@@ -3,6 +3,7 @@
 # FD 3 must be open and connected to ct-shell-trace-writer's stdin.
 
 set -o functrace    # DEBUG trap inherited by functions
+set -o errtrace     # ERR trap inherited by functions
 shopt -s extdebug   # Required for DEBUG trap in functions + RETURN trap
 
 _ct_target_script="$1"
@@ -172,6 +173,15 @@ _ct_debug_trap() {
 
     _ct_prev_depth=$_ct_depth
 
+    # Detect output commands from BASH_COMMAND
+    local _ct_cmd="$BASH_COMMAND"
+    if [[ "$_ct_cmd" == echo\ * ]] || [[ "$_ct_cmd" == printf\ * ]] || [[ "$_ct_cmd" == print\ * ]]; then
+        # Extract the content (approximate — just use the full command)
+        local _ct_write_content
+        _ct_write_content=$(_ct_quote_value "$_ct_cmd")
+        printf 'WRITE content=%s\n' "$_ct_write_content" >&3
+    fi
+
     # Emit step event
     printf 'STEP file=%s line=%d\n' "$_ct_file" "$_ct_line" >&3
 
@@ -179,6 +189,23 @@ _ct_debug_trap() {
     _ct_capture_variables
 
     return 0  # Don't skip the command
+}
+
+# ERR trap handler — fires when a command returns non-zero exit status.
+# BASH_SOURCE[0] is this file (recorder.sh, where the function is defined).
+# BASH_SOURCE[1] is the file where the failing command was executed.
+_ct_err_trap() {
+    local _ct_status=$?
+    local _ct_cmd="$BASH_COMMAND"
+    local _ct_file="${BASH_SOURCE[1]}"
+
+    # Skip errors from recorder internals
+    [[ "$_ct_file" == "$0" ]] && return
+    [[ -z "$_ct_file" ]] && return
+
+    local _ct_quoted_cmd
+    _ct_quoted_cmd=$(_ct_quote_value "$_ct_cmd")
+    printf 'ERROR cmd=%s status=%d\n' "$_ct_quoted_cmd" "$_ct_status" >&3
 }
 
 # RETURN trap handler — we keep this trap active so that the DEBUG trap in the
@@ -193,6 +220,7 @@ _ct_return_trap() {
 
 trap '_ct_debug_trap' DEBUG
 trap '_ct_return_trap' RETURN
+trap '_ct_err_trap' ERR
 
 # Execute the target script by sourcing it so traps apply
 # Set positional parameters for the script
@@ -203,6 +231,7 @@ _ct_exit_code=$?
 # Disable traps before cleanup
 trap '' DEBUG
 trap '' RETURN
+trap '' ERR
 
 # Emit EXIT event
 printf 'EXIT code=%d\n' "$_ct_exit_code" >&3

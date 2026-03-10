@@ -675,3 +675,235 @@ fn test_bash_builtin_filtering() {
         );
     }
 }
+
+// ============================================================================
+// M5: IO, Errors & Edge Cases Tests
+// ============================================================================
+
+/// Helper: find all Event entries in the trace with a given kind.
+/// kind=0 is Write (EventLogKind::Write), kind=11 is Error (EventLogKind::Error).
+fn find_trace_events_by_kind(output_dir: &TempDir, kind: u64) -> Vec<serde_json::Value> {
+    let trace_content = read_trace_json(output_dir);
+    let trace_events: Vec<serde_json::Value> =
+        serde_json::from_str(&trace_content).expect("trace.json should be valid JSON array");
+
+    trace_events
+        .iter()
+        .filter_map(|e| {
+            e.get("Event").and_then(|ev| {
+                let k = ev.get("kind")?.as_u64()?;
+                if k == kind {
+                    Some(ev.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn test_bash_error_trap() {
+    // Record errors.sh — it contains `false` and `ls /nonexistent/path`
+    // which both fail. The script should still complete.
+    let (output_dir, stdout, _stderr) = record_fixture("errors.sh");
+
+    // The script should finish and print "done"
+    assert!(
+        stdout.contains("done"),
+        "Expected 'done' in stdout (script should complete despite errors), got: {}",
+        stdout
+    );
+
+    // Read trace.json and find Error events (kind=11)
+    let error_events = find_trace_events_by_kind(&output_dir, 11);
+
+    // We expect at least 2 Error events: one for `false` and one for `ls /nonexistent/path`
+    assert!(
+        error_events.len() >= 2,
+        "Expected at least 2 Error events for 'false' and 'ls /nonexistent/path', got {}: {:?}",
+        error_events.len(),
+        error_events
+    );
+
+    // Verify one error is for the `false` command
+    let has_false_error = error_events.iter().any(|ev| {
+        ev.get("content")
+            .and_then(|c| c.as_str())
+            .map_or(false, |c| c.contains("false"))
+    });
+    assert!(
+        has_false_error,
+        "Expected an Error event mentioning 'false', got: {:?}",
+        error_events
+    );
+
+    // Verify one error is for the `ls` command
+    let has_ls_error = error_events.iter().any(|ev| {
+        ev.get("content")
+            .and_then(|c| c.as_str())
+            .map_or(false, |c| c.contains("ls"))
+    });
+    assert!(
+        has_ls_error,
+        "Expected an Error event mentioning 'ls', got: {:?}",
+        error_events
+    );
+
+    // Verify the script still has Step events (it didn't crash)
+    let trace_content = read_trace_json(&output_dir);
+    let trace_events: Vec<serde_json::Value> =
+        serde_json::from_str(&trace_content).expect("trace.json should be valid JSON array");
+    let step_count = trace_events
+        .iter()
+        .filter(|e| e.get("Step").is_some())
+        .count();
+    assert!(
+        step_count >= 5,
+        "Expected at least 5 Step events in errors.sh, got {}",
+        step_count
+    );
+
+    // Verify user variables were captured despite errors
+    let var_names = extract_variable_names(&output_dir);
+    assert!(
+        var_names.contains(&"x".to_string()),
+        "Should capture variable 'x' despite errors, found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"y".to_string()),
+        "Should capture variable 'y' despite errors, found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"z".to_string()),
+        "Should capture variable 'z' despite errors, found: {:?}",
+        var_names
+    );
+}
+
+#[test]
+fn test_bash_output_capture() {
+    // Record output.sh — it uses echo and printf
+    let (output_dir, stdout, _stderr) = record_fixture("output.sh");
+
+    // Verify script produced expected output
+    assert!(
+        stdout.contains("hello"),
+        "Expected 'hello' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("world"),
+        "Expected 'world' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("x is result"),
+        "Expected 'x is result' in stdout, got: {}",
+        stdout
+    );
+
+    // Read trace.json and find Write events (kind=0)
+    let write_events = find_trace_events_by_kind(&output_dir, 0);
+
+    // We expect at least 2 Write events: for echo "hello" and printf "world\n"
+    // (echo "x is $x" should also produce one)
+    assert!(
+        write_events.len() >= 2,
+        "Expected at least 2 Write events for echo/printf commands, got {}: {:?}",
+        write_events.len(),
+        write_events
+    );
+
+    // Verify at least one Write event references the echo command
+    let has_echo_write = write_events.iter().any(|ev| {
+        ev.get("content")
+            .and_then(|c| c.as_str())
+            .map_or(false, |c| c.contains("echo"))
+    });
+    assert!(
+        has_echo_write,
+        "Expected a Write event referencing 'echo', got: {:?}",
+        write_events
+    );
+
+    // Verify at least one Write event references the printf command
+    let has_printf_write = write_events.iter().any(|ev| {
+        ev.get("content")
+            .and_then(|c| c.as_str())
+            .map_or(false, |c| c.contains("printf"))
+    });
+    assert!(
+        has_printf_write,
+        "Expected a Write event referencing 'printf', got: {:?}",
+        write_events
+    );
+}
+
+#[test]
+fn test_bash_sourced_file() {
+    // Record with_source.sh which sources sourced_lib.sh
+    let (output_dir, stdout, _stderr) = record_fixture("with_source.sh");
+
+    // Verify script produced expected output from sourced functions
+    assert!(
+        stdout.contains("from lib"),
+        "Expected 'from lib' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("library value"),
+        "Expected 'library value' in stdout, got: {}",
+        stdout
+    );
+
+    // Verify trace_paths.json contains BOTH files
+    let paths = read_trace_paths(&output_dir);
+
+    let has_with_source = paths
+        .iter()
+        .any(|p| p.as_str().map_or(false, |s| s.contains("with_source.sh")));
+    assert!(
+        has_with_source,
+        "paths should contain with_source.sh: {:?}",
+        paths
+    );
+
+    let has_sourced_lib = paths
+        .iter()
+        .any(|p| p.as_str().map_or(false, |s| s.contains("sourced_lib.sh")));
+    assert!(
+        has_sourced_lib,
+        "paths should contain sourced_lib.sh (the sourced file): {:?}",
+        paths
+    );
+
+    // Verify the function from sourced_lib.sh appears in trace
+    let trace_content = read_trace_json(&output_dir);
+
+    assert!(
+        trace_content.contains("\"lib_func\""),
+        "trace.json should contain function name 'lib_func' from sourced file, content: {}",
+        &trace_content[..trace_content.len().min(2000)]
+    );
+
+    // Verify Call and Function events exist
+    assert!(
+        trace_content.contains("\"Call\""),
+        "trace.json should contain Call events for lib_func"
+    );
+    assert!(
+        trace_content.contains("\"Function\""),
+        "trace.json should contain Function events for lib_func"
+    );
+
+    // Verify LIB_VAR was captured
+    let var_names = extract_variable_names(&output_dir);
+    assert!(
+        var_names.contains(&"LIB_VAR".to_string()),
+        "Should capture variable 'LIB_VAR' from sourced file, found: {:?}",
+        var_names
+    );
+}
