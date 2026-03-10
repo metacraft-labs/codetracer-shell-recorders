@@ -57,7 +57,7 @@ jobs:
             CLONE_URL="https://github.com/metacraft-labs/codetracer.git"
           fi
 
-          # Only need the trace-format libs, but a shallow clone is sufficient
+          # Only need the trace-format libs (not submodules) for building
           if ! git clone --depth 1 --branch "${REF}" --single-branch \
             "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer" 2>/dev/null; then
             rm -rf "${GITHUB_WORKSPACE}/../codetracer"
@@ -65,20 +65,11 @@ jobs:
             git -C "${GITHUB_WORKSPACE}/../codetracer" checkout "${REF}"
           fi
 
-          # Init submodules needed for trace-format (trace-format itself has no submodules,
-          # but the main repo may need them for a clean checkout)
+          # Only init the trace-format submodule (capnproto schema), skip others
+          # to avoid needing auth tokens for private submodules like tree-sitter-nim
           cd "${GITHUB_WORKSPACE}/../codetracer"
-          git submodule init
-          if [ -n "${TOKEN}" ]; then
-            for url in $(git config --get-regexp '^submodule\..*\.url$' | grep -E 'git@github\.com:|https://github\.com/' | cut -d' ' -f1); do
-              old_url=$(git config --get "$url")
-              new_url=$(echo "$old_url" \
-                | sed "s|git@github.com:|https://x-access-token:${TOKEN}@github.com/|" \
-                | sed "s|https://github.com/|https://x-access-token:${TOKEN}@github.com/|")
-              git config "$url" "$new_url"
-            done
-          fi
-          git submodule update --recursive --depth 1
+          git submodule init libs/codetracer-trace-format 2>/dev/null || true
+          git submodule update --depth 1 libs/codetracer-trace-format 2>/dev/null || true
 
           echo "Codetracer cloned at: $(realpath "${GITHUB_WORKSPACE}/../codetracer")"
 
