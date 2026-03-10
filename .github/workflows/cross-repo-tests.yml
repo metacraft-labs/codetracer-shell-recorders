@@ -56,6 +56,10 @@ on:
 jobs:
   cross-repo-tests:
     runs-on: ubuntu-latest
+    # Cross-repo tests need access to private submodules (tree-sitter-nim)
+    # in the codetracer repo, which requires the GH_READ_METACRAFT_PRIVATE_REPOS
+    # secret. Skip gracefully on forks or when the secret is not configured.
+    if: ${{ github.event_name == 'repository_dispatch' || github.repository == 'metacraft-labs/codetracer-shell-recorders' }}
 
     steps:
       # 1. Checkout this repository (codetracer-shell-recorders)
@@ -158,18 +162,23 @@ jobs:
             git -C "${GITHUB_WORKSPACE}/../codetracer" checkout "${CODETRACER_REF}"
           fi
 
-          # Initialize and update submodules
+          # Initialize and update submodules (requires GH_READ_METACRAFT_PRIVATE_REPOS
+          # for private submodules like tree-sitter-nim)
           cd "${GITHUB_WORKSPACE}/../codetracer"
           git submodule init
-          if [ -n "${TOKEN}" ]; then
-            for url in $(git config --get-regexp '^submodule\..*\.url$' | grep -E 'git@github\.com:|https://github\.com/' | cut -d' ' -f1); do
-              old_url=$(git config --get "$url")
-              new_url=$(echo "$old_url" \
-                | sed "s|git@github.com:|https://x-access-token:${TOKEN}@github.com/|" \
-                | sed "s|https://github.com/|https://x-access-token:${TOKEN}@github.com/|")
-              git config "$url" "$new_url"
-            done
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::GH_READ_METACRAFT_PRIVATE_REPOS secret is required for cross-repo tests."
+            echo "::error::The codetracer repo has private submodules that need auth."
+            echo "::error::Add the secret in Settings > Secrets and variables > Actions."
+            exit 1
           fi
+          for url in $(git config --get-regexp '^submodule\..*\.url$' | grep -E 'git@github\.com:|https://github\.com/' | cut -d' ' -f1); do
+            old_url=$(git config --get "$url")
+            new_url=$(echo "$old_url" \
+              | sed "s|git@github.com:|https://x-access-token:${TOKEN}@github.com/|" \
+              | sed "s|https://github.com/|https://x-access-token:${TOKEN}@github.com/|")
+            git config "$url" "$new_url"
+          done
           git submodule update --recursive --depth 1
 
           # Override trace-format submodule to a specific ref if pinned
