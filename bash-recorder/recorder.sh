@@ -35,6 +35,18 @@ _ct_prev_depth=1
 # Flag: set to 1 inside the RETURN trap so the DEBUG trap skips processing
 _ct_in_return_trap=0
 
+# Snapshot all variable names that exist BEFORE the target script runs.
+# Any variable not in this set was created by the user script and should be captured.
+declare -A _ct_baseline_vars
+while IFS= read -r _ct_baseline_line; do
+    if [[ "$_ct_baseline_line" =~ ^declare\ +[-[:alpha:]]+\ +([_[:alpha:]][_[:alnum:]]*)= ]] ||
+       [[ "$_ct_baseline_line" =~ ^declare\ +[-[:alpha:]]+\ +([_[:alpha:]][_[:alnum:]]*) ]]; then
+        _ct_baseline_vars["${BASH_REMATCH[1]}"]=1
+    fi
+done <<< "$(declare -p 2>/dev/null)"
+# Also add BASH_REMATCH itself to baseline since the regex above created/modified it
+_ct_baseline_vars["BASH_REMATCH"]=1
+
 # Quote a value for the wire protocol: if it contains spaces or special chars, wrap in quotes
 _ct_quote_value() {
     local val="$1"
@@ -45,6 +57,69 @@ _ct_quote_value() {
     else
         printf '%s' "$val"
     fi
+}
+
+# Capture all user-visible variables and emit VAR events.
+# Called after each STEP event to record variable state.
+# Only captures variables NOT in the baseline snapshot (i.e., user-created variables).
+_ct_capture_variables() {
+    local _ct_decl_output
+    _ct_decl_output=$(declare -p 2>/dev/null) || return
+
+    local _ct_decl_line
+    while IFS= read -r _ct_decl_line; do
+        # Skip empty lines
+        [[ -z "$_ct_decl_line" ]] && continue
+
+        # Pattern: declare [-flags] name="value" or declare [-flags] name
+        local _ct_flags=""
+        local _ct_varname=""
+        if [[ "$_ct_decl_line" =~ ^declare\ +([-[:alpha:]]+)\ +([_[:alpha:]][_[:alnum:]]*)= ]]; then
+            _ct_flags="${BASH_REMATCH[1]}"
+            _ct_varname="${BASH_REMATCH[2]}"
+        elif [[ "$_ct_decl_line" =~ ^declare\ +([-[:alpha:]]+)\ +([_[:alpha:]][_[:alnum:]]*) ]]; then
+            _ct_flags="${BASH_REMATCH[1]}"
+            _ct_varname="${BASH_REMATCH[2]}"
+        else
+            continue
+        fi
+
+        # Skip internal recorder variables
+        [[ "$_ct_varname" == _ct_* ]] && continue
+        # Skip any variable that existed before the user script was sourced
+        [[ -n "${_ct_baseline_vars[$_ct_varname]+x}" ]] && continue
+        # Skip bash internals that may be created dynamically
+        [[ "$_ct_varname" == BASH_* ]] && continue
+        [[ "$_ct_varname" == COMP_* ]] && continue
+        [[ "$_ct_varname" == READLINE_* ]] && continue
+
+        # Determine type flag from declare flags
+        local _ct_type_flag="s"
+        if [[ "$_ct_flags" == *A* ]]; then
+            _ct_type_flag="A"
+        elif [[ "$_ct_flags" == *a* ]]; then
+            _ct_type_flag="a"
+        elif [[ "$_ct_flags" == *i* ]]; then
+            _ct_type_flag="i"
+        fi
+
+        # Extract value: everything after the first =
+        local _ct_value=""
+        if [[ "$_ct_decl_line" =~ ^declare\ +[-[:alpha:]]+\ +[_[:alpha:]][_[:alnum:]]*=(.*) ]]; then
+            _ct_value="${BASH_REMATCH[1]}"
+            # Remove surrounding quotes if present
+            if [[ "$_ct_value" == \"*\" ]]; then
+                _ct_value="${_ct_value:1:${#_ct_value}-2}"
+            elif [[ "$_ct_value" == \'*\' ]]; then
+                _ct_value="${_ct_value:1:${#_ct_value}-2}"
+            fi
+        fi
+
+        # Emit VAR event with quoted value
+        local _ct_quoted_val
+        _ct_quoted_val=$(_ct_quote_value "$_ct_value")
+        printf 'VAR name=%s value=%s type=%s\n' "$_ct_varname" "$_ct_quoted_val" "$_ct_type_flag" >&3
+    done <<< "$_ct_decl_output"
 }
 
 # DEBUG trap handler — fires before each simple command
@@ -99,6 +174,9 @@ _ct_debug_trap() {
 
     # Emit step event
     printf 'STEP file=%s line=%d\n' "$_ct_file" "$_ct_line" >&3
+
+    # Capture variables at this step
+    _ct_capture_variables
 
     return 0  # Don't skip the command
 }

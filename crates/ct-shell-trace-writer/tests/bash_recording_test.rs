@@ -376,3 +376,302 @@ fn test_bash_exit_code() {
 
     assert_eq!(exit_code, 0, "Exit code should be 0 for simple.sh");
 }
+
+// ============================================================================
+// M4: Variable Capture & Type Inference Tests
+// ============================================================================
+
+/// Helper: parse trace.json and return all unique VariableName strings.
+fn extract_variable_names(output_dir: &TempDir) -> Vec<String> {
+    let trace_content = read_trace_json(output_dir);
+    let trace_events: Vec<serde_json::Value> =
+        serde_json::from_str(&trace_content).expect("trace.json should be valid JSON array");
+
+    trace_events
+        .iter()
+        .filter_map(|e| {
+            e.get("VariableName")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Helper: find all Value events for a given variable name.
+/// Returns Vec of (variable_id, value_record) for each Value event following
+/// a VariableName event that matches the given name.
+fn find_variable_values(output_dir: &TempDir, var_name: &str) -> Vec<serde_json::Value> {
+    let trace_content = read_trace_json(output_dir);
+    let trace_events: Vec<serde_json::Value> =
+        serde_json::from_str(&trace_content).expect("trace.json should be valid JSON array");
+
+    // First, find the variable_id for this name by looking at VariableName events.
+    // The variable_id is implicit: each VariableName event assigns the next sequential id.
+    let mut var_id: Option<usize> = None;
+    let mut next_var_id: usize = 0;
+
+    for event in &trace_events {
+        if let Some(name) = event.get("VariableName").and_then(|v| v.as_str()) {
+            if name == var_name && var_id.is_none() {
+                var_id = Some(next_var_id);
+            }
+            next_var_id += 1;
+        }
+    }
+
+    let var_id = match var_id {
+        Some(id) => id,
+        None => return vec![],
+    };
+
+    // Now collect all Value events with this variable_id
+    trace_events
+        .iter()
+        .filter_map(|e| {
+            e.get("Value").and_then(|v| {
+                let vid = v.get("variable_id")?.as_u64()?;
+                if vid == var_id as u64 {
+                    Some(v.get("value")?.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn test_bash_scalar_variable_capture() {
+    let (output_dir, stdout, _stderr) = record_fixture("variables.sh");
+
+    // Verify script produced expected output
+    assert!(
+        stdout.contains("hello world 52"),
+        "Expected 'hello world 52' in stdout, got: {}",
+        stdout
+    );
+
+    // Verify user variables are present in trace
+    let var_names = extract_variable_names(&output_dir);
+
+    assert!(
+        var_names.contains(&"x".to_string()),
+        "Should capture variable 'x', found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"y".to_string()),
+        "Should capture variable 'y', found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"z".to_string()),
+        "Should capture variable 'z', found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"count".to_string()),
+        "Should capture variable 'count', found: {:?}",
+        var_names
+    );
+
+    // Verify "x" has String kind (plain variable, no declare -i)
+    let x_values = find_variable_values(&output_dir, "x");
+    assert!(!x_values.is_empty(), "Should have Value events for 'x'");
+    let x_kind = x_values[0].get("kind").and_then(|k| k.as_str());
+    assert_eq!(
+        x_kind,
+        Some("String"),
+        "Variable 'x' should be String kind, got: {:?}",
+        x_kind
+    );
+
+    // Verify "count" has Int kind (from declare -i)
+    let count_values = find_variable_values(&output_dir, "count");
+    assert!(
+        !count_values.is_empty(),
+        "Should have Value events for 'count'"
+    );
+    let count_kind = count_values[0].get("kind").and_then(|k| k.as_str());
+    assert_eq!(
+        count_kind,
+        Some("Int"),
+        "Variable 'count' should be Int kind (declare -i), got: {:?}",
+        count_kind
+    );
+
+    // Verify "count" has value 42
+    let count_i = count_values[0].get("i").and_then(|v| v.as_i64());
+    assert_eq!(
+        count_i,
+        Some(42),
+        "Variable 'count' should have value 42, got: {:?}",
+        count_i
+    );
+
+    // Verify "y" has String kind and contains "hello world"
+    let y_values = find_variable_values(&output_dir, "y");
+    assert!(!y_values.is_empty(), "Should have Value events for 'y'");
+    let y_kind = y_values[0].get("kind").and_then(|k| k.as_str());
+    assert_eq!(
+        y_kind,
+        Some("String"),
+        "Variable 'y' should be String kind, got: {:?}",
+        y_kind
+    );
+    let y_text = y_values[0].get("text").and_then(|v| v.as_str());
+    assert_eq!(
+        y_text,
+        Some("hello world"),
+        "Variable 'y' should have value 'hello world', got: {:?}",
+        y_text
+    );
+}
+
+#[test]
+fn test_bash_array_variable_capture() {
+    let (output_dir, _stdout, _stderr) = record_fixture("variables.sh");
+
+    let var_names = extract_variable_names(&output_dir);
+    assert!(
+        var_names.contains(&"fruits".to_string()),
+        "Should capture variable 'fruits', found: {:?}",
+        var_names
+    );
+
+    // Verify "fruits" appears as a value in the trace
+    let fruits_values = find_variable_values(&output_dir, "fruits");
+    assert!(
+        !fruits_values.is_empty(),
+        "Should have Value events for 'fruits'"
+    );
+
+    // The type for fruits should be Seq (Array type, kind=0 in TypeKind enum)
+    // The value is stored as a String containing the bash array representation
+    let fruits_kind = fruits_values[0].get("kind").and_then(|k| k.as_str());
+    assert_eq!(
+        fruits_kind,
+        Some("String"),
+        "Array variable 'fruits' value should be stored as String kind, got: {:?}",
+        fruits_kind
+    );
+
+    // The text should contain the array elements
+    let fruits_text = fruits_values[0]
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        fruits_text.contains("apple"),
+        "Array 'fruits' should contain 'apple', got: {}",
+        fruits_text
+    );
+    assert!(
+        fruits_text.contains("banana"),
+        "Array 'fruits' should contain 'banana', got: {}",
+        fruits_text
+    );
+    assert!(
+        fruits_text.contains("cherry"),
+        "Array 'fruits' should contain 'cherry', got: {}",
+        fruits_text
+    );
+}
+
+#[test]
+fn test_bash_assoc_array_capture() {
+    let (output_dir, _stdout, _stderr) = record_fixture("variables.sh");
+
+    let var_names = extract_variable_names(&output_dir);
+    assert!(
+        var_names.contains(&"colors".to_string()),
+        "Should capture variable 'colors', found: {:?}",
+        var_names
+    );
+
+    // Verify "colors" appears as a value in the trace
+    let colors_values = find_variable_values(&output_dir, "colors");
+    assert!(
+        !colors_values.is_empty(),
+        "Should have Value events for 'colors'"
+    );
+
+    // Assoc arrays are stored as String kind with the bash representation
+    let colors_kind = colors_values[0].get("kind").and_then(|k| k.as_str());
+    assert_eq!(
+        colors_kind,
+        Some("String"),
+        "Assoc array 'colors' value should be stored as String kind, got: {:?}",
+        colors_kind
+    );
+
+    // The text should contain the key-value pairs
+    let colors_text = colors_values[0]
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        colors_text.contains("red"),
+        "Assoc array 'colors' should contain key 'red', got: {}",
+        colors_text
+    );
+    assert!(
+        colors_text.contains("#ff0000"),
+        "Assoc array 'colors' should contain value '#ff0000', got: {}",
+        colors_text
+    );
+    assert!(
+        colors_text.contains("green"),
+        "Assoc array 'colors' should contain key 'green', got: {}",
+        colors_text
+    );
+}
+
+#[test]
+fn test_bash_builtin_filtering() {
+    let (output_dir, _stdout, _stderr) = record_fixture("simple.sh");
+
+    let var_names = extract_variable_names(&output_dir);
+
+    // User variables from simple.sh should be present
+    assert!(
+        var_names.contains(&"x".to_string()),
+        "Should capture user variable 'x', found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"y".to_string()),
+        "Should capture user variable 'y', found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"z".to_string()),
+        "Should capture user variable 'z', found: {:?}",
+        var_names
+    );
+
+    // Bash builtins and environment variables should NOT be present
+    for builtin in &[
+        "BASH_VERSION",
+        "HOME",
+        "PATH",
+        "PWD",
+        "SHELL",
+        "USER",
+        "SHLVL",
+        "BASH_SOURCE",
+        "BASH_LINENO",
+        "FUNCNAME",
+        "PIPESTATUS",
+        "BASH_REMATCH",
+    ] {
+        assert!(
+            !var_names.contains(&builtin.to_string()),
+            "Should NOT capture builtin '{}', found: {:?}",
+            builtin,
+            var_names
+        );
+    }
+}
