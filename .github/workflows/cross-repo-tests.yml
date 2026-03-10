@@ -1,0 +1,182 @@
+# Cross-Repo Integration Tests
+#
+# PURPOSE:
+# Builds ct-shell-trace-writer from this repository and runs integration tests
+# defined in the sibling codetracer repo (metacraft-labs/codetracer). This
+# validates that changes to the shell recorders do not break the CodeTracer
+# db-backend flow tests (bash_flow_integration, zsh_flow_integration).
+#
+# WORKSPACE LAYOUT:
+# The cross-repo test script expects both repositories side-by-side:
+#
+#   $GITHUB_WORKSPACE/../
+#     codetracer/                        <-- cloned by this workflow
+#     codetracer-shell-recorders/        <-- checked out by actions/checkout
+#
+# POLICY: All CI steps should be reproducible locally via `just` targets.
+# Local equivalent:
+#   just cross-test
+#
+# Codetracer revision pinning:
+#   Priority cascade for resolving the codetracer ref:
+#     1. workflow_dispatch input `codetracer_ref` (manual override)
+#     2. repository_dispatch `client_payload.codetracer_ref` (bidirectional)
+#     3. `.github/sibling-pins.json` (lock file)
+#     4. Fallback to `main`
+
+name: Cross-Repo Integration Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+  workflow_dispatch:
+    inputs:
+      codetracer_ref:
+        description: 'Git ref (branch/tag/SHA) of the codetracer repo to test against'
+        required: false
+        default: 'main'
+
+  # Bidirectional trigger: the codetracer repo can dispatch this event when
+  # shell-recorder-related files change (e.g. db-backend Bash/Zsh support).
+  #
+  # Expected payload:
+  #   {
+  #     "event_type": "cross-repo-test",
+  #     "client_payload": {
+  #       "codetracer_ref": "<git-ref-or-sha>",
+  #       "triggered_by": "codetracer PR #123"
+  #     }
+  #   }
+  repository_dispatch:
+    types: [cross-repo-test]
+
+jobs:
+  cross-repo-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout this repository (codetracer-shell-recorders)
+      - name: Checkout codetracer-shell-recorders
+        uses: actions/checkout@v4
+
+      # 2. Set up Nix
+      - name: Set up Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-25.05
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Cache Nix store
+        uses: cachix/cachix-action@v15
+        with:
+          name: nix-community
+          skipPush: true
+
+      # 3. Resolve codetracer ref via priority cascade
+      - name: Resolve codetracer ref
+        id: resolve-ref
+        run: |
+          # 1. workflow_dispatch input (manual trigger)
+          DISPATCH_REF="${{ github.event.inputs.codetracer_ref }}"
+          if [ -n "${DISPATCH_REF}" ] && [ "${DISPATCH_REF}" != "main" ]; then
+            echo "ref=${DISPATCH_REF}" >> "$GITHUB_OUTPUT"
+            echo "Resolved codetracer ref from workflow_dispatch: ${DISPATCH_REF}"
+            exit 0
+          fi
+
+          # 2. repository_dispatch payload (bidirectional trigger)
+          PAYLOAD_REF="${{ github.event.client_payload.codetracer_ref }}"
+          if [ -n "${PAYLOAD_REF}" ]; then
+            echo "ref=${PAYLOAD_REF}" >> "$GITHUB_OUTPUT"
+            echo "Resolved codetracer ref from repository_dispatch: ${PAYLOAD_REF}"
+            exit 0
+          fi
+
+          # 3. sibling-pins.json
+          SIBLING_PINS=".github/sibling-pins.json"
+          if [ -f "${SIBLING_PINS}" ]; then
+            PINS_REF="$(python3 -c "
+          import json
+          with open('${SIBLING_PINS}') as f:
+              pins = json.load(f)
+          print(pins.get('codetracer', ''))
+          " 2>/dev/null)" || true
+            if [ -n "${PINS_REF}" ]; then
+              echo "ref=${PINS_REF}" >> "$GITHUB_OUTPUT"
+              echo "Resolved codetracer ref from sibling-pins.json: ${PINS_REF}"
+              exit 0
+            fi
+          fi
+
+          # 4. Fallback
+          echo "ref=main" >> "$GITHUB_OUTPUT"
+          echo "Resolved codetracer ref: main (fallback)"
+
+      # 4. Clone the codetracer repo as a sibling directory
+      - name: Clone codetracer repo
+        env:
+          CODETRACER_REF: ${{ steps.resolve-ref.outputs.ref }}
+        run: |
+          echo "Cloning codetracer at ref: ${CODETRACER_REF}"
+
+          # Clean up from previous runs (self-hosted runners may retain state)
+          rm -rf "${GITHUB_WORKSPACE}/../codetracer"
+
+          # Configure git URL rewriting for private submodules
+          TOKEN="${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}"
+          if [ -n "${TOKEN}" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "git@github.com:"
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+            CLONE_URL="https://x-access-token:${TOKEN}@github.com/metacraft-labs/codetracer.git"
+          else
+            CLONE_URL="https://github.com/metacraft-labs/codetracer.git"
+          fi
+
+          # Clone into parent directory for sibling layout
+          if ! git clone \
+            --depth 1 \
+            --branch "${CODETRACER_REF}" \
+            --single-branch \
+            "${CLONE_URL}" \
+            "${GITHUB_WORKSPACE}/../codetracer" 2>/dev/null; then
+            echo "Shallow branch clone failed (ref may be a SHA); falling back"
+            rm -rf "${GITHUB_WORKSPACE}/../codetracer"
+            git clone --no-checkout "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer"
+            git -C "${GITHUB_WORKSPACE}/../codetracer" checkout "${CODETRACER_REF}"
+          fi
+
+          # Initialize and update submodules
+          cd "${GITHUB_WORKSPACE}/../codetracer"
+          git submodule init
+          if [ -n "${TOKEN}" ]; then
+            for url in $(git config --get-regexp '^submodule\..*\.url$' | grep -E 'git@github\.com:|https://github\.com/' | cut -d' ' -f1); do
+              old_url=$(git config --get "$url")
+              new_url=$(echo "$old_url" \
+                | sed "s|git@github.com:|https://x-access-token:${TOKEN}@github.com/|" \
+                | sed "s|https://github.com/|https://x-access-token:${TOKEN}@github.com/|")
+              git config "$url" "$new_url"
+            done
+          fi
+          git submodule update --recursive --depth 1
+
+          echo "Codetracer cloned to: $(realpath "${GITHUB_WORKSPACE}/../codetracer")"
+          echo "HEAD: $(git -C "${GITHUB_WORKSPACE}/../codetracer" rev-parse HEAD)"
+
+      # 5. Run cross-repo integration tests
+      - name: Run cross-repo integration tests
+        run: nix develop --command bash scripts/run-cross-repo-tests.sh all
+
+      # 6. Upload test logs on failure
+      - name: Upload cross-repo test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-repo-test-logs
+          path: target/cross-test-logs/
+          retention-days: 14
+          if-no-files-found: ignore

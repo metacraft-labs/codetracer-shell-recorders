@@ -35,3 +35,7 @@ lint-nix:
 lint:
     just lint-rust
     just lint-nix
+
+# Run cross-repo integration tests against sibling codetracer repo
+cross-test *ARGS:
+    bash scripts/run-cross-repo-tests.sh {{ ARGS }}
