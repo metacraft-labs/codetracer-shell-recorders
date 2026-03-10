@@ -23,6 +23,65 @@ jobs:
           name: nix-community
           skipPush: true
 
+      # The Cargo.toml uses relative path dependencies to the sibling
+      # codetracer repo (../../codetracer/libs/codetracer-trace-format/).
+      # Clone it so cargo can resolve these.
+      - name: Resolve codetracer ref
+        id: resolve-ref
+        run: |
+          SIBLING_PINS=".github/sibling-pins.json"
+          if [ -f "${SIBLING_PINS}" ]; then
+            PINS_REF="$(python3 -c "
+          import json
+          with open('${SIBLING_PINS}') as f:
+              pins = json.load(f)
+          print(pins.get('codetracer', ''))
+          " 2>/dev/null)" || true
+            if [ -n "${PINS_REF}" ]; then
+              echo "ref=${PINS_REF}" >> "$GITHUB_OUTPUT"
+              echo "Resolved codetracer ref from sibling-pins.json: ${PINS_REF}"
+              exit 0
+            fi
+          fi
+          echo "ref=main" >> "$GITHUB_OUTPUT"
+
+      - name: Clone codetracer (for path dependencies)
+        run: |
+          REF="${{ steps.resolve-ref.outputs.ref }}"
+          TOKEN="${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}"
+          if [ -n "${TOKEN}" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "git@github.com:"
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+            CLONE_URL="https://x-access-token:${TOKEN}@github.com/metacraft-labs/codetracer.git"
+          else
+            CLONE_URL="https://github.com/metacraft-labs/codetracer.git"
+          fi
+
+          # Only need the trace-format libs, but a shallow clone is sufficient
+          if ! git clone --depth 1 --branch "${REF}" --single-branch \
+            "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer" 2>/dev/null; then
+            rm -rf "${GITHUB_WORKSPACE}/../codetracer"
+            git clone --no-checkout "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer"
+            git -C "${GITHUB_WORKSPACE}/../codetracer" checkout "${REF}"
+          fi
+
+          # Init submodules needed for trace-format (trace-format itself has no submodules,
+          # but the main repo may need them for a clean checkout)
+          cd "${GITHUB_WORKSPACE}/../codetracer"
+          git submodule init
+          if [ -n "${TOKEN}" ]; then
+            for url in $(git config --get-regexp '^submodule\..*\.url$' | grep -E 'git@github\.com:|https://github\.com/' | cut -d' ' -f1); do
+              old_url=$(git config --get "$url")
+              new_url=$(echo "$old_url" \
+                | sed "s|git@github.com:|https://x-access-token:${TOKEN}@github.com/|" \
+                | sed "s|https://github.com/|https://x-access-token:${TOKEN}@github.com/|")
+              git config "$url" "$new_url"
+            done
+          fi
+          git submodule update --recursive --depth 1
+
+          echo "Codetracer cloned at: $(realpath "${GITHUB_WORKSPACE}/../codetracer")"
+
       - name: Build
         run: nix develop --command just build
 
