@@ -198,7 +198,8 @@ jobs:
       - name: Generate tree-sitter-nim parser
         run: |
           cd "${GITHUB_WORKSPACE}/../codetracer/libs/tree-sitter-nim"
-          nix develop "${GITHUB_WORKSPACE}/../codetracer" --command tree-sitter generate
+          npm install
+          npx tree-sitter generate
           ls -la src/parser.c
 
       # 6. Run cross-repo integration tests
