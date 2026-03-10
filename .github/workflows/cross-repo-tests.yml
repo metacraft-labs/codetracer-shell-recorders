@@ -194,11 +194,18 @@ jobs:
           echo "Codetracer cloned to: $(realpath "${GITHUB_WORKSPACE}/../codetracer")"
           echo "HEAD: $(git -C "${GITHUB_WORKSPACE}/../codetracer" rev-parse HEAD)"
 
-      # 5. Run cross-repo integration tests
+      # 5. Generate tree-sitter-nim parser (gitignored generated file)
+      - name: Generate tree-sitter-nim parser
+        run: |
+          cd "${GITHUB_WORKSPACE}/../codetracer/libs/tree-sitter-nim"
+          nix develop "${GITHUB_WORKSPACE}/../codetracer" --command tree-sitter generate
+          ls -la src/parser.c
+
+      # 6. Run cross-repo integration tests
       - name: Run cross-repo integration tests
         run: nix develop --command bash scripts/run-cross-repo-tests.sh all
 
-      # 6. Upload test logs on failure
+      # 7. Upload test logs on failure
       - name: Upload cross-repo test logs
         if: failure()
         uses: actions/upload-artifact@v4
