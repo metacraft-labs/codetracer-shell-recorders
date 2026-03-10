@@ -1,0 +1,13 @@
+[package]
+name = "ct-shell-trace-writer"
+version = "0.1.0"
+edition = "2021"
+description = "CodeTracer shell recorder — reads debugger wire-protocol events from stdin and writes a CodeTracer trace"
+
+[[bin]]
+name = "ct-shell-trace-writer"
+path = "src/main.rs"
+
+[dependencies]
+codetracer_trace_types = { version = "0.16", path = "../../../codetracer/libs/codetracer-trace-format/codetracer_trace_types" }
+codetracer_trace_writer = { version = "0.17", path = "../../../codetracer/libs/codetracer-trace-format/codetracer_trace_writer" }
