@@ -26,28 +26,38 @@ jobs:
       # The Cargo.toml uses relative path dependencies to the sibling
       # codetracer repo (../../codetracer/libs/codetracer-trace-format/).
       # Clone it so cargo can resolve these.
-      - name: Resolve codetracer ref
+      - name: Resolve dependency refs
         id: resolve-ref
         run: |
           SIBLING_PINS=".github/sibling-pins.json"
+
+          # Resolve codetracer ref
           if [ -f "${SIBLING_PINS}" ]; then
-            PINS_REF="$(python3 -c "
+            CT_REF="$(python3 -c "
           import json
           with open('${SIBLING_PINS}') as f:
               pins = json.load(f)
           print(pins.get('codetracer', ''))
           " 2>/dev/null)" || true
-            if [ -n "${PINS_REF}" ]; then
-              echo "ref=${PINS_REF}" >> "$GITHUB_OUTPUT"
-              echo "Resolved codetracer ref from sibling-pins.json: ${PINS_REF}"
-              exit 0
-            fi
           fi
-          echo "ref=main" >> "$GITHUB_OUTPUT"
+          echo "codetracer_ref=${CT_REF:-main}" >> "$GITHUB_OUTPUT"
+          echo "Resolved codetracer ref: ${CT_REF:-main}"
+
+          # Resolve trace-format ref (for submodule override)
+          if [ -f "${SIBLING_PINS}" ]; then
+            TF_REF="$(python3 -c "
+          import json
+          with open('${SIBLING_PINS}') as f:
+              pins = json.load(f)
+          print(pins.get('codetracer-trace-format', ''))
+          " 2>/dev/null)" || true
+          fi
+          echo "trace_format_ref=${TF_REF:-}" >> "$GITHUB_OUTPUT"
+          echo "Resolved trace-format ref: ${TF_REF:-<default>}"
 
       - name: Clone codetracer (for path dependencies)
         run: |
-          REF="${{ steps.resolve-ref.outputs.ref }}"
+          REF="${{ steps.resolve-ref.outputs.codetracer_ref }}"
           TOKEN="${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}"
           if [ -n "${TOKEN}" ]; then
             git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "git@github.com:"
@@ -70,6 +80,16 @@ jobs:
           cd "${GITHUB_WORKSPACE}/../codetracer"
           git submodule init libs/codetracer-trace-format 2>/dev/null || true
           git submodule update --depth 1 libs/codetracer-trace-format 2>/dev/null || true
+
+          # Override trace-format to a specific ref if pinned
+          TF_REF="${{ steps.resolve-ref.outputs.trace_format_ref }}"
+          if [ -n "${TF_REF}" ]; then
+            echo "Overriding trace-format submodule to ${TF_REF}"
+            git -C libs/codetracer-trace-format fetch origin "${TF_REF}" 2>/dev/null || \
+              git -C libs/codetracer-trace-format fetch --unshallow origin 2>/dev/null || true
+            git -C libs/codetracer-trace-format checkout "${TF_REF}" 2>/dev/null || \
+              echo "WARN: could not checkout trace-format at ${TF_REF}, using default"
+          fi
 
           echo "Codetracer cloned at: $(realpath "${GITHUB_WORKSPACE}/../codetracer")"
 

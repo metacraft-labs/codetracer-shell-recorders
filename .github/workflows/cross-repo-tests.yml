@@ -80,25 +80,20 @@ jobs:
       - name: Resolve codetracer ref
         id: resolve-ref
         run: |
+          SIBLING_PINS=".github/sibling-pins.json"
+
           # 1. workflow_dispatch input (manual trigger)
           DISPATCH_REF="${{ github.event.inputs.codetracer_ref }}"
           if [ -n "${DISPATCH_REF}" ] && [ "${DISPATCH_REF}" != "main" ]; then
-            echo "ref=${DISPATCH_REF}" >> "$GITHUB_OUTPUT"
+            echo "codetracer_ref=${DISPATCH_REF}" >> "$GITHUB_OUTPUT"
             echo "Resolved codetracer ref from workflow_dispatch: ${DISPATCH_REF}"
-            exit 0
-          fi
-
           # 2. repository_dispatch payload (bidirectional trigger)
-          PAYLOAD_REF="${{ github.event.client_payload.codetracer_ref }}"
-          if [ -n "${PAYLOAD_REF}" ]; then
-            echo "ref=${PAYLOAD_REF}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.client_payload.codetracer_ref }}" ]; then
+            PAYLOAD_REF="${{ github.event.client_payload.codetracer_ref }}"
+            echo "codetracer_ref=${PAYLOAD_REF}" >> "$GITHUB_OUTPUT"
             echo "Resolved codetracer ref from repository_dispatch: ${PAYLOAD_REF}"
-            exit 0
-          fi
-
           # 3. sibling-pins.json
-          SIBLING_PINS=".github/sibling-pins.json"
-          if [ -f "${SIBLING_PINS}" ]; then
+          elif [ -f "${SIBLING_PINS}" ]; then
             PINS_REF="$(python3 -c "
           import json
           with open('${SIBLING_PINS}') as f:
@@ -106,20 +101,33 @@ jobs:
           print(pins.get('codetracer', ''))
           " 2>/dev/null)" || true
             if [ -n "${PINS_REF}" ]; then
-              echo "ref=${PINS_REF}" >> "$GITHUB_OUTPUT"
+              echo "codetracer_ref=${PINS_REF}" >> "$GITHUB_OUTPUT"
               echo "Resolved codetracer ref from sibling-pins.json: ${PINS_REF}"
-              exit 0
+            else
+              echo "codetracer_ref=main" >> "$GITHUB_OUTPUT"
             fi
+          else
+            # 4. Fallback
+            echo "codetracer_ref=main" >> "$GITHUB_OUTPUT"
+            echo "Resolved codetracer ref: main (fallback)"
           fi
 
-          # 4. Fallback
-          echo "ref=main" >> "$GITHUB_OUTPUT"
-          echo "Resolved codetracer ref: main (fallback)"
+          # Resolve trace-format ref (for submodule override)
+          if [ -f "${SIBLING_PINS}" ]; then
+            TF_REF="$(python3 -c "
+          import json
+          with open('${SIBLING_PINS}') as f:
+              pins = json.load(f)
+          print(pins.get('codetracer-trace-format', ''))
+          " 2>/dev/null)" || true
+          fi
+          echo "trace_format_ref=${TF_REF:-}" >> "$GITHUB_OUTPUT"
+          echo "Resolved trace-format ref: ${TF_REF:-<default>}"
 
       # 4. Clone the codetracer repo as a sibling directory
       - name: Clone codetracer repo
         env:
-          CODETRACER_REF: ${{ steps.resolve-ref.outputs.ref }}
+          CODETRACER_REF: ${{ steps.resolve-ref.outputs.codetracer_ref }}
         run: |
           echo "Cloning codetracer at ref: ${CODETRACER_REF}"
 
@@ -163,6 +171,16 @@ jobs:
             done
           fi
           git submodule update --recursive --depth 1
+
+          # Override trace-format submodule to a specific ref if pinned
+          TF_REF="${{ steps.resolve-ref.outputs.trace_format_ref }}"
+          if [ -n "${TF_REF}" ]; then
+            echo "Overriding trace-format submodule to ${TF_REF}"
+            git -C libs/codetracer-trace-format fetch origin "${TF_REF}" 2>/dev/null || \
+              git -C libs/codetracer-trace-format fetch --unshallow origin 2>/dev/null || true
+            git -C libs/codetracer-trace-format checkout "${TF_REF}" 2>/dev/null || \
+              echo "WARN: could not checkout trace-format at ${TF_REF}, using default"
+          fi
 
           echo "Codetracer cloned to: $(realpath "${GITHUB_WORKSPACE}/../codetracer")"
           echo "HEAD: $(git -C "${GITHUB_WORKSPACE}/../codetracer" rev-parse HEAD)"
