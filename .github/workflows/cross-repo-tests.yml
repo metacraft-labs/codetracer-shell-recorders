@@ -197,9 +197,9 @@ jobs:
       # 5. Generate tree-sitter-nim parser (gitignored generated file)
       - name: Generate tree-sitter-nim parser
         run: |
+          npm install -g tree-sitter-cli
           cd "${GITHUB_WORKSPACE}/../codetracer/libs/tree-sitter-nim"
-          npm install
-          npx tree-sitter generate
+          tree-sitter generate
           ls -la src/parser.c
 
       # 6. Run cross-repo integration tests
