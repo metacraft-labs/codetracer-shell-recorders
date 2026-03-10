@@ -907,3 +907,376 @@ fn test_bash_sourced_file() {
         var_names
     );
 }
+
+// ============================================================================
+// M6: End-to-End Validation & CLI Integration Tests
+// ============================================================================
+
+#[test]
+fn e2e_bash_simple_script() {
+    // Record simple.sh, verify COMPLETE trace folder structure
+    let (output_dir, _stdout, _stderr) = record_fixture("simple.sh");
+
+    // trace.json exists and is non-empty
+    let trace_json = output_dir.path().join("trace.json");
+    assert!(trace_json.exists(), "trace.json not found");
+    let trace_size = std::fs::metadata(&trace_json).unwrap().len();
+    assert!(trace_size > 0, "trace.json is empty");
+
+    // trace_metadata.json exists
+    let metadata_json = output_dir.path().join("trace_metadata.json");
+    assert!(metadata_json.exists(), "trace_metadata.json not found");
+
+    // trace_paths.json exists
+    let paths_json = output_dir.path().join("trace_paths.json");
+    assert!(paths_json.exists(), "trace_paths.json not found");
+
+    // trace_db_metadata.json exists with language="bash"
+    let db_metadata_json = output_dir.path().join("trace_db_metadata.json");
+    assert!(
+        db_metadata_json.exists(),
+        "trace_db_metadata.json not found"
+    );
+    let db_meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&db_metadata_json).expect("Failed to read trace_db_metadata.json"),
+    )
+    .expect("Invalid trace_db_metadata.json");
+    assert_eq!(
+        db_meta["language"].as_str(),
+        Some("bash"),
+        "trace_db_metadata.json language should be 'bash'"
+    );
+
+    // symbols.json exists
+    let symbols_json = output_dir.path().join("symbols.json");
+    assert!(symbols_json.exists(), "symbols.json not found");
+    let symbols: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&symbols_json).expect("Failed to read symbols.json"),
+    )
+    .expect("Invalid symbols.json");
+    assert!(symbols.is_array(), "symbols.json should be a JSON array");
+
+    // files/ directory exists with source file copy
+    let files_dir = output_dir.path().join("files");
+    assert!(files_dir.exists(), "files/ directory not found");
+    assert!(files_dir.is_dir(), "files/ should be a directory");
+
+    // Verify the source file was copied — it should be under files/<absolute-path>
+    let fixture = fixture_path("simple.sh");
+    let copied = files_dir.join(fixture.strip_prefix("/").unwrap_or(&fixture));
+    assert!(
+        copied.exists(),
+        "Source file copy not found at expected path: {}",
+        copied.display()
+    );
+
+    // Verify the copied file has the same content as the original
+    let original_content =
+        std::fs::read_to_string(&fixture).expect("Failed to read original simple.sh");
+    let copied_content = std::fs::read_to_string(&copied).expect("Failed to read copied simple.sh");
+    assert_eq!(
+        original_content, copied_content,
+        "Copied source file content should match original"
+    );
+}
+
+#[test]
+fn e2e_bash_multi_file() {
+    // Record with_source.sh which sources sourced_lib.sh
+    let (output_dir, _stdout, _stderr) = record_fixture("with_source.sh");
+
+    // Verify trace_paths.json has both files
+    let paths = read_trace_paths(&output_dir);
+    let has_with_source = paths
+        .iter()
+        .any(|p| p.as_str().map_or(false, |s| s.contains("with_source.sh")));
+    assert!(
+        has_with_source,
+        "trace_paths.json should contain with_source.sh: {:?}",
+        paths
+    );
+    let has_sourced_lib = paths
+        .iter()
+        .any(|p| p.as_str().map_or(false, |s| s.contains("sourced_lib.sh")));
+    assert!(
+        has_sourced_lib,
+        "trace_paths.json should contain sourced_lib.sh: {:?}",
+        paths
+    );
+
+    // Verify files/ directory has copies of BOTH with_source.sh and sourced_lib.sh
+    let files_dir = output_dir.path().join("files");
+    assert!(files_dir.exists(), "files/ directory not found");
+
+    let with_source_fixture = fixture_path("with_source.sh");
+    let sourced_lib_fixture = fixture_path("sourced_lib.sh");
+
+    let copied_with_source = files_dir.join(
+        with_source_fixture
+            .strip_prefix("/")
+            .unwrap_or(&with_source_fixture),
+    );
+    assert!(
+        copied_with_source.exists(),
+        "with_source.sh copy not found at: {}",
+        copied_with_source.display()
+    );
+
+    let copied_sourced_lib = files_dir.join(
+        sourced_lib_fixture
+            .strip_prefix("/")
+            .unwrap_or(&sourced_lib_fixture),
+    );
+    assert!(
+        copied_sourced_lib.exists(),
+        "sourced_lib.sh copy not found at: {}",
+        copied_sourced_lib.display()
+    );
+
+    // Verify content matches
+    let original_ws =
+        std::fs::read_to_string(&with_source_fixture).expect("Failed to read with_source.sh");
+    let copied_ws =
+        std::fs::read_to_string(&copied_with_source).expect("Failed to read copied with_source.sh");
+    assert_eq!(
+        original_ws, copied_ws,
+        "with_source.sh content should match"
+    );
+
+    let original_sl =
+        std::fs::read_to_string(&sourced_lib_fixture).expect("Failed to read sourced_lib.sh");
+    let copied_sl =
+        std::fs::read_to_string(&copied_sourced_lib).expect("Failed to read copied sourced_lib.sh");
+    assert_eq!(
+        original_sl, copied_sl,
+        "sourced_lib.sh content should match"
+    );
+}
+
+#[test]
+fn e2e_bash_complex_script() {
+    // Record comprehensive.sh
+    let (output_dir, stdout, _stderr) = record_fixture("comprehensive.sh");
+
+    // Verify script output contains expected lines
+    assert!(
+        stdout.contains("Starting comprehensive test"),
+        "Expected 'Starting comprehensive test' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("from lib"),
+        "Expected 'from lib' in stdout (from sourced lib_func), got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("positive"),
+        "Expected 'positive' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("negative"),
+        "Expected 'negative' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("zero"),
+        "Expected 'zero' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Done"),
+        "Expected 'Done' in stdout, got: {}",
+        stdout
+    );
+
+    // Read the trace
+    let trace_content = read_trace_json(&output_dir);
+    let trace_events: Vec<serde_json::Value> =
+        serde_json::from_str(&trace_content).expect("trace.json should be valid JSON array");
+
+    // Verify trace has Function events for count_to, classify, lib_func
+    let function_names: Vec<String> = trace_events
+        .iter()
+        .filter_map(|e| {
+            e.get("Function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(String::from)
+        })
+        .collect();
+
+    assert!(
+        function_names.iter().any(|n| n == "count_to"),
+        "trace should have Function event for 'count_to', found: {:?}",
+        function_names
+    );
+    assert!(
+        function_names.iter().any(|n| n == "classify"),
+        "trace should have Function event for 'classify', found: {:?}",
+        function_names
+    );
+    assert!(
+        function_names.iter().any(|n| n == "lib_func"),
+        "trace should have Function event for 'lib_func', found: {:?}",
+        function_names
+    );
+
+    // Verify trace has Step events
+    let step_count = trace_events
+        .iter()
+        .filter(|e| e.get("Step").is_some())
+        .count();
+    assert!(
+        step_count >= 10,
+        "Expected at least 10 Step events in comprehensive.sh, got {}",
+        step_count
+    );
+
+    // Verify trace has Call events
+    let call_count = trace_events
+        .iter()
+        .filter(|e| e.get("Call").is_some())
+        .count();
+    assert!(
+        call_count >= 4,
+        "Expected at least 4 Call events (lib_func, count_to, classify x3), got {}",
+        call_count
+    );
+
+    // Verify trace has Return events
+    let return_count = trace_events
+        .iter()
+        .filter(|e| e.get("Return").is_some())
+        .count();
+    assert!(
+        return_count >= 4,
+        "Expected at least 4 Return events, got {}",
+        return_count
+    );
+
+    // Verify trace has variable events (numbers, config, etc.)
+    let var_names = extract_variable_names(&output_dir);
+    assert!(
+        var_names.contains(&"numbers".to_string()),
+        "Should capture variable 'numbers', found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"config".to_string()),
+        "Should capture variable 'config', found: {:?}",
+        var_names
+    );
+
+    // Verify symbols.json contains the function names
+    let symbols_json = output_dir.path().join("symbols.json");
+    assert!(symbols_json.exists(), "symbols.json not found");
+    let symbols: Vec<String> = serde_json::from_str(
+        &std::fs::read_to_string(&symbols_json).expect("Failed to read symbols.json"),
+    )
+    .expect("Invalid symbols.json");
+    assert!(
+        symbols.iter().any(|s| s == "count_to"),
+        "symbols.json should contain 'count_to', found: {:?}",
+        symbols
+    );
+    assert!(
+        symbols.iter().any(|s| s == "classify"),
+        "symbols.json should contain 'classify', found: {:?}",
+        symbols
+    );
+    assert!(
+        symbols.iter().any(|s| s == "lib_func"),
+        "symbols.json should contain 'lib_func', found: {:?}",
+        symbols
+    );
+}
+
+#[test]
+fn e2e_bash_metadata() {
+    // Record simple.sh
+    let (output_dir, _stdout, _stderr) = record_fixture("simple.sh");
+
+    // Read trace_db_metadata.json
+    let db_metadata_json = output_dir.path().join("trace_db_metadata.json");
+    assert!(
+        db_metadata_json.exists(),
+        "trace_db_metadata.json not found"
+    );
+    let db_meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&db_metadata_json).expect("Failed to read trace_db_metadata.json"),
+    )
+    .expect("Invalid trace_db_metadata.json");
+
+    // Verify: language="bash"
+    assert_eq!(
+        db_meta["language"].as_str(),
+        Some("bash"),
+        "language should be 'bash', got: {:?}",
+        db_meta["language"]
+    );
+
+    // Verify: program contains "simple.sh"
+    let program = db_meta["program"]
+        .as_str()
+        .expect("program field should be a string");
+    assert!(
+        program.contains("simple.sh"),
+        "program should contain 'simple.sh', got: {}",
+        program
+    );
+
+    // Verify: bash_version is non-empty
+    let bash_version = db_meta["bash_version"]
+        .as_str()
+        .expect("bash_version field should be a string");
+    assert!(!bash_version.is_empty(), "bash_version should be non-empty");
+    // Should look like a version number (e.g., 5.2.0)
+    assert!(
+        bash_version.contains('.'),
+        "bash_version should contain a dot (version number), got: {}",
+        bash_version
+    );
+
+    // Verify: recorder field
+    let recorder = db_meta["recorder"]
+        .as_str()
+        .expect("recorder field should be a string");
+    assert_eq!(
+        recorder, "codetracer-bash-recorder",
+        "recorder should be 'codetracer-bash-recorder', got: {}",
+        recorder
+    );
+
+    // Verify: workdir is non-empty
+    let workdir = db_meta["workdir"]
+        .as_str()
+        .expect("workdir field should be a string");
+    assert!(!workdir.is_empty(), "workdir should be non-empty");
+
+    // Verify: args is an array
+    assert!(
+        db_meta["args"].is_array(),
+        "args should be an array, got: {:?}",
+        db_meta["args"]
+    );
+
+    // Also verify that the regular trace_metadata.json still exists and is valid
+    let metadata_json = output_dir.path().join("trace_metadata.json");
+    assert!(
+        metadata_json.exists(),
+        "trace_metadata.json should still exist"
+    );
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&metadata_json).expect("Failed to read trace_metadata.json"),
+    )
+    .expect("Invalid trace_metadata.json");
+    let meta_program = meta["program"]
+        .as_str()
+        .expect("No program field in trace_metadata.json");
+    assert!(
+        meta_program.contains("simple.sh"),
+        "trace_metadata.json program should reference simple.sh, got: {}",
+        meta_program
+    );
+}

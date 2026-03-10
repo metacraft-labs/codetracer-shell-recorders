@@ -90,4 +90,111 @@ _ct_exit_code=$?
 # Wait for the trace writer to finish processing
 wait "$_ct_writer_pid" 2>/dev/null || true
 
+# ============================================================================
+# Post-recording steps: enrich the trace folder for self-containment
+# ============================================================================
+
+# Copy source files into the trace folder for self-containment
+_ct_copy_source_files() {
+    local _ct_paths_file="$_ct_output_dir/trace_paths.json"
+    [[ -f "$_ct_paths_file" ]] || return 0
+
+    # Parse the JSON array of paths using python3 (available on most systems)
+    # Fallback: use simple grep if python3 not available
+    local _ct_paths
+    if command -v python3 >/dev/null 2>&1; then
+        _ct_paths=$(python3 -c "
+import json, sys
+paths = json.load(open('$_ct_paths_file'))
+for p in paths:
+    # Convert Path objects to strings
+    s = str(p) if isinstance(p, str) else p
+    # Handle paths that might be serialized as objects
+    if isinstance(p, dict):
+        continue
+    print(s)
+" 2>/dev/null) || _ct_paths=""
+    else
+        _ct_paths=$(grep -oP '"[^"]*"' "$_ct_paths_file" | tr -d '"')
+    fi
+
+    local _ct_files_dir="$_ct_output_dir/files"
+
+    while IFS= read -r _ct_src; do
+        [[ -z "$_ct_src" ]] && continue
+        [[ -f "$_ct_src" ]] || continue
+
+        # Create the directory structure under files/
+        local _ct_dest="$_ct_files_dir$_ct_src"
+        mkdir -p "$(dirname "$_ct_dest")"
+        cp "$_ct_src" "$_ct_dest" 2>/dev/null || true
+    done <<< "$_ct_paths"
+}
+
+_ct_copy_source_files
+
+# Write enhanced metadata with language-specific fields
+_ct_write_enhanced_metadata() {
+    local _ct_args_json="["
+    local _ct_first=true
+    for _ct_arg in "${_ct_script_args[@]}"; do
+        if [[ "$_ct_first" == true ]]; then
+            _ct_first=false
+        else
+            _ct_args_json+=","
+        fi
+        # Simple JSON string escaping
+        _ct_arg="${_ct_arg//\\/\\\\}"
+        _ct_arg="${_ct_arg//\"/\\\"}"
+        _ct_args_json+="\"$_ct_arg\""
+    done
+    _ct_args_json+="]"
+
+    cat > "$_ct_output_dir/trace_db_metadata.json" <<METADATA
+{
+  "language": "bash",
+  "program": "$_ct_script",
+  "args": $_ct_args_json,
+  "workdir": "$(pwd)",
+  "recorder": "codetracer-bash-recorder",
+  "bash_version": "$(bash --version | head -1 | grep -oP '\d+\.\d+\.\d+')"
+}
+METADATA
+}
+
+_ct_write_enhanced_metadata
+
+# Generate symbols.json from trace data
+# Functions are already in the trace events, but we also write them separately
+# for quick symbol search in the UI
+_ct_write_symbols() {
+    local _ct_trace_file
+    if [[ "$_ct_format" == "json" ]]; then
+        _ct_trace_file="$_ct_output_dir/trace.json"
+    else
+        _ct_trace_file="$_ct_output_dir/trace.bin"
+    fi
+
+    # For JSON format, extract function names from Function events
+    if [[ "$_ct_format" == "json" ]] && [[ -f "$_ct_trace_file" ]] && command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import json
+data = json.load(open('$_ct_trace_file'))
+funcs = []
+seen = set()
+for event in data:
+    if isinstance(event, dict) and 'Function' in event:
+        name = event['Function'].get('name', '')
+        if name and name != '<toplevel>' and name not in seen:
+            funcs.append(name)
+            seen.add(name)
+print(json.dumps(funcs))
+" > "$_ct_output_dir/symbols.json" 2>/dev/null || echo "[]" > "$_ct_output_dir/symbols.json"
+    else
+        echo "[]" > "$_ct_output_dir/symbols.json"
+    fi
+}
+
+_ct_write_symbols
+
 exit "$_ct_exit_code"
