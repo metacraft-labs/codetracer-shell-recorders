@@ -26,16 +26,45 @@ printf 'PATH file=%s\n' "$_ct_target_script" >&3
 declare -A _ct_registered_paths
 _ct_registered_paths["$_ct_target_script"]=1
 
+# Track which functions we've already registered
+declare -A _ct_registered_funcs
+
+# Previous FUNCNAME stack depth (initial depth is 1 for the top-level)
+_ct_prev_depth=1
+
+# Flag: set to 1 inside the RETURN trap so the DEBUG trap skips processing
+_ct_in_return_trap=0
+
+# Quote a value for the wire protocol: if it contains spaces or special chars, wrap in quotes
+_ct_quote_value() {
+    local val="$1"
+    if [[ "$val" =~ [\ \"\\\n] ]]; then
+        val="${val//\\/\\\\}"
+        val="${val//\"/\\\"}"
+        printf '"%s"' "$val"
+    else
+        printf '%s' "$val"
+    fi
+}
+
 # DEBUG trap handler — fires before each simple command
 _ct_debug_trap() {
+    # Capture $? immediately — before any command can clobber it.
+    # This is critical for detecting the return value of a function that just
+    # returned: the DEBUG trap that fires for the next command in the *caller*
+    # sees $? set to the function's exit status.
+    local _ct_status=$?
+
     # BASH_SOURCE[0] is the recorder itself when in the trap function
     # BASH_SOURCE[1] is the actual source file being executed
     local _ct_file="${BASH_SOURCE[1]}"
     local _ct_line="${BASH_LINENO[0]}"
+    local _ct_depth=${#FUNCNAME[@]}
 
-    # Skip events from the recorder itself
+    # Skip events from the recorder itself or when inside the RETURN trap
     [[ "$_ct_file" == "$0" ]] && return 0
     [[ "$_ct_file" == "" ]] && return 0
+    (( _ct_in_return_trap )) && return 0
 
     # Register new source files
     if [[ -z "${_ct_registered_paths[$_ct_file]+x}" ]]; then
@@ -43,13 +72,49 @@ _ct_debug_trap() {
         _ct_registered_paths["$_ct_file"]=1
     fi
 
+    # Detect function return: depth decreased compared to previous trap invocation.
+    # At this point, _ct_status holds the return value of the function that just
+    # returned, because bash restores $? to the function's exit status for the
+    # first command back in the caller's scope.
+    if (( _ct_depth < _ct_prev_depth )); then
+        printf 'RETURN status=%d\n' "$_ct_status" >&3
+    fi
+
+    # Detect function call: depth increased compared to previous trap invocation
+    # FUNCNAME[0] is _ct_debug_trap, FUNCNAME[1] is the function we're inside
+    if (( _ct_depth > _ct_prev_depth )); then
+        local _ct_func_name="${FUNCNAME[1]}"
+
+        # Register function if first time seen
+        if [[ -z "${_ct_registered_funcs[$_ct_func_name]+x}" ]]; then
+            printf 'FUNC name=%s file=%s line=%d\n' "$_ct_func_name" "$_ct_file" "$_ct_line" >&3
+            _ct_registered_funcs["$_ct_func_name"]=1
+        fi
+
+        # Emit CALL event
+        printf 'CALL name=%s\n' "$_ct_func_name" >&3
+    fi
+
+    _ct_prev_depth=$_ct_depth
+
     # Emit step event
     printf 'STEP file=%s line=%d\n' "$_ct_file" "$_ct_line" >&3
 
     return 0  # Don't skip the command
 }
 
+# RETURN trap handler — we keep this trap active so that the DEBUG trap in the
+# caller correctly observes the depth decrease. However, the actual RETURN
+# event emission is handled by the DEBUG trap (which can reliably capture $?).
+# We use the _ct_in_return_trap flag to prevent the DEBUG trap from emitting
+# spurious events for commands inside this handler.
+_ct_return_trap() {
+    _ct_in_return_trap=1
+    _ct_in_return_trap=0
+}
+
 trap '_ct_debug_trap' DEBUG
+trap '_ct_return_trap' RETURN
 
 # Execute the target script by sourcing it so traps apply
 # Set positional parameters for the script
@@ -59,6 +124,7 @@ _ct_exit_code=$?
 
 # Disable traps before cleanup
 trap '' DEBUG
+trap '' RETURN
 
 # Emit EXIT event
 printf 'EXIT code=%d\n' "$_ct_exit_code" >&3

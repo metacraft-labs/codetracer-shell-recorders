@@ -120,11 +120,11 @@ EXIT code=0"#;
                 TraceWriter::register_variable_with_full_value(&mut writer, &name, value_record);
             }
             ct_shell_trace_writer::wire_protocol::WireEvent::Write { content } => {
-                TraceWriter::register_special_event(&mut writer, EventLogKind::Write, &content);
+                TraceWriter::register_special_event(&mut writer, EventLogKind::Write, "", &content);
             }
             ct_shell_trace_writer::wire_protocol::WireEvent::Error { cmd, status } => {
                 let msg = format!("command '{cmd}' exited with status {status}");
-                TraceWriter::register_special_event(&mut writer, EventLogKind::Error, &msg);
+                TraceWriter::register_special_event(&mut writer, EventLogKind::Error, &cmd, &msg);
             }
             ct_shell_trace_writer::wire_protocol::WireEvent::Return { status } => {
                 let type_id = TraceWriter::ensure_type_id(&mut writer, TypeKind::Int, "Int");

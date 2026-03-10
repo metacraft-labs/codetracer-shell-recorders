@@ -85,6 +85,7 @@ impl TraceBridge {
                 TraceWriter::register_special_event(
                     self.writer.as_mut(),
                     EventLogKind::Write,
+                    "",
                     &content,
                 );
             }
@@ -93,6 +94,7 @@ impl TraceBridge {
                 TraceWriter::register_special_event(
                     self.writer.as_mut(),
                     EventLogKind::Error,
+                    &cmd,
                     &message,
                 );
             }
