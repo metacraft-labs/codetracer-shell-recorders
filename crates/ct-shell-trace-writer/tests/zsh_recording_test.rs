@@ -914,3 +914,674 @@ fn e2e_zsh_builtin_filtering() {
         );
     }
 }
+
+// ============================================================================
+// M9: Zsh End-to-End Validation & CLI Integration Tests
+// ============================================================================
+
+fn cross_shell_fixture_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("tests/fixtures/cross_shell")
+        .join(name)
+}
+
+fn bash_launcher_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("bash-recorder/launcher.sh")
+}
+
+/// Run the bash recorder on a cross-shell fixture and return (output_dir, stdout, stderr).
+fn record_bash_fixture(fixture: &str) -> (TempDir, String, String) {
+    build_trace_writer();
+
+    let output_dir = TempDir::new().expect("Failed to create temp dir");
+
+    let output = Command::new("bash")
+        .args([
+            bash_launcher_path().to_str().unwrap(),
+            "--output-dir",
+            output_dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            cross_shell_fixture_path(fixture).to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run bash launcher");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        output.status.success(),
+        "Bash launcher exited with non-zero status for {}: stderr={}",
+        fixture,
+        stderr
+    );
+
+    (output_dir, stdout, stderr)
+}
+
+/// Run the zsh recorder on a cross-shell fixture and return (output_dir, stdout, stderr).
+fn record_zsh_cross_fixture(fixture: &str) -> (TempDir, String, String) {
+    build_trace_writer();
+
+    let output_dir = TempDir::new().expect("Failed to create temp dir");
+
+    let output = Command::new("zsh")
+        .args([
+            launcher_path().to_str().unwrap(),
+            "--output-dir",
+            output_dir.path().to_str().unwrap(),
+            "--format",
+            "json",
+            cross_shell_fixture_path(fixture).to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run zsh launcher");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        output.status.success(),
+        "Zsh launcher exited with non-zero status for {}: stderr={}",
+        fixture,
+        stderr
+    );
+
+    (output_dir, stdout, stderr)
+}
+
+/// Helper: parse trace.json and return all trace events as a Vec.
+fn parse_trace_events(output_dir: &TempDir) -> Vec<serde_json::Value> {
+    let trace_content = read_trace_json(output_dir);
+    serde_json::from_str(&trace_content).expect("trace.json should be valid JSON array")
+}
+
+/// Helper: count events of a specific kind in the trace.
+fn count_events_of_type(events: &[serde_json::Value], event_type: &str) -> usize {
+    events
+        .iter()
+        .filter(|e| e.get(event_type).is_some())
+        .count()
+}
+
+/// Helper: extract all function names from Function events.
+fn extract_function_names(events: &[serde_json::Value]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| {
+            e.get("Function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .map(String::from)
+        })
+        .collect()
+}
+
+#[test]
+fn test_zsh_sourced_file() {
+    require_zsh!();
+    let (output_dir, stdout, _stderr) = record_fixture("with_source.zsh");
+
+    // Verify script produced expected output from sourced function and main script
+    assert!(
+        stdout.contains("lib: hello"),
+        "Expected 'lib: hello' in stdout (from lib_func call), got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("y=15"),
+        "Expected 'y=15' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("LIB_VAR=from_zsh_lib"),
+        "Expected 'LIB_VAR=from_zsh_lib' in stdout, got: {}",
+        stdout
+    );
+
+    // Verify trace_paths.json contains BOTH files
+    let paths = read_trace_paths(&output_dir);
+
+    let has_with_source = paths
+        .iter()
+        .any(|p| p.as_str().map_or(false, |s| s.contains("with_source.zsh")));
+    assert!(
+        has_with_source,
+        "paths should contain with_source.zsh: {:?}",
+        paths
+    );
+
+    let has_sourced_lib = paths.iter().any(|p| {
+        p.as_str()
+            .map_or(false, |s| s.contains("zsh_sourced_lib.zsh"))
+    });
+    assert!(
+        has_sourced_lib,
+        "paths should contain zsh_sourced_lib.zsh (the sourced file): {:?}",
+        paths
+    );
+
+    // Verify Function event for lib_func exists
+    let trace_events = parse_trace_events(&output_dir);
+    let function_names = extract_function_names(&trace_events);
+    assert!(
+        function_names.iter().any(|n| n == "lib_func"),
+        "trace should have Function event for 'lib_func', found: {:?}",
+        function_names
+    );
+
+    // Verify both source files are copied to files/ directory
+    let files_dir = output_dir.path().join("files");
+    assert!(files_dir.exists(), "files/ directory not found");
+
+    let with_source_fixture = fixture_path("with_source.zsh");
+    let copied_with_source = files_dir.join(
+        with_source_fixture
+            .strip_prefix("/")
+            .unwrap_or(&with_source_fixture),
+    );
+    assert!(
+        copied_with_source.exists(),
+        "with_source.zsh copy not found at: {}",
+        copied_with_source.display()
+    );
+
+    let sourced_lib_fixture = fixture_path("zsh_sourced_lib.zsh");
+    let copied_sourced_lib = files_dir.join(
+        sourced_lib_fixture
+            .strip_prefix("/")
+            .unwrap_or(&sourced_lib_fixture),
+    );
+    assert!(
+        copied_sourced_lib.exists(),
+        "zsh_sourced_lib.zsh copy not found at: {}",
+        copied_sourced_lib.display()
+    );
+
+    // Verify content matches for both files
+    let original_ws =
+        std::fs::read_to_string(&with_source_fixture).expect("Failed to read with_source.zsh");
+    let copied_ws = std::fs::read_to_string(&copied_with_source)
+        .expect("Failed to read copied with_source.zsh");
+    assert_eq!(
+        original_ws, copied_ws,
+        "with_source.zsh content should match"
+    );
+
+    let original_sl =
+        std::fs::read_to_string(&sourced_lib_fixture).expect("Failed to read zsh_sourced_lib.zsh");
+    let copied_sl = std::fs::read_to_string(&copied_sourced_lib)
+        .expect("Failed to read copied zsh_sourced_lib.zsh");
+    assert_eq!(
+        original_sl, copied_sl,
+        "zsh_sourced_lib.zsh content should match"
+    );
+
+    // Verify variables from both files are captured
+    let var_names = extract_variable_names(&output_dir);
+    assert!(
+        var_names.contains(&"x".to_string()),
+        "Should capture variable 'x' from with_source.zsh, found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"y".to_string()),
+        "Should capture variable 'y' from with_source.zsh, found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"LIB_VAR".to_string()),
+        "Should capture variable 'LIB_VAR' from zsh_sourced_lib.zsh, found: {:?}",
+        var_names
+    );
+}
+
+#[test]
+fn e2e_zsh_complex_script() {
+    require_zsh!();
+    let (output_dir, stdout, _stderr) = record_fixture("comprehensive.zsh");
+
+    // Verify script produced expected output
+    assert!(
+        stdout.contains("Processing: alpha (#1)"),
+        "Expected 'Processing: alpha (#1)' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Processing: beta (#2)"),
+        "Expected 'Processing: beta (#2)' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Processing: gamma (#3)"),
+        "Expected 'Processing: gamma (#3)' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("lib: done"),
+        "Expected 'lib: done' in stdout (from lib_func call), got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("count=3"),
+        "Expected 'count=3' in stdout, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("pi="),
+        "Expected 'pi=' in stdout, got: {}",
+        stdout
+    );
+
+    // Read the trace
+    let trace_events = parse_trace_events(&output_dir);
+
+    // Verify trace has Step events
+    let step_count = count_events_of_type(&trace_events, "Step");
+    assert!(
+        step_count >= 10,
+        "Expected at least 10 Step events in comprehensive.zsh, got {}",
+        step_count
+    );
+
+    // Verify trace has Call events
+    let call_count = count_events_of_type(&trace_events, "Call");
+    assert!(
+        call_count >= 4,
+        "Expected at least 4 Call events (toplevel + process x3 + lib_func), got {}",
+        call_count
+    );
+
+    // Verify trace has Return events
+    let return_count = count_events_of_type(&trace_events, "Return");
+    assert!(
+        return_count >= 3,
+        "Expected at least 3 Return events (process x3 returns), got {}",
+        return_count
+    );
+
+    // Verify trace has Function events for process and lib_func
+    let function_names = extract_function_names(&trace_events);
+    assert!(
+        function_names.iter().any(|n| n == "process"),
+        "trace should have Function event for 'process', found: {:?}",
+        function_names
+    );
+    assert!(
+        function_names.iter().any(|n| n == "lib_func"),
+        "trace should have Function event for 'lib_func', found: {:?}",
+        function_names
+    );
+
+    // Verify integer, float, array, assoc array variables are captured
+    let var_names = extract_variable_names(&output_dir);
+    assert!(
+        var_names.contains(&"count".to_string()),
+        "Should capture integer variable 'count', found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"pi".to_string()),
+        "Should capture float variable 'pi', found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"items".to_string()),
+        "Should capture array variable 'items', found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"config".to_string()),
+        "Should capture assoc array variable 'config', found: {:?}",
+        var_names
+    );
+    assert!(
+        var_names.contains(&"result".to_string()),
+        "Should capture variable 'result', found: {:?}",
+        var_names
+    );
+
+    // Verify integer variable has Int kind
+    let count_values = find_variable_values(&output_dir, "count");
+    assert!(
+        !count_values.is_empty(),
+        "Should have Value events for 'count'"
+    );
+    let count_kind = count_values[0].get("kind").and_then(|k| k.as_str());
+    assert_eq!(
+        count_kind,
+        Some("Int"),
+        "Variable 'count' should be Int kind (integer), got: {:?}",
+        count_kind
+    );
+
+    // Verify float variable has Float kind
+    let pi_values = find_variable_values(&output_dir, "pi");
+    assert!(!pi_values.is_empty(), "Should have Value events for 'pi'");
+    let pi_kind = pi_values[0].get("kind").and_then(|k| k.as_str());
+    assert_eq!(
+        pi_kind,
+        Some("Float"),
+        "Variable 'pi' should be Float kind, got: {:?}",
+        pi_kind
+    );
+    let pi_f = pi_values[0].get("f").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        pi_f.contains("3.14159"),
+        "Float 'pi' should contain '3.14159', got: {}",
+        pi_f
+    );
+
+    // Verify array variable contains expected elements
+    let items_values = find_variable_values(&output_dir, "items");
+    assert!(
+        !items_values.is_empty(),
+        "Should have Value events for 'items'"
+    );
+    let items_text = items_values[0]
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        items_text.contains("alpha"),
+        "Array 'items' should contain 'alpha', got: {}",
+        items_text
+    );
+    assert!(
+        items_text.contains("beta"),
+        "Array 'items' should contain 'beta', got: {}",
+        items_text
+    );
+    assert!(
+        items_text.contains("gamma"),
+        "Array 'items' should contain 'gamma', got: {}",
+        items_text
+    );
+
+    // Verify assoc array variable contains expected keys
+    let config_values = find_variable_values(&output_dir, "config");
+    assert!(
+        !config_values.is_empty(),
+        "Should have Value events for 'config'"
+    );
+    let config_text = config_values[0]
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        config_text.contains("host"),
+        "Assoc array 'config' should contain key 'host', got: {}",
+        config_text
+    );
+    assert!(
+        config_text.contains("localhost"),
+        "Assoc array 'config' should contain value 'localhost', got: {}",
+        config_text
+    );
+    assert!(
+        config_text.contains("port"),
+        "Assoc array 'config' should contain key 'port', got: {}",
+        config_text
+    );
+    assert!(
+        config_text.contains("8080"),
+        "Assoc array 'config' should contain value '8080', got: {}",
+        config_text
+    );
+
+    // Verify the sourced lib file is tracked in trace_paths.json
+    let paths = read_trace_paths(&output_dir);
+    let has_sourced_lib = paths.iter().any(|p| {
+        p.as_str()
+            .map_or(false, |s| s.contains("zsh_sourced_lib.zsh"))
+    });
+    assert!(
+        has_sourced_lib,
+        "trace_paths.json should contain zsh_sourced_lib.zsh: {:?}",
+        paths
+    );
+    let has_comprehensive = paths.iter().any(|p| {
+        p.as_str()
+            .map_or(false, |s| s.contains("comprehensive.zsh"))
+    });
+    assert!(
+        has_comprehensive,
+        "trace_paths.json should contain comprehensive.zsh: {:?}",
+        paths
+    );
+
+    // Verify symbols.json contains process and lib_func
+    let symbols_json = output_dir.path().join("symbols.json");
+    assert!(symbols_json.exists(), "symbols.json not found");
+    let symbols: Vec<String> = serde_json::from_str(
+        &std::fs::read_to_string(&symbols_json).expect("Failed to read symbols.json"),
+    )
+    .expect("Invalid symbols.json");
+    assert!(
+        symbols.iter().any(|s| s == "process"),
+        "symbols.json should contain 'process', found: {:?}",
+        symbols
+    );
+    assert!(
+        symbols.iter().any(|s| s == "lib_func"),
+        "symbols.json should contain 'lib_func', found: {:?}",
+        symbols
+    );
+
+    // Verify source files are copied (both comprehensive.zsh and zsh_sourced_lib.zsh)
+    let files_dir = output_dir.path().join("files");
+    assert!(files_dir.exists(), "files/ directory not found");
+
+    let comprehensive_fixture = fixture_path("comprehensive.zsh");
+    let copied_comprehensive = files_dir.join(
+        comprehensive_fixture
+            .strip_prefix("/")
+            .unwrap_or(&comprehensive_fixture),
+    );
+    assert!(
+        copied_comprehensive.exists(),
+        "comprehensive.zsh copy not found at: {}",
+        copied_comprehensive.display()
+    );
+
+    let sourced_lib_fixture = fixture_path("zsh_sourced_lib.zsh");
+    let copied_sourced_lib = files_dir.join(
+        sourced_lib_fixture
+            .strip_prefix("/")
+            .unwrap_or(&sourced_lib_fixture),
+    );
+    assert!(
+        copied_sourced_lib.exists(),
+        "zsh_sourced_lib.zsh copy not found at: {}",
+        copied_sourced_lib.display()
+    );
+}
+
+#[test]
+fn e2e_cross_shell_equivalence() {
+    require_zsh!();
+
+    // Record the same logic with both shells
+    let (bash_output, bash_stdout, _bash_stderr) = record_bash_fixture("equivalent.sh");
+    let (zsh_output, zsh_stdout, _zsh_stderr) = record_zsh_cross_fixture("equivalent.zsh");
+
+    // Both should produce the same stdout output
+    assert!(
+        bash_stdout.contains("Hello, World!"),
+        "Bash stdout should contain 'Hello, World!', got: {}",
+        bash_stdout
+    );
+    assert!(
+        zsh_stdout.contains("Hello, World!"),
+        "Zsh stdout should contain 'Hello, World!', got: {}",
+        zsh_stdout
+    );
+    assert!(
+        bash_stdout.contains("result=30"),
+        "Bash stdout should contain 'result=30', got: {}",
+        bash_stdout
+    );
+    assert!(
+        zsh_stdout.contains("result=30"),
+        "Zsh stdout should contain 'result=30', got: {}",
+        zsh_stdout
+    );
+
+    // Parse trace events from both
+    let bash_events = parse_trace_events(&bash_output);
+    let zsh_events = parse_trace_events(&zsh_output);
+
+    // Both should have Step events, and the counts should be within reasonable tolerance
+    let bash_steps = count_events_of_type(&bash_events, "Step");
+    let zsh_steps = count_events_of_type(&zsh_events, "Step");
+    assert!(
+        bash_steps >= 5,
+        "Bash should have at least 5 Step events, got {}",
+        bash_steps
+    );
+    assert!(
+        zsh_steps >= 5,
+        "Zsh should have at least 5 Step events, got {}",
+        zsh_steps
+    );
+    // The step counts should be within a reasonable tolerance (recorders may differ slightly)
+    let step_diff = (bash_steps as i64 - zsh_steps as i64).unsigned_abs() as usize;
+    assert!(
+        step_diff <= 5,
+        "Step count difference should be <= 5 (bash={}, zsh={}, diff={})",
+        bash_steps,
+        zsh_steps,
+        step_diff
+    );
+
+    // Both should have Function events for "greet"
+    let bash_func_names = extract_function_names(&bash_events);
+    let zsh_func_names = extract_function_names(&zsh_events);
+    assert!(
+        bash_func_names.iter().any(|n| n == "greet"),
+        "Bash trace should have Function event for 'greet', found: {:?}",
+        bash_func_names
+    );
+    assert!(
+        zsh_func_names.iter().any(|n| n == "greet"),
+        "Zsh trace should have Function event for 'greet', found: {:?}",
+        zsh_func_names
+    );
+
+    // Both should have Call events for "greet"
+    let bash_calls = count_events_of_type(&bash_events, "Call");
+    let zsh_calls = count_events_of_type(&zsh_events, "Call");
+    assert!(
+        bash_calls >= 1,
+        "Bash should have at least 1 Call event, got {}",
+        bash_calls
+    );
+    assert!(
+        zsh_calls >= 1,
+        "Zsh should have at least 1 Call event, got {}",
+        zsh_calls
+    );
+
+    // Both should have Return events
+    let bash_returns = count_events_of_type(&bash_events, "Return");
+    let zsh_returns = count_events_of_type(&zsh_events, "Return");
+    assert!(
+        bash_returns >= 1,
+        "Bash should have at least 1 Return event, got {}",
+        bash_returns
+    );
+    assert!(
+        zsh_returns >= 1,
+        "Zsh should have at least 1 Return event, got {}",
+        zsh_returns
+    );
+
+    // Both should capture the same set of variables: x, y, z, result
+    let bash_var_names = extract_variable_names(&bash_output);
+    let zsh_var_names = extract_variable_names(&zsh_output);
+
+    for var in &["x", "y", "z", "result"] {
+        assert!(
+            bash_var_names.contains(&var.to_string()),
+            "Bash trace should capture variable '{}', found: {:?}",
+            var,
+            bash_var_names
+        );
+        assert!(
+            zsh_var_names.contains(&var.to_string()),
+            "Zsh trace should capture variable '{}', found: {:?}",
+            var,
+            zsh_var_names
+        );
+    }
+
+    // Verify both traces have the correct language in their metadata
+    let bash_db_meta_path = bash_output.path().join("trace_db_metadata.json");
+    assert!(
+        bash_db_meta_path.exists(),
+        "Bash trace_db_metadata.json not found"
+    );
+    let bash_db_meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&bash_db_meta_path)
+            .expect("Failed to read bash trace_db_metadata.json"),
+    )
+    .expect("Invalid bash trace_db_metadata.json");
+    assert_eq!(
+        bash_db_meta["language"].as_str(),
+        Some("bash"),
+        "Bash trace should have language='bash', got: {:?}",
+        bash_db_meta["language"]
+    );
+
+    let zsh_db_meta_path = zsh_output.path().join("trace_db_metadata.json");
+    assert!(
+        zsh_db_meta_path.exists(),
+        "Zsh trace_db_metadata.json not found"
+    );
+    let zsh_db_meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&zsh_db_meta_path)
+            .expect("Failed to read zsh trace_db_metadata.json"),
+    )
+    .expect("Invalid zsh trace_db_metadata.json");
+    assert_eq!(
+        zsh_db_meta["language"].as_str(),
+        Some("zsh"),
+        "Zsh trace should have language='zsh', got: {:?}",
+        zsh_db_meta["language"]
+    );
+
+    // Verify both produce symbols.json with "greet"
+    let bash_symbols_path = bash_output.path().join("symbols.json");
+    assert!(bash_symbols_path.exists(), "Bash symbols.json not found");
+    let bash_symbols: Vec<String> = serde_json::from_str(
+        &std::fs::read_to_string(&bash_symbols_path).expect("Failed to read bash symbols.json"),
+    )
+    .expect("Invalid bash symbols.json");
+    assert!(
+        bash_symbols.iter().any(|s| s == "greet"),
+        "Bash symbols.json should contain 'greet', found: {:?}",
+        bash_symbols
+    );
+
+    let zsh_symbols_path = zsh_output.path().join("symbols.json");
+    assert!(zsh_symbols_path.exists(), "Zsh symbols.json not found");
+    let zsh_symbols: Vec<String> = serde_json::from_str(
+        &std::fs::read_to_string(&zsh_symbols_path).expect("Failed to read zsh symbols.json"),
+    )
+    .expect("Invalid zsh symbols.json");
+    assert!(
+        zsh_symbols.iter().any(|s| s == "greet"),
+        "Zsh symbols.json should contain 'greet', found: {:?}",
+        zsh_symbols
+    );
+}
