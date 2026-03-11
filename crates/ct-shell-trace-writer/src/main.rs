@@ -10,14 +10,14 @@ use ct_shell_trace_writer::wire_protocol;
 
 fn print_usage() {
     eprintln!(
-        "Usage: ct-shell-trace-writer --output-dir <path> [--format binary|json] \
+        "Usage: ct-shell-trace-writer --out-dir <path> [--format binary|json] \
          [--program <name>] [--args <arg1> <arg2> ...]"
     );
     eprintln!();
     eprintln!("Reads wire protocol events from stdin and writes a CodeTracer trace.");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --output-dir <path>   Directory where trace files are written (required)");
+    eprintln!("  --out-dir <path>   Directory where trace files are written (required)");
     eprintln!("  --format <fmt>        Output format: binary (default) or json");
     eprintln!("  --program <name>      Override program name (normally from START event)");
     eprintln!("  --args <arg> ...      Program arguments for metadata");
@@ -53,10 +53,10 @@ fn parse_cli_args() -> Result<CliArgs, String> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--output-dir" => {
+            "--out-dir" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("--output-dir requires a value".to_string());
+                    return Err("--out-dir requires a value".to_string());
                 }
                 output_dir = Some(PathBuf::from(&args[i]));
             }
@@ -94,7 +94,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
         i += 1;
     }
 
-    let output_dir = output_dir.ok_or("--output-dir is required")?;
+    let output_dir = output_dir.ok_or("--out-dir is required")?;
 
     Ok(CliArgs {
         output_dir,

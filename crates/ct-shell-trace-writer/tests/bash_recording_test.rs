@@ -49,7 +49,7 @@ fn record_fixture(fixture: &str) -> (TempDir, String, String) {
     let output = Command::new("bash")
         .args([
             launcher_path().to_str().unwrap(),
-            "--output-dir",
+            "--out-dir",
             output_dir.path().to_str().unwrap(),
             "--format",
             "json",
@@ -156,7 +156,7 @@ fn e2e_bash_basic_recording() {
     let output = Command::new("bash")
         .args([
             launcher_path().to_str().unwrap(),
-            "--output-dir",
+            "--out-dir",
             output_dir.path().to_str().unwrap(),
             "--format",
             "binary",
