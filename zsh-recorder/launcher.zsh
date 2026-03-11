@@ -1,7 +1,7 @@
 #!/bin/zsh
 # ct-zsh-recorder launcher: Sets up the pipe between recorder.zsh and ct-shell-trace-writer.
 #
-# Usage: launcher.zsh --output-dir <dir> [--format binary|json] <script.zsh> [script-args...]
+# Usage: launcher.zsh --out-dir <dir> [--format binary|json] <script.zsh> [script-args...]
 
 set -eo pipefail
 
@@ -14,7 +14,7 @@ _ct_script_args=()
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --output-dir)
+        --out-dir)
             _ct_output_dir="$2"
             shift 2
             ;;
@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$_ct_output_dir" ]]; then
-    echo "Error: --output-dir is required" >&2
+    echo "Error: --out-dir is required" >&2
     exit 1
 fi
 
@@ -80,7 +80,7 @@ mkfifo "$_ct_fifo"
 trap 'rm -f "$_ct_fifo"' EXIT
 
 # Start the trace writer reading from the FIFO, passing the program name for metadata
-"$_ct_trace_writer" --output-dir "$_ct_output_dir" --format "$_ct_format" --program "$_ct_script" < "$_ct_fifo" &
+"$_ct_trace_writer" --out-dir "$_ct_output_dir" --format "$_ct_format" --program "$_ct_script" < "$_ct_fifo" &
 _ct_writer_pid=$!
 
 # Run the recorder with FD 3 connected to the FIFO

@@ -68,7 +68,7 @@ fn record_fixture(fixture: &str) -> (TempDir, String, String) {
     let output = Command::new("zsh")
         .args([
             launcher_path().to_str().unwrap(),
-            "--output-dir",
+            "--out-dir",
             output_dir.path().to_str().unwrap(),
             "--format",
             "json",
@@ -947,7 +947,7 @@ fn record_bash_fixture(fixture: &str) -> (TempDir, String, String) {
     let output = Command::new("bash")
         .args([
             bash_launcher_path().to_str().unwrap(),
-            "--output-dir",
+            "--out-dir",
             output_dir.path().to_str().unwrap(),
             "--format",
             "json",
@@ -978,7 +978,7 @@ fn record_zsh_cross_fixture(fixture: &str) -> (TempDir, String, String) {
     let output = Command::new("zsh")
         .args([
             launcher_path().to_str().unwrap(),
-            "--output-dir",
+            "--out-dir",
             output_dir.path().to_str().unwrap(),
             "--format",
             "json",

@@ -39,3 +39,8 @@ lint:
 # Run cross-repo integration tests against sibling codetracer repo
 cross-test *ARGS:
     bash scripts/run-cross-repo-tests.sh {{ ARGS }}
+
+# Bump version in Cargo.toml (usage: just bump-version 0.2.0)
+bump-version version:
+    sed -i 's/^version = ".*"/version = "{{version}}"/' crates/ct-shell-trace-writer/Cargo.toml
+    @echo "ct-shell-trace-writer → {{version}}"
