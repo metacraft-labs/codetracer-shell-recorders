@@ -8,6 +8,15 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     pre-commit-hooks.url = "github:cachix/git-hooks.nix";
+
+    # Non-flake source for the codetracer trace format crates.
+    # The Rust crates in this repo depend on codetracer_trace_types and
+    # codetracer_trace_writer via relative path deps. This input provides the
+    # source so Nix package builds can resolve those paths.
+    codetracer-trace-format = {
+      url = "github:metacraft-labs/codetracer-trace-format/ffi-crate-and-format-fixes";
+      flake = false;
+    };
   };
 
   outputs =
@@ -16,6 +25,7 @@
       nixpkgs,
       fenix,
       pre-commit-hooks,
+      codetracer-trace-format,
     }:
     let
       systems = [
@@ -88,6 +98,65 @@
               ++ preCommit.enabledPackages;
 
             inherit (preCommit) shellHook;
+          };
+        }
+      );
+
+      packages = forEachSystem (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          isDarwin = pkgs.stdenv.isDarwin;
+        in
+        {
+          # The ct-shell-trace-writer binary reads debugger wire-protocol events
+          # from stdin and writes a CodeTracer trace. This package also installs
+          # the bash and zsh launcher/recorder scripts.
+          default = pkgs.rustPlatform.buildRustPackage {
+            pname = "ct-shell-trace-writer";
+            version = "0.1.0";
+
+            src = ./.;
+
+            cargoLock.lockFile = ./Cargo.lock;
+
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              capnproto
+            ];
+
+            buildInputs = pkgs.lib.optionals isDarwin (
+              with pkgs;
+              [
+                libiconv
+                darwin.apple_sdk.frameworks.CoreFoundation
+                darwin.apple_sdk.frameworks.Security
+              ]
+            );
+
+            # The Cargo.toml references codetracer_trace_types and
+            # codetracer_trace_writer via relative path deps that assume a
+            # sibling codetracer repo checkout. Patch them to point at the
+            # codetracer-trace-format flake input in the nix store instead.
+            postPatch = ''
+              substituteInPlace crates/ct-shell-trace-writer/Cargo.toml \
+                --replace-fail \
+                  'path = "../../../codetracer/libs/codetracer-trace-format/codetracer_trace_types"' \
+                  'path = "${codetracer-trace-format}/codetracer_trace_types"' \
+                --replace-fail \
+                  'path = "../../../codetracer/libs/codetracer-trace-format/codetracer_trace_writer"' \
+                  'path = "${codetracer-trace-format}/codetracer_trace_writer"'
+            '';
+
+            # Install the binary plus the shell launcher/recorder scripts
+            postInstall = ''
+              cp -r bash-recorder $out/
+              cp -r zsh-recorder $out/
+            '';
+
+            # Integration tests require a full codetracer checkout with trace
+            # fixtures, so they are not runnable inside the Nix sandbox.
+            doCheck = false;
           };
         }
       );
