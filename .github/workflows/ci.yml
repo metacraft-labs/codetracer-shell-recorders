@@ -29,28 +29,18 @@ jobs:
       - name: Resolve dependency refs
         id: resolve-ref
         run: |
-          SIBLING_PINS=".github/sibling-pins.json"
+          SIBLING_PINS=".github/sibling-pins"
 
           # Resolve codetracer ref
           if [ -f "${SIBLING_PINS}" ]; then
-            CT_REF="$(python3 -c "
-          import json
-          with open('${SIBLING_PINS}') as f:
-              pins = json.load(f)
-          print(pins.get('codetracer', ''))
-          " 2>/dev/null)" || true
+            CT_REF="$(grep '^codetracer ' "${SIBLING_PINS}" | cut -d' ' -f2)" || true
           fi
           echo "codetracer_ref=${CT_REF:-main}" >> "$GITHUB_OUTPUT"
           echo "Resolved codetracer ref: ${CT_REF:-main}"
 
           # Resolve trace-format ref (for submodule override)
           if [ -f "${SIBLING_PINS}" ]; then
-            TF_REF="$(python3 -c "
-          import json
-          with open('${SIBLING_PINS}') as f:
-              pins = json.load(f)
-          print(pins.get('codetracer-trace-format', ''))
-          " 2>/dev/null)" || true
+            TF_REF="$(grep '^codetracer-trace-format ' "${SIBLING_PINS}" | cut -d' ' -f2)" || true
           fi
           echo "trace_format_ref=${TF_REF:-}" >> "$GITHUB_OUTPUT"
           echo "Resolved trace-format ref: ${TF_REF:-<default>}"

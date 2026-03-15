@@ -21,7 +21,7 @@
 #   Priority cascade for resolving the codetracer ref:
 #     1. workflow_dispatch input `codetracer_ref` (manual override)
 #     2. repository_dispatch `client_payload.codetracer_ref` (bidirectional)
-#     3. `.github/sibling-pins.json` (lock file)
+#     3. `.github/sibling-pins` (lock file)
 #     4. Fallback to `main`
 
 name: Cross-Repo Integration Tests
@@ -84,7 +84,7 @@ jobs:
       - name: Resolve codetracer ref
         id: resolve-ref
         run: |
-          SIBLING_PINS=".github/sibling-pins.json"
+          SIBLING_PINS=".github/sibling-pins"
 
           # 1. workflow_dispatch input (manual trigger)
           DISPATCH_REF="${{ github.event.inputs.codetracer_ref }}"
@@ -96,17 +96,12 @@ jobs:
             PAYLOAD_REF="${{ github.event.client_payload.codetracer_ref }}"
             echo "codetracer_ref=${PAYLOAD_REF}" >> "$GITHUB_OUTPUT"
             echo "Resolved codetracer ref from repository_dispatch: ${PAYLOAD_REF}"
-          # 3. sibling-pins.json
+          # 3. sibling-pins
           elif [ -f "${SIBLING_PINS}" ]; then
-            PINS_REF="$(python3 -c "
-          import json
-          with open('${SIBLING_PINS}') as f:
-              pins = json.load(f)
-          print(pins.get('codetracer', ''))
-          " 2>/dev/null)" || true
+            PINS_REF="$(grep '^codetracer ' "${SIBLING_PINS}" | cut -d' ' -f2)" || true
             if [ -n "${PINS_REF}" ]; then
               echo "codetracer_ref=${PINS_REF}" >> "$GITHUB_OUTPUT"
-              echo "Resolved codetracer ref from sibling-pins.json: ${PINS_REF}"
+              echo "Resolved codetracer ref from sibling-pins: ${PINS_REF}"
             else
               echo "codetracer_ref=main" >> "$GITHUB_OUTPUT"
             fi
@@ -118,12 +113,7 @@ jobs:
 
           # Resolve trace-format ref (for submodule override)
           if [ -f "${SIBLING_PINS}" ]; then
-            TF_REF="$(python3 -c "
-          import json
-          with open('${SIBLING_PINS}') as f:
-              pins = json.load(f)
-          print(pins.get('codetracer-trace-format', ''))
-          " 2>/dev/null)" || true
+            TF_REF="$(grep '^codetracer-trace-format ' "${SIBLING_PINS}" | cut -d' ' -f2)" || true
           fi
           echo "trace_format_ref=${TF_REF:-}" >> "$GITHUB_OUTPUT"
           echo "Resolved trace-format ref: ${TF_REF:-<default>}"
