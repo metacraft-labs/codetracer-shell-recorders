@@ -119,6 +119,7 @@ impl TraceBridge {
         let events_ext = match self.format {
             TraceEventsFileFormat::Json => "trace.json",
             TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => "trace.bin",
+            TraceEventsFileFormat::Ctfs => "trace.ct",
         };
         let events_path = self.output_dir.join(events_ext);
         let metadata_path = self.output_dir.join("trace_metadata.json");
