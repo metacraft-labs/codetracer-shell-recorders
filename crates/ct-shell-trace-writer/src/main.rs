@@ -18,7 +18,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --out-dir <path>   Directory where trace files are written (required)");
-    eprintln!("  --format <fmt>        Output format: binary (default) or json");
+    eprintln!("  --format <fmt>        Output format: ctfs (default), binary, or json");
     eprintln!("  --program <name>      Override program name (normally from START event)");
     eprintln!("  --args <arg> ...      Program arguments for metadata");
     eprintln!("  --version             Print version and exit");
@@ -46,7 +46,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
     }
 
     let mut output_dir: Option<PathBuf> = None;
-    let mut format = TraceEventsFileFormat::Binary;
+    let mut format = TraceEventsFileFormat::Ctfs;
     let mut program = String::from("unknown");
     let mut extra_args: Vec<String> = Vec::new();
 
@@ -68,6 +68,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                 format = match args[i].as_str() {
                     "binary" => TraceEventsFileFormat::Binary,
                     "json" => TraceEventsFileFormat::Json,
+                    "ctfs" | "ct" => TraceEventsFileFormat::Ctfs,
                     other => return Err(format!("unknown format: {other}")),
                 };
             }
