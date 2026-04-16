@@ -14,7 +14,7 @@
     # codetracer_trace_writer via relative path deps. This input provides the
     # source so Nix package builds can resolve those paths.
     codetracer-trace-format = {
-      url = "github:metacraft-labs/codetracer-trace-format/ffi-crate-and-format-fixes";
+      url = "github:metacraft-labs/codetracer-trace-format/main";
       flake = false;
     };
   };
@@ -136,15 +136,15 @@
 
             # The Cargo.toml references codetracer_trace_types and
             # codetracer_trace_writer via relative path deps that assume a
-            # sibling codetracer repo checkout. Patch them to point at the
-            # codetracer-trace-format flake input in the nix store instead.
+            # sibling codetracer-trace-format repo checkout. Patch them to
+            # point at the codetracer-trace-format flake input in the nix store.
             postPatch = ''
               substituteInPlace crates/ct-shell-trace-writer/Cargo.toml \
                 --replace-fail \
-                  'path = "../../../codetracer/libs/codetracer-trace-format/codetracer_trace_types"' \
+                  'path = "../../../codetracer-trace-format/codetracer_trace_types"' \
                   'path = "${codetracer-trace-format}/codetracer_trace_types"' \
                 --replace-fail \
-                  'path = "../../../codetracer/libs/codetracer-trace-format/codetracer_trace_writer"' \
+                  'path = "../../../codetracer-trace-format/codetracer_trace_writer"' \
                   'path = "${codetracer-trace-format}/codetracer_trace_writer"'
             '';
 
