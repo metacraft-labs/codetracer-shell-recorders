@@ -184,6 +184,29 @@ jobs:
           echo "Codetracer cloned to: $(realpath "${GITHUB_WORKSPACE}/../codetracer")"
           echo "HEAD: $(git -C "${GITHUB_WORKSPACE}/../codetracer" rev-parse HEAD)"
 
+      # 4b. Clone codetracer-trace-format as a direct sibling (Cargo.toml path deps)
+      - name: Clone codetracer-trace-format (path dependency)
+        run: |
+          TF_REF="${{ steps.resolve-ref.outputs.trace_format_ref }}"
+          TOKEN="${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}"
+          if [ -n "${TOKEN}" ]; then
+            CLONE_URL="https://x-access-token:${TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git"
+          else
+            CLONE_URL="https://github.com/metacraft-labs/codetracer-trace-format.git"
+          fi
+
+          rm -rf "${GITHUB_WORKSPACE}/../codetracer-trace-format"
+          if [ -n "${TF_REF}" ]; then
+            if ! git clone --depth 1 --branch "${TF_REF}" --single-branch \
+              "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer-trace-format" 2>/dev/null; then
+              rm -rf "${GITHUB_WORKSPACE}/../codetracer-trace-format"
+              git clone --no-checkout "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer-trace-format"
+              git -C "${GITHUB_WORKSPACE}/../codetracer-trace-format" checkout "${TF_REF}"
+            fi
+          else
+            git clone --depth 1 "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer-trace-format"
+          fi
+
       # 5. Generate tree-sitter-nim parser (gitignored generated file)
       - name: Generate tree-sitter-nim parser
         run: |

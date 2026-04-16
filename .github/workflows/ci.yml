@@ -23,65 +23,44 @@ jobs:
           name: nix-community
           skipPush: true
 
-      # The Cargo.toml uses relative path dependencies to the sibling
-      # codetracer repo (../../codetracer/libs/codetracer-trace-format/).
-      # Clone it so cargo can resolve these.
+      # The Cargo.toml uses relative path dependencies that resolve to
+      # ../../codetracer-trace-format/ from the repo root. Clone it as
+      # a sibling directory so cargo can resolve these paths.
       - name: Resolve dependency refs
         id: resolve-ref
         run: |
+          # Try plain-text sibling-pins first, fall back to JSON
           SIBLING_PINS=".github/sibling-pins"
+          SIBLING_PINS_JSON=".github/sibling-pins.json"
 
-          # Resolve codetracer ref
-          if [ -f "${SIBLING_PINS}" ]; then
-            CT_REF="$(grep '^codetracer ' "${SIBLING_PINS}" | cut -d' ' -f2)" || true
-          fi
-          echo "codetracer_ref=${CT_REF:-main}" >> "$GITHUB_OUTPUT"
-          echo "Resolved codetracer ref: ${CT_REF:-main}"
-
-          # Resolve trace-format ref (for submodule override)
+          # Resolve trace-format ref
           if [ -f "${SIBLING_PINS}" ]; then
             TF_REF="$(grep '^codetracer-trace-format ' "${SIBLING_PINS}" | cut -d' ' -f2)" || true
+          elif [ -f "${SIBLING_PINS_JSON}" ]; then
+            TF_REF="$(python3 -c "import json,sys; d=json.load(open('${SIBLING_PINS_JSON}')); print(d.get('codetracer-trace-format',''))" 2>/dev/null)" || true
           fi
-          echo "trace_format_ref=${TF_REF:-}" >> "$GITHUB_OUTPUT"
-          echo "Resolved trace-format ref: ${TF_REF:-<default>}"
+          echo "trace_format_ref=${TF_REF:-main}" >> "$GITHUB_OUTPUT"
+          echo "Resolved trace-format ref: ${TF_REF:-main}"
 
-      - name: Clone codetracer (for path dependencies)
+      - name: Clone codetracer-trace-format (path dependency)
         run: |
-          REF="${{ steps.resolve-ref.outputs.codetracer_ref }}"
+          TF_REF="${{ steps.resolve-ref.outputs.trace_format_ref }}"
           TOKEN="${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}"
           if [ -n "${TOKEN}" ]; then
-            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "git@github.com:"
-            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
-            CLONE_URL="https://x-access-token:${TOKEN}@github.com/metacraft-labs/codetracer.git"
+            CLONE_URL="https://x-access-token:${TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git"
           else
-            CLONE_URL="https://github.com/metacraft-labs/codetracer.git"
+            CLONE_URL="https://github.com/metacraft-labs/codetracer-trace-format.git"
           fi
 
-          # Only need the trace-format libs (not submodules) for building
-          if ! git clone --depth 1 --branch "${REF}" --single-branch \
-            "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer" 2>/dev/null; then
-            rm -rf "${GITHUB_WORKSPACE}/../codetracer"
-            git clone --no-checkout "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer"
-            git -C "${GITHUB_WORKSPACE}/../codetracer" checkout "${REF}"
+          rm -rf "${GITHUB_WORKSPACE}/../codetracer-trace-format"
+          if ! git clone --depth 1 --branch "${TF_REF}" --single-branch \
+            "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer-trace-format" 2>/dev/null; then
+            rm -rf "${GITHUB_WORKSPACE}/../codetracer-trace-format"
+            git clone --no-checkout "${CLONE_URL}" "${GITHUB_WORKSPACE}/../codetracer-trace-format"
+            git -C "${GITHUB_WORKSPACE}/../codetracer-trace-format" checkout "${TF_REF}"
           fi
 
-          # Only init the trace-format submodule (capnproto schema), skip others
-          # to avoid needing auth tokens for private submodules like tree-sitter-nim
-          cd "${GITHUB_WORKSPACE}/../codetracer"
-          git submodule init libs/codetracer-trace-format 2>/dev/null || true
-          git submodule update --depth 1 libs/codetracer-trace-format 2>/dev/null || true
-
-          # Override trace-format to a specific ref if pinned
-          TF_REF="${{ steps.resolve-ref.outputs.trace_format_ref }}"
-          if [ -n "${TF_REF}" ]; then
-            echo "Overriding trace-format submodule to ${TF_REF}"
-            git -C libs/codetracer-trace-format fetch origin "${TF_REF}" 2>/dev/null || \
-              git -C libs/codetracer-trace-format fetch --unshallow origin 2>/dev/null || true
-            git -C libs/codetracer-trace-format checkout "${TF_REF}" 2>/dev/null || \
-              echo "WARN: could not checkout trace-format at ${TF_REF}, using default"
-          fi
-
-          echo "Codetracer cloned at: $(realpath "${GITHUB_WORKSPACE}/../codetracer")"
+          echo "codetracer-trace-format cloned at: $(realpath "${GITHUB_WORKSPACE}/../codetracer-trace-format")"
 
       - name: Build
         run: nix develop --command just build
