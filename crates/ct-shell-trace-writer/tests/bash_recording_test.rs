@@ -704,7 +704,7 @@ fn find_trace_events_by_kind(output_dir: &TempDir, kind: u64) -> Vec<serde_json:
 
 #[test]
 fn test_bash_error_trap() {
-    // Record errors.sh — it contains `false` and `ls /nonexistent/path`
+    // Record errors.sh — it contains `false` and `ls /ct_recorder_test_nonexistent_path_xyzzy`
     // which both fail. The script should still complete.
     let (output_dir, stdout, _stderr) = record_fixture("errors.sh");
 
@@ -718,10 +718,10 @@ fn test_bash_error_trap() {
     // Read trace.json and find Error events (kind=11)
     let error_events = find_trace_events_by_kind(&output_dir, 11);
 
-    // We expect at least 2 Error events: one for `false` and one for `ls /nonexistent/path`
+    // We expect at least 2 Error events: one for `false` and one for `ls` on a nonexistent path
     assert!(
         error_events.len() >= 2,
-        "Expected at least 2 Error events for 'false' and 'ls /nonexistent/path', got {}: {:?}",
+        "Expected at least 2 Error events for 'false' and 'ls' on nonexistent path, got {}: {:?}",
         error_events.len(),
         error_events
     );

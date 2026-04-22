@@ -185,11 +185,16 @@ impl TraceBridge {
     }
 
     /// Finalize trace files. Call this after EXIT or on EOF.
+    ///
+    /// This finishes all three output streams (events, metadata, paths) and then
+    /// closes the writer. For the Nim CTFS backend, `close()` is the step that
+    /// actually flushes the `.ct` container file to disk.
     pub fn finish(&mut self) -> Result<(), Box<dyn Error>> {
         if self.started {
             TraceWriter::finish_writing_trace_events(self.writer.as_mut())?;
             TraceWriter::finish_writing_trace_metadata(self.writer.as_mut())?;
             TraceWriter::finish_writing_trace_paths(self.writer.as_mut())?;
+            TraceWriter::close(self.writer.as_mut())?;
         }
         Ok(())
     }

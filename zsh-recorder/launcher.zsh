@@ -179,9 +179,12 @@ _ct_write_symbols() {
         _ct_trace_file="$_ct_output_dir/trace.bin"
     fi
 
-    # For JSON format, extract function names from Function events
-    if [[ "$_ct_format" == "json" ]] && [[ -f "$_ct_trace_file" ]] && command -v python3 >/dev/null 2>&1; then
-        python3 -c "
+    # For JSON format, extract function names from Function events.
+    # We try python3 first for robust JSON parsing, then fall back to grep+sed
+    # for environments where python3 is not available (e.g. Nix dev shells).
+    if [[ "$_ct_format" == "json" ]] && [[ -f "$_ct_trace_file" ]]; then
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c "
 import json
 data = json.load(open('$_ct_trace_file'))
 funcs = []
@@ -194,6 +197,38 @@ for event in data:
             seen.add(name)
 print(json.dumps(funcs))
 " > "$_ct_output_dir/symbols.json" 2>/dev/null || echo "[]" > "$_ct_output_dir/symbols.json"
+        else
+            # Fallback: extract function names using grep and sed.
+            # Matches {"Function":{"path_id":N,"line":N,"name":"NAME"}} patterns
+            # and filters out the synthetic <toplevel> entry.
+            local _ct_names
+            _ct_names=$(grep -oP '"Function":\{[^}]*"name":"[^"]*"' "$_ct_trace_file" 2>/dev/null \
+                | sed 's/.*"name":"\([^"]*\)"/\1/' \
+                | grep -v '^<toplevel>$' \
+                | awk '!seen[$0]++') || true
+
+            if [[ -n "$_ct_names" ]]; then
+                # Build a JSON array from the newline-separated names
+                local _ct_json="["
+                local _ct_first=true
+                while IFS= read -r _ct_fname; do
+                    [[ -z "$_ct_fname" ]] && continue
+                    if [[ "$_ct_first" == true ]]; then
+                        _ct_first=false
+                    else
+                        _ct_json+=","
+                    fi
+                    # Escape backslashes and quotes for JSON
+                    _ct_fname="${_ct_fname//\\/\\\\}"
+                    _ct_fname="${_ct_fname//\"/\\\"}"
+                    _ct_json+="\"$_ct_fname\""
+                done <<< "$_ct_names"
+                _ct_json+="]"
+                echo "$_ct_json" > "$_ct_output_dir/symbols.json"
+            else
+                echo "[]" > "$_ct_output_dir/symbols.json"
+            fi
+        fi
     else
         echo "[]" > "$_ct_output_dir/symbols.json"
     fi
