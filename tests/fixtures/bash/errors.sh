@@ -4,6 +4,6 @@ x=1
 false
 y=2
 # This will also fail
-ls /nonexistent/path 2>/dev/null
+ls /ct_recorder_test_nonexistent_path_xyzzy 2>/dev/null
 z=3
 echo "done"
