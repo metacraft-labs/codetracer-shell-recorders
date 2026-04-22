@@ -168,72 +168,11 @@ METADATA
 
 _ct_write_enhanced_metadata
 
-# Generate symbols.json from trace data
-# Functions are already in the trace events, but we also write them separately
-# for quick symbol search in the UI
-_ct_write_symbols() {
-    local _ct_trace_file
-    if [[ "$_ct_format" == "json" ]]; then
-        _ct_trace_file="$_ct_output_dir/trace.json"
-    else
-        _ct_trace_file="$_ct_output_dir/trace.bin"
-    fi
-
-    # For JSON format, extract function names from Function events.
-    # We try python3 first for robust JSON parsing, then fall back to grep+sed
-    # for environments where python3 is not available (e.g. Nix dev shells).
-    if [[ "$_ct_format" == "json" ]] && [[ -f "$_ct_trace_file" ]]; then
-        if command -v python3 >/dev/null 2>&1; then
-            python3 -c "
-import json
-data = json.load(open('$_ct_trace_file'))
-funcs = []
-seen = set()
-for event in data:
-    if isinstance(event, dict) and 'Function' in event:
-        name = event['Function'].get('name', '')
-        if name and name != '<toplevel>' and name not in seen:
-            funcs.append(name)
-            seen.add(name)
-print(json.dumps(funcs))
-" > "$_ct_output_dir/symbols.json" 2>/dev/null || echo "[]" > "$_ct_output_dir/symbols.json"
-        else
-            # Fallback: extract function names using grep and sed.
-            # Matches {"Function":{"path_id":N,"line":N,"name":"NAME"}} patterns
-            # and filters out the synthetic <toplevel> entry.
-            local _ct_names
-            _ct_names=$(grep -oP '"Function":\{[^}]*"name":"[^"]*"' "$_ct_trace_file" 2>/dev/null \
-                | sed 's/.*"name":"\([^"]*\)"/\1/' \
-                | grep -v '^<toplevel>$' \
-                | awk '!seen[$0]++') || true
-
-            if [[ -n "$_ct_names" ]]; then
-                # Build a JSON array from the newline-separated names
-                local _ct_json="["
-                local _ct_first=true
-                while IFS= read -r _ct_fname; do
-                    [[ -z "$_ct_fname" ]] && continue
-                    if [[ "$_ct_first" == true ]]; then
-                        _ct_first=false
-                    else
-                        _ct_json+=","
-                    fi
-                    # Escape backslashes and quotes for JSON
-                    _ct_fname="${_ct_fname//\\/\\\\}"
-                    _ct_fname="${_ct_fname//\"/\\\"}"
-                    _ct_json+="\"$_ct_fname\""
-                done <<< "$_ct_names"
-                _ct_json+="]"
-                echo "$_ct_json" > "$_ct_output_dir/symbols.json"
-            else
-                echo "[]" > "$_ct_output_dir/symbols.json"
-            fi
-        fi
-    else
-        echo "[]" > "$_ct_output_dir/symbols.json"
-    fi
-}
-
-_ct_write_symbols
+# The trace writer binary now writes symbols.json directly as a sidecar file
+# alongside the .ct container. Only write an empty fallback if the trace writer
+# did not produce one (e.g. if it crashed before finishing).
+if [[ ! -f "$_ct_output_dir/symbols.json" ]]; then
+    echo "[]" > "$_ct_output_dir/symbols.json"
+fi
 
 exit "$_ct_exit_code"

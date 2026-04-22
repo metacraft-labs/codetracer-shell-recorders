@@ -2,7 +2,14 @@
 //
 // TraceBridge holds a TraceWriter instance and translates each WireEvent
 // into the appropriate sequence of TraceWriter method calls.
+//
+// The Nim CTFS backend packages all trace data (events, metadata, paths)
+// into a single `.ct` container file. Separate JSON sidecar files
+// (`trace_metadata.json`, `trace_paths.json`, `symbols.json`) are written
+// by the bridge itself in `finish()` so that the launcher scripts and
+// downstream tools can consume them without parsing the binary container.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +30,13 @@ pub struct TraceBridge {
     current_line: i64,
     /// Whether `start()` has been called on the writer.
     started: bool,
+    /// Program path from the START event, used for metadata sidecar.
+    program: String,
+    /// All registered source file paths, written as `trace_paths.json` sidecar.
+    registered_paths: Vec<String>,
+    /// All registered function names (excluding `<toplevel>`), written as
+    /// `symbols.json` sidecar for quick symbol search in the UI.
+    registered_functions: BTreeSet<String>,
 }
 
 impl TraceBridge {
@@ -44,6 +58,9 @@ impl TraceBridge {
             current_file: None,
             current_line: 1,
             started: false,
+            program: program.to_string(),
+            registered_paths: Vec::new(),
+            registered_functions: BTreeSet::new(),
         }
     }
 
@@ -60,10 +77,14 @@ impl TraceBridge {
             WireEvent::Path { file } => {
                 let path = PathBuf::from(&file);
                 TraceWriter::ensure_path_id(self.writer.as_mut(), &path);
+                self.registered_paths.push(file);
             }
             WireEvent::Func { name, file, line } => {
                 let path = PathBuf::from(&file);
                 TraceWriter::ensure_function_id(self.writer.as_mut(), &name, &path, Line(line));
+                if name != "<toplevel>" {
+                    self.registered_functions.insert(name);
+                }
             }
             WireEvent::Step { file, line } => {
                 let path = PathBuf::from(&file);
@@ -131,6 +152,7 @@ impl TraceBridge {
 
         let program_path = PathBuf::from(program);
         TraceWriter::start(self.writer.as_mut(), &program_path, Line(1));
+        self.program = program.to_string();
         self.current_file = Some(program.to_string());
         self.current_line = 1;
         self.started = true;
@@ -148,6 +170,9 @@ impl TraceBridge {
         let line = Line(self.current_line);
 
         let function_id = TraceWriter::ensure_function_id(self.writer.as_mut(), name, &path, line);
+        if name != "<toplevel>" {
+            self.registered_functions.insert(name.to_string());
+        }
         // No args for now (will be enhanced in M3)
         TraceWriter::register_call(self.writer.as_mut(), function_id, vec![]);
     }
@@ -189,13 +214,82 @@ impl TraceBridge {
     /// This finishes all three output streams (events, metadata, paths) and then
     /// closes the writer. For the Nim CTFS backend, `close()` is the step that
     /// actually flushes the `.ct` container file to disk.
+    ///
+    /// After the writer is closed, sidecar JSON files are written to the output
+    /// directory so that launcher scripts and downstream tools can access
+    /// metadata, paths, and symbols without parsing the binary `.ct` container:
+    ///
+    /// - `trace_metadata.json` — program name and basic recording metadata
+    /// - `trace_paths.json` — array of registered source file paths
+    /// - `symbols.json` — array of registered function names (for symbol search)
     pub fn finish(&mut self) -> Result<(), Box<dyn Error>> {
         if self.started {
             TraceWriter::finish_writing_trace_events(self.writer.as_mut())?;
             TraceWriter::finish_writing_trace_metadata(self.writer.as_mut())?;
             TraceWriter::finish_writing_trace_paths(self.writer.as_mut())?;
             TraceWriter::close(self.writer.as_mut())?;
+
+            self.write_sidecar_files()?;
         }
         Ok(())
     }
+
+    /// Write JSON sidecar files alongside the `.ct` container.
+    ///
+    /// These files duplicate information that is already inside the binary
+    /// container, but in a human-readable form that shell scripts and simple
+    /// tools can consume without a CTFS reader.
+    fn write_sidecar_files(&self) -> Result<(), Box<dyn Error>> {
+        // trace_metadata.json — minimal metadata about the recording
+        let metadata = format!("{{\"program\":{}}}", serde_json_escape(&self.program));
+        std::fs::write(self.output_dir.join("trace_metadata.json"), metadata)?;
+
+        // trace_paths.json — array of source file paths
+        let paths_json: String = format!(
+            "[{}]",
+            self.registered_paths
+                .iter()
+                .map(|p| serde_json_escape(p))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        std::fs::write(self.output_dir.join("trace_paths.json"), paths_json)?;
+
+        // symbols.json — array of function names for quick symbol lookup
+        let symbols_json: String = format!(
+            "[{}]",
+            self.registered_functions
+                .iter()
+                .map(|n| serde_json_escape(n))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        std::fs::write(self.output_dir.join("symbols.json"), symbols_json)?;
+
+        Ok(())
+    }
+}
+
+/// Escape a string for embedding in JSON output.
+///
+/// Produces a quoted JSON string with backslash, double-quote, and control
+/// character escaping per RFC 8259 section 7.
+fn serde_json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
