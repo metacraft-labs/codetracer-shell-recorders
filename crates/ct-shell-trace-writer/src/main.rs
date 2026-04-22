@@ -3,7 +3,7 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 use std::process;
 
-use codetracer_trace_writer::TraceEventsFileFormat;
+use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 use ct_shell_trace_writer::trace_bridge::TraceBridge;
 use ct_shell_trace_writer::wire_protocol;

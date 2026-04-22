@@ -1,12 +1,12 @@
 use std::fs;
 
-use codetracer_trace_writer::TraceEventsFileFormat;
+use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 use ct_shell_trace_writer::wire_protocol::parse_line;
 
 use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord};
-use codetracer_trace_writer::non_streaming_trace_writer::NonStreamingTraceWriter;
-use codetracer_trace_writer::trace_writer::TraceWriter;
+use codetracer_trace_writer_nim::non_streaming_trace_writer::NonStreamingTraceWriter;
+use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 
 /// Feed a complete event stream through the wire protocol parser and trace
 /// writer, then verify that trace files are created and non-empty.

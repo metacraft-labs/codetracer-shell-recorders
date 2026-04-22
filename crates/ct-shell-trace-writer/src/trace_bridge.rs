@@ -7,8 +7,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord};
-use codetracer_trace_writer::trace_writer::TraceWriter;
-use codetracer_trace_writer::{create_trace_writer, TraceEventsFileFormat};
+use codetracer_trace_writer_nim::trace_writer::TraceWriter;
+use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
 
 use crate::wire_protocol::WireEvent;
 
