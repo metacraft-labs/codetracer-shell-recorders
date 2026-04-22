@@ -144,8 +144,8 @@
                   'path = "../../../codetracer-trace-format/codetracer_trace_types"' \
                   'path = "${codetracer-trace-format}/codetracer_trace_types"' \
                 --replace-fail \
-                  'path = "../../../codetracer-trace-format/codetracer_trace_writer"' \
-                  'path = "${codetracer-trace-format}/codetracer_trace_writer"'
+                  'path = "../../../codetracer-trace-format/codetracer_trace_writer_nim"' \
+                  'path = "${codetracer-trace-format}/codetracer_trace_writer_nim"'
             '';
 
             # Install the binary plus the shell launcher/recorder scripts
