@@ -7,7 +7,7 @@ set -euo pipefail
 
 _ct_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _ct_output_dir=""
-_ct_format="binary"
+_ct_format="ctfs"
 _ct_script=""
 _ct_script_args=()
 
