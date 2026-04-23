@@ -79,13 +79,13 @@ jobs:
           echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
 
       - name: Build
-        run: nix develop --command just build
+        run: nix develop --impure --command just build
 
       - name: Test
-        run: nix develop --command just test
+        run: nix develop --impure --command just test
 
       - name: Lint
-        run: nix develop --command just lint
+        run: nix develop --impure --command just lint
 
   nix-build:
     name: Verify nix flake packages build
