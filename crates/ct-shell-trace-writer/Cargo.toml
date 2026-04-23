@@ -15,6 +15,10 @@ path = "src/main.rs"
 [dependencies]
 codetracer_trace_types = { version = "0.16", path = "../../../codetracer-trace-format/codetracer_trace_types" }
 codetracer_trace_writer_nim = { path = "../../../codetracer-trace-format/codetracer_trace_writer_nim" }
+# The Rust-native trace writer is used for --format binary (CBOR+Zstd)
+# since the Nim writer always produces CTFS containers, which the
+# db-backend's seek-based reader does not support yet (M37).
+codetracer_trace_writer = { path = "../../../codetracer-trace-format/codetracer_trace_writer" }
 
 [dev-dependencies]
 tempfile = "3"

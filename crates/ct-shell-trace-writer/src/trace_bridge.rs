@@ -15,9 +15,243 @@ use std::path::{Path, PathBuf};
 
 use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
-use codetracer_trace_writer_nim::{create_trace_writer, TraceEventsFileFormat};
+use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
 use crate::wire_protocol::WireEvent;
+
+// ---------------------------------------------------------------------------
+// Adapter: wraps the Rust-native trace writer so it can be used through the
+// Nim `TraceWriter` trait expected by `TraceBridge`.
+// ---------------------------------------------------------------------------
+
+/// Wraps a Rust-native `codetracer_trace_writer::trace_writer::TraceWriter`
+/// and exposes it as a `codetracer_trace_writer_nim::trace_writer::TraceWriter`.
+///
+/// The two traits have nearly identical method signatures but are distinct
+/// types. This adapter delegates every call to the inner Rust writer,
+/// allowing the rest of `TraceBridge` to remain trait-object based.
+/// Type alias for the Rust-native TraceWriter trait (distinct from the Nim one).
+type RustTraceWriter = dyn codetracer_trace_writer::trace_writer::TraceWriter + Send;
+
+struct RustWriterAdapter {
+    inner: Box<RustTraceWriter>,
+}
+
+/// Helper macro to call methods on the inner Rust writer, disambiguating
+/// the `TraceWriter` vs `AbstractTraceWriter` trait methods.
+macro_rules! rust_tw {
+    ($self:expr, $method:ident ( $($arg:expr),* $(,)? )) => {
+        codetracer_trace_writer::trace_writer::TraceWriter::$method($self.inner.as_mut(), $($arg),*)
+    };
+}
+
+impl TraceWriter for RustWriterAdapter {
+    fn begin_writing_trace_metadata(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
+        rust_tw!(self, begin_writing_trace_metadata(path))
+    }
+    fn finish_writing_trace_metadata(&mut self) -> Result<(), Box<dyn Error>> {
+        rust_tw!(self, finish_writing_trace_metadata())
+    }
+    fn begin_writing_trace_events(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
+        rust_tw!(self, begin_writing_trace_events(path))
+    }
+    fn finish_writing_trace_events(&mut self) -> Result<(), Box<dyn Error>> {
+        rust_tw!(self, finish_writing_trace_events())
+    }
+    fn begin_writing_trace_paths(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
+        rust_tw!(self, begin_writing_trace_paths(path))
+    }
+    fn finish_writing_trace_paths(&mut self) -> Result<(), Box<dyn Error>> {
+        rust_tw!(self, finish_writing_trace_paths())
+    }
+    fn close(&mut self) -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+    fn set_workdir(&mut self, workdir: &Path) {
+        rust_tw!(self, set_workdir(workdir));
+    }
+    fn start(&mut self, path: &Path, line: Line) {
+        rust_tw!(self, start(path, line));
+    }
+    fn ensure_path_id(&mut self, path: &Path) -> codetracer_trace_types::PathId {
+        rust_tw!(self, ensure_path_id(path))
+    }
+    fn ensure_function_id(
+        &mut self,
+        name: &str,
+        path: &Path,
+        line: Line,
+    ) -> codetracer_trace_types::FunctionId {
+        rust_tw!(self, ensure_function_id(name, path, line))
+    }
+    fn ensure_type_id(
+        &mut self,
+        kind: TypeKind,
+        lang_type: &str,
+    ) -> codetracer_trace_types::TypeId {
+        rust_tw!(self, ensure_type_id(kind, lang_type))
+    }
+    fn ensure_raw_type_id(
+        &mut self,
+        typ: codetracer_trace_types::TypeRecord,
+    ) -> codetracer_trace_types::TypeId {
+        rust_tw!(self, ensure_raw_type_id(typ))
+    }
+    fn ensure_variable_id(&mut self, name: &str) -> codetracer_trace_types::VariableId {
+        rust_tw!(self, ensure_variable_id(name))
+    }
+    fn register_path(&mut self, path: &Path) {
+        rust_tw!(self, register_path(path));
+    }
+    fn register_function(&mut self, name: &str, path: &Path, line: Line) {
+        rust_tw!(self, register_function(name, path, line));
+    }
+    fn register_step(&mut self, path: &Path, line: Line) {
+        rust_tw!(self, register_step(path, line));
+    }
+    fn register_call(
+        &mut self,
+        fid: codetracer_trace_types::FunctionId,
+        args: Vec<codetracer_trace_types::FullValueRecord>,
+    ) {
+        rust_tw!(self, register_call(fid, args));
+    }
+    fn arg(&mut self, name: &str, value: ValueRecord) -> codetracer_trace_types::FullValueRecord {
+        rust_tw!(self, arg(name, value))
+    }
+    fn register_return(&mut self, rv: ValueRecord) {
+        rust_tw!(self, register_return(rv));
+    }
+    fn register_special_event(&mut self, kind: EventLogKind, metadata: &str, content: &str) {
+        rust_tw!(self, register_special_event(kind, metadata, content));
+    }
+    fn to_raw_type(&self, kind: TypeKind, lang_type: &str) -> codetracer_trace_types::TypeRecord {
+        codetracer_trace_writer::trace_writer::TraceWriter::to_raw_type(
+            self.inner.as_ref(),
+            kind,
+            lang_type,
+        )
+    }
+    fn register_type(&mut self, kind: TypeKind, lang_type: &str) {
+        rust_tw!(self, register_type(kind, lang_type));
+    }
+    fn register_raw_type(&mut self, typ: codetracer_trace_types::TypeRecord) {
+        rust_tw!(self, register_raw_type(typ));
+    }
+    fn register_asm(&mut self, instructions: &[String]) {
+        rust_tw!(self, register_asm(instructions));
+    }
+    fn register_variable_with_full_value(&mut self, name: &str, value: ValueRecord) {
+        rust_tw!(self, register_variable_with_full_value(name, value));
+    }
+    fn register_variable_name(&mut self, name: &str) {
+        rust_tw!(self, register_variable_name(name));
+    }
+    fn register_full_value(&mut self, vid: codetracer_trace_types::VariableId, value: ValueRecord) {
+        rust_tw!(self, register_full_value(vid, value));
+    }
+    fn register_compound_value(
+        &mut self,
+        place: codetracer_trace_types::Place,
+        value: ValueRecord,
+    ) {
+        rust_tw!(self, register_compound_value(place, value));
+    }
+    fn register_cell_value(&mut self, place: codetracer_trace_types::Place, value: ValueRecord) {
+        rust_tw!(self, register_cell_value(place, value));
+    }
+    fn assign_compound_item(
+        &mut self,
+        place: codetracer_trace_types::Place,
+        index: usize,
+        item_place: codetracer_trace_types::Place,
+    ) {
+        rust_tw!(self, assign_compound_item(place, index, item_place));
+    }
+    fn assign_cell(&mut self, place: codetracer_trace_types::Place, new_value: ValueRecord) {
+        rust_tw!(self, assign_cell(place, new_value));
+    }
+    fn register_variable(&mut self, name: &str, place: codetracer_trace_types::Place) {
+        rust_tw!(self, register_variable(name, place));
+    }
+    fn drop_variable(&mut self, name: &str) {
+        rust_tw!(self, drop_variable(name));
+    }
+    fn assign(
+        &mut self,
+        name: &str,
+        rvalue: codetracer_trace_types::RValue,
+        pass_by: codetracer_trace_types::PassBy,
+    ) {
+        rust_tw!(self, assign(name, rvalue, pass_by));
+    }
+    fn bind_variable(&mut self, name: &str, place: codetracer_trace_types::Place) {
+        rust_tw!(self, bind_variable(name, place));
+    }
+    fn drop_variables(&mut self, names: &[String]) {
+        rust_tw!(self, drop_variables(names));
+    }
+    fn simple_rvalue(&mut self, name: &str) -> codetracer_trace_types::RValue {
+        rust_tw!(self, simple_rvalue(name))
+    }
+    fn compound_rvalue(&mut self, deps: &[String]) -> codetracer_trace_types::RValue {
+        rust_tw!(self, compound_rvalue(deps))
+    }
+    fn drop_last_step(&mut self) {
+        rust_tw!(self, drop_last_step());
+    }
+    fn add_event(&mut self, event: codetracer_trace_types::TraceLowLevelEvent) {
+        rust_tw!(self, add_event(event));
+    }
+    fn append_events(&mut self, events: &mut Vec<codetracer_trace_types::TraceLowLevelEvent>) {
+        rust_tw!(self, append_events(events));
+    }
+    fn events(&self) -> &[codetracer_trace_types::TraceLowLevelEvent] {
+        codetracer_trace_writer::trace_writer::TraceWriter::events(self.inner.as_ref())
+    }
+}
+
+/// Create the appropriate trace writer for the given format.
+///
+/// For `Ctfs` format, uses the Nim-backed writer which produces `.ct` CTFS
+/// containers with the new multi-stream format (steps.dat, calls.dat, etc.).
+///
+/// For `Binary` and `Json` formats, uses the Rust-native writer which produces
+/// `trace.bin` (CBOR+Zstd) or `trace.json` respectively. This ensures the
+/// output is compatible with the db-backend's existing trace reader, which
+/// does not yet implement the seek-based CTFS reader (M37).
+fn create_writer_for_format(
+    program: &str,
+    args: &[String],
+    format: TraceEventsFileFormat,
+) -> Box<dyn TraceWriter> {
+    match format {
+        TraceEventsFileFormat::Ctfs => {
+            codetracer_trace_writer_nim::create_trace_writer(program, args, format)
+        }
+        TraceEventsFileFormat::Binary | TraceEventsFileFormat::BinaryV0 => {
+            let rust_format = match format {
+                TraceEventsFileFormat::Binary => {
+                    codetracer_trace_writer::TraceEventsFileFormat::Binary
+                }
+                TraceEventsFileFormat::BinaryV0 => {
+                    codetracer_trace_writer::TraceEventsFileFormat::BinaryV0
+                }
+                _ => unreachable!(),
+            };
+            Box::new(RustWriterAdapter {
+                inner: codetracer_trace_writer::create_trace_writer(program, args, rust_format),
+            })
+        }
+        TraceEventsFileFormat::Json => Box::new(RustWriterAdapter {
+            inner: codetracer_trace_writer::create_trace_writer(
+                program,
+                args,
+                codetracer_trace_writer::TraceEventsFileFormat::Json,
+            ),
+        }),
+    }
+}
 
 /// Connects wire protocol events to the TraceWriter API.
 pub struct TraceBridge {
@@ -50,7 +284,7 @@ impl TraceBridge {
         program: &str,
         args: &[String],
     ) -> Self {
-        let writer = create_trace_writer(program, args, format);
+        let writer = create_writer_for_format(program, args, format);
         TraceBridge {
             writer,
             output_dir: output_dir.to_path_buf(),
@@ -240,8 +474,13 @@ impl TraceBridge {
     /// container, but in a human-readable form that shell scripts and simple
     /// tools can consume without a CTFS reader.
     fn write_sidecar_files(&self) -> Result<(), Box<dyn Error>> {
-        // trace_metadata.json — minimal metadata about the recording
-        let metadata = format!("{{\"program\":{}}}", serde_json_escape(&self.program));
+        // trace_metadata.json — minimal metadata about the recording.
+        // Must include all fields required by TraceMetadata deserialization
+        // (program, args). Workdir has serde(default) and can be omitted.
+        let metadata = format!(
+            "{{\"program\":{},\"args\":[]}}",
+            serde_json_escape(&self.program)
+        );
         std::fs::write(self.output_dir.join("trace_metadata.json"), metadata)?;
 
         // trace_paths.json — array of source file paths
