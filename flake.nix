@@ -79,9 +79,14 @@
                 # Rust toolchain
                 (rust-toolchain-for system)
 
+                # Nim compiler — needed to build the trace writer static library
+                # from codetracer-trace-format-nim before cargo can link it.
+                nim
+
                 # For trace format serialization
                 pkg-config
                 capnproto
+                zstd
 
                 # Build automation and dev tools
                 just
