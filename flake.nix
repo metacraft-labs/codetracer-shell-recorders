@@ -17,6 +17,26 @@
       url = "github:metacraft-labs/codetracer-trace-format/main";
       flake = false;
     };
+
+    # Nim implementation of the trace writer. The Rust crate
+    # codetracer_trace_writer_nim links against a pre-built Nim static
+    # library (libcodetracer_trace_writer.a) produced from this repo.
+    codetracer-trace-format-nim = {
+      url = "github:metacraft-labs/codetracer-trace-format-nim/main";
+      flake = false;
+    };
+
+    # Nim library dependencies required by codetracer-trace-format-nim.
+    # Fetched as flake inputs so the Nim compiler can find them inside the
+    # Nix sandbox without needing network access for `nimble install`.
+    nim-stew = {
+      url = "github:status-im/nim-stew";
+      flake = false;
+    };
+    nim-results = {
+      url = "github:arnetheduck/nim-results";
+      flake = false;
+    };
   };
 
   outputs =
@@ -26,6 +46,9 @@
       fenix,
       pre-commit-hooks,
       codetracer-trace-format,
+      codetracer-trace-format-nim,
+      nim-stew,
+      nim-results,
     }:
     let
       systems = [
@@ -129,16 +152,54 @@
             nativeBuildInputs = with pkgs; [
               pkg-config
               capnproto
+
+              # Nim toolchain — used in preBuild to compile the trace writer
+              # static library from codetracer-trace-format-nim.
+              nim
+              nimble
+
+              # zstd headers/lib — needed both by the Nim static library
+              # (linked at compile time) and by the Rust crate at link time.
+              zstd
             ];
 
-            buildInputs = pkgs.lib.optionals isDarwin (
-              with pkgs;
-              [
-                libiconv
-                darwin.apple_sdk.frameworks.CoreFoundation
-                darwin.apple_sdk.frameworks.Security
-              ]
-            );
+            buildInputs =
+              [ pkgs.zstd ]
+              ++ pkgs.lib.optionals isDarwin (
+                with pkgs;
+                [
+                  libiconv
+                  darwin.apple_sdk.frameworks.CoreFoundation
+                  darwin.apple_sdk.frameworks.Security
+                ]
+              );
+
+            # Build the Nim trace writer static library that the Rust
+            # crate codetracer_trace_writer_nim links against at build time.
+            # The Nix store source is read-only, so we copy it to a writable
+            # location first.
+            preBuild = ''
+              nim_src="$TMPDIR/codetracer-trace-format-nim"
+              cp -r ${codetracer-trace-format-nim} "$nim_src"
+              chmod -R u+w "$nim_src"
+
+              export HOME="$TMPDIR/home"
+              mkdir -p "$HOME"
+
+              # Compile the Nim static library. Dependencies (stew, results) are
+              # provided as -p search paths from their flake inputs, so no network
+              # access (nimble install) is needed inside the sandbox.
+              nim c --app:staticlib --mm:arc --noMain -d:release \
+                --passC:'-fPIC' \
+                -p:"$nim_src/src" \
+                -p:${nim-stew} \
+                -p:${nim-results} \
+                --nimcache:"$TMPDIR/nimcache" \
+                -o:"$TMPDIR/libcodetracer_trace_writer.a" \
+                "$nim_src/src/codetracer_trace_writer_ffi.nim"
+
+              export CODETRACER_NIM_LIB_DIR="$TMPDIR"
+            '';
 
             # The Cargo.toml references codetracer_trace_types and
             # codetracer_trace_writer via relative path deps that assume a

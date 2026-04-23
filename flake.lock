@@ -17,6 +17,23 @@
         "type": "github"
       }
     },
+    "codetracer-trace-format-nim": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1776922969,
+        "narHash": "sha256-++OBrjDcKwwZf3a3OGSvCLZEpADxwl65oYpFL7Fzqxk=",
+        "owner": "metacraft-labs",
+        "repo": "codetracer-trace-format-nim",
+        "rev": "be62884d56ca2425ce11f416b1ccf69f3d4bf716",
+        "type": "github"
+      },
+      "original": {
+        "owner": "metacraft-labs",
+        "ref": "main",
+        "repo": "codetracer-trace-format-nim",
+        "type": "github"
+      }
+    },
     "fenix": {
       "inputs": {
         "nixpkgs": [
@@ -75,6 +92,38 @@
         "type": "github"
       }
     },
+    "nim-results": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1733582743,
+        "narHash": "sha256-KbNqt0FMuzDF4X+XM6JEaZJBypLDnvVPpnBpE7Sq6sA=",
+        "owner": "arnetheduck",
+        "repo": "nim-results",
+        "rev": "df8113dda4c2d74d460a8fa98252b0b771bf1f27",
+        "type": "github"
+      },
+      "original": {
+        "owner": "arnetheduck",
+        "repo": "nim-results",
+        "type": "github"
+      }
+    },
+    "nim-stew": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1775816678,
+        "narHash": "sha256-w4JCNHQlYI4qFAw8xZccUAQtf/ggER5kOEhzVvUmmfs=",
+        "owner": "status-im",
+        "repo": "nim-stew",
+        "rev": "30dadcd14b5ec1631935d9037213ece6871cc11a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "status-im",
+        "repo": "nim-stew",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1767313136,
@@ -130,7 +179,10 @@
     "root": {
       "inputs": {
         "codetracer-trace-format": "codetracer-trace-format",
+        "codetracer-trace-format-nim": "codetracer-trace-format-nim",
         "fenix": "fenix",
+        "nim-results": "nim-results",
+        "nim-stew": "nim-stew",
         "nixpkgs": "nixpkgs",
         "pre-commit-hooks": "pre-commit-hooks"
       }
