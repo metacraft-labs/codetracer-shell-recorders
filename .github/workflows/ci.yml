@@ -62,6 +62,9 @@ jobs:
 
           echo "codetracer-trace-format cloned at: $(realpath "${GITHUB_WORKSPACE}/../codetracer-trace-format")"
 
+      - name: Install zstd headers
+        run: sudo apt-get update && sudo apt-get install -y libzstd-dev
+
       - name: Build Nim trace writer library
         run: |
           git clone --depth 1 \
@@ -70,7 +73,7 @@ jobs:
           nix develop --command bash -c "
             cd '${GITHUB_WORKSPACE}/../codetracer-trace-format-nim'
             nimble install -y stew results
-            nim c --app:staticlib --mm:arc --noMain -d:release -p:src \
+            nim c --app:staticlib --mm:arc --noMain -d:release --passC:'-fPIC' -p:src \
               -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
           "
           echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
