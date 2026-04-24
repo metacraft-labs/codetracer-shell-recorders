@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Wrapper script that provides a standard binary name for the zsh recorder.
+# The ct binary finds this via PATH using findTool("codetracer-zsh-recorder").
+exec "$(dirname "$0")/launcher.zsh" "$@"
