@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 lib_func() {
     echo "from lib"
 }

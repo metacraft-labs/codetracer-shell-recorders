@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 # Cross-shell test: identical logic in Zsh
 x=10
 y=20

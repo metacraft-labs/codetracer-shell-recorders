@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 greet() {
     local name=$1
     print "Hello, $name!"

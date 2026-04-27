@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 # ct-zsh-recorder launcher: Sets up the pipe between recorder.zsh and ct-shell-trace-writer.
 #
 # Usage: launcher.zsh --out-dir <dir> [--format binary|json] <script.zsh> [script-args...]

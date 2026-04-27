@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 x=1
 # This command will fail (non-zero exit)
 false

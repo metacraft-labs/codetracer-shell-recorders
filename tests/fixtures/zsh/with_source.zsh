@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 # Script that sources another file
 SCRIPT_DIR="${0:A:h}"
 source "$SCRIPT_DIR/zsh_sourced_lib.zsh"

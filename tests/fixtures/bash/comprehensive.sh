@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Comprehensive test: loops, conditionals, functions, arrays, sourced files
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

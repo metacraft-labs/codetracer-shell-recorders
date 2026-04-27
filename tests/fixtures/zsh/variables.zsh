@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 x=10
 y="hello world"
 integer count=42

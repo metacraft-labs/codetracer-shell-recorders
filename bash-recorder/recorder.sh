@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ct-bash-recorder: Records a Bash script execution via trap-based instrumentation.
 # FD 3 must be open and connected to ct-shell-trace-writer's stdin.
 

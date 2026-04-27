@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 # Library file to be sourced
 lib_func() {
     local msg=$1

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 inner() {
     echo "inner called"
     return 0

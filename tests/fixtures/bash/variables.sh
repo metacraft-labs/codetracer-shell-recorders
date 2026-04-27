@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 x=10
 y="hello world"
 declare -i count=42

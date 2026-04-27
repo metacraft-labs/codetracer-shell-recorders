@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 x=1
 # This command will fail (non-zero exit)
 false

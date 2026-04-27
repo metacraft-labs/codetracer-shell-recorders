@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 # ct-zsh-recorder: Records a Zsh script execution via trap-based instrumentation.
 # FD 3 must be open and connected to ct-shell-trace-writer's stdin.
 

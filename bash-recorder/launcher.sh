@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ct-bash-recorder launcher: Sets up the pipe between recorder.sh and ct-shell-trace-writer.
 #
 # Usage: launcher.sh --out-dir <dir> [--format binary|json] <script.sh> [script-args...]

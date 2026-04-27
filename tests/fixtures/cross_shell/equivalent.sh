@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Cross-shell test: identical logic in Bash
 x=10
 y=20
