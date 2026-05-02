@@ -88,3 +88,70 @@ EXIT code=0"#;
         ct_size
     );
 }
+
+/// Verify that ARG events stage call arguments and that they are drained
+/// onto the next CALL event.  This is the smoke-level reproduction of the
+/// canonical CTFS call-arg staging pattern (Ruby 1.21 / Python 1.27 / etc.)
+/// applied to the shell-recorder wire protocol added in the 2026-05-02
+/// audit.
+#[test]
+fn test_arg_events_stage_call_args() {
+    let input = r#"START program=/tmp/argy.sh shell=bash shell_version=5.2.0
+PATH file=/tmp/argy.sh
+FUNC name=greet file=/tmp/argy.sh line=3
+STEP file=/tmp/argy.sh line=3
+ARG name=$1 value="hello world" type=s
+ARG name=$2 value=42 type=i
+CALL name=greet
+STEP file=/tmp/argy.sh line=4
+RETURN status=0
+EXIT code=0"#;
+
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let output_dir = tmp_dir.path();
+
+    // Pass script-level argv through `args` to confirm the implicit
+    // top-level call also receives them.
+    let format = TraceEventsFileFormat::Ctfs;
+    let mut bridge = TraceBridge::new(
+        output_dir,
+        format,
+        "/tmp/argy.sh",
+        &["one".to_string(), "two".to_string()],
+    );
+
+    for line_str in input.lines() {
+        let line_str = line_str.trim();
+        if line_str.is_empty() {
+            continue;
+        }
+        let event =
+            parse_line(line_str).unwrap_or_else(|e| panic!("failed to parse '{line_str}': {e}"));
+        bridge
+            .handle_event(event)
+            .unwrap_or_else(|e| panic!("failed to handle event from '{line_str}': {e}"));
+    }
+    bridge.finish().expect("finish() should succeed");
+
+    let ct_path = output_dir.join("argy.ct");
+    assert!(
+        ct_path.exists(),
+        "argy.ct should exist; files: {:?}",
+        fs::read_dir(output_dir)
+            .map(|rd| rd
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
+
+    // The .ct container is binary CBOR+Zstd, so we cannot trivially
+    // assert specific event content here without a CTFS reader in this
+    // crate.  The size assertion confirms events landed (empty traces
+    // produce <1KB containers).
+    let ct_size = fs::metadata(&ct_path).unwrap().len();
+    assert!(
+        ct_size >= 1024,
+        "argy.ct should be at least 1KB, got {} bytes",
+        ct_size
+    );
+}

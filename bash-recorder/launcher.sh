@@ -79,8 +79,25 @@ mkfifo "$_ct_fifo"
 # Clean up on exit
 trap 'rm -f "$_ct_fifo"' EXIT
 
-# Start the trace writer reading from the FIFO, passing the program name for metadata
-"$_ct_trace_writer" --out-dir "$_ct_output_dir" --format "$_ct_format" --program "$_ct_script" < "$_ct_fifo" &
+# Start the trace writer reading from the FIFO, passing the program name and
+# its positional argv for metadata + top-level call-arg staging.
+#
+# `--args` MUST be the last flag because the trace writer treats every
+# remaining token after `--args` as a positional argv element.
+if (( ${#_ct_script_args[@]} > 0 )); then
+    "$_ct_trace_writer" \
+        --out-dir "$_ct_output_dir" \
+        --format "$_ct_format" \
+        --program "$_ct_script" \
+        --args "${_ct_script_args[@]}" \
+        < "$_ct_fifo" &
+else
+    "$_ct_trace_writer" \
+        --out-dir "$_ct_output_dir" \
+        --format "$_ct_format" \
+        --program "$_ct_script" \
+        < "$_ct_fifo" &
+fi
 _ct_writer_pid=$!
 
 # Run the recorder with FD 3 connected to the FIFO

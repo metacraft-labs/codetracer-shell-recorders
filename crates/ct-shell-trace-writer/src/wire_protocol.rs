@@ -32,6 +32,20 @@ pub enum WireEvent {
     Call {
         name: String,
     },
+    /// One positional argument staged for the *next* `CALL` event.
+    ///
+    /// The recorder shell scripts emit one `ARG` line per shell positional
+    /// parameter (`$1`, `$2`, ...) immediately before the `CALL` event for a
+    /// shell function invocation, so the trace bridge can stage them via
+    /// `TraceWriter::arg(name, value)` and pass the resulting
+    /// `FullValueRecord` vec into `register_call(fid, args)`.  Mirrors the
+    /// canonical CTFS call-arg staging pattern used by every other audited
+    /// recorder (Ruby 1.21 / Python 1.27 / Move 1.46 / Cairo 1.50 / etc.).
+    Arg {
+        name: String,
+        value: String,
+        type_flag: String,
+    },
     Var {
         name: String,
         value: String,
@@ -225,6 +239,18 @@ pub fn parse_line(line: &str) -> Result<WireEvent, ParseError> {
         "CALL" => {
             let name = require_field(&kv, "name")?;
             Ok(WireEvent::Call { name })
+        }
+        "ARG" => {
+            // ARG lines stage one positional argument for the next CALL event.
+            // See WireEvent::Arg for the full contract.
+            let name = require_field(&kv, "name")?;
+            let value = require_field(&kv, "value")?;
+            let type_flag = kv.get("type").cloned().unwrap_or_else(|| "s".to_string());
+            Ok(WireEvent::Arg {
+                name,
+                value,
+                type_flag,
+            })
         }
         "VAR" => {
             let name = require_field(&kv, "name")?;
@@ -481,6 +507,43 @@ mod tests {
             WireEvent::Var {
                 name: "path".to_string(),
                 value: r"C:\Users\test".to_string(),
+                type_flag: "s".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_arg_event() {
+        // ARG event with explicit type
+        let event = parse_line("ARG name=arg0 value=hello type=s").unwrap();
+        assert_eq!(
+            event,
+            WireEvent::Arg {
+                name: "arg0".to_string(),
+                value: "hello".to_string(),
+                type_flag: "s".to_string(),
+            }
+        );
+
+        // ARG event with integer
+        let event_int = parse_line("ARG name=count value=42 type=i").unwrap();
+        assert_eq!(
+            event_int,
+            WireEvent::Arg {
+                name: "count".to_string(),
+                value: "42".to_string(),
+                type_flag: "i".to_string(),
+            }
+        );
+
+        // ARG event with quoted spaces
+        let event_quoted = parse_line(r#"ARG name=arg1 value="hello world""#).unwrap();
+        assert_eq!(
+            event_quoted,
+            WireEvent::Arg {
+                name: "arg1".to_string(),
+                value: "hello world".to_string(),
+                // Default flag is "s"
                 type_flag: "s".to_string(),
             }
         );

@@ -239,7 +239,21 @@ trap '
                     _ct_registered_funcs[$_ct_func_name]=1
                 fi
 
-                # Emit CALL event
+                # Stage positional parameters as ARG events BEFORE the CALL
+                # event.  Zsh DEBUG traps inherit `$@` from the enclosing
+                # function frame, so we can iterate `argv` directly.  Each
+                # ARG line is consumed by the trace writers pending-call-args
+                # buffer and drained on the next CALL.
+                _ct_arg_count=${#argv}
+                _ct_arg_idx=1
+                while (( _ct_arg_idx <= _ct_arg_count )); do
+                    _ct_arg_val="${argv[$_ct_arg_idx]}"
+                    _ct_inline_quote "$_ct_arg_val"
+                    printf '\''ARG name=$%d value=%s type=s\n'\'' "$_ct_arg_idx" "$_ct_qv" >&3
+                    _ct_arg_idx=$(( _ct_arg_idx + 1 ))
+                done
+
+                # Emit CALL event (drains the ARG events staged above)
                 printf '\''CALL name=%s\n'\'' "$_ct_func_name" >&3
             fi
 

@@ -167,7 +167,43 @@ _ct_debug_trap() {
             _ct_registered_funcs["$_ct_func_name"]=1
         fi
 
-        # Emit CALL event
+        # Stage positional parameters as ARG events BEFORE the CALL event.
+        #
+        # When `extdebug` is on, bash maintains `BASH_ARGC` (per-frame argv
+        # count, top-of-stack = current frame) and `BASH_ARGV` (flat stack
+        # of all positional parameters, reversed: BASH_ARGV[0] is the LAST
+        # positional parameter of the innermost frame).
+        # See: https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html
+        #
+        # Inside this DEBUG trap, FUNCNAME[0] = `_ct_debug_trap` and
+        # FUNCNAME[1] is the user function we are inside.  Since we read
+        # `_ct_func_name` from FUNCNAME[1], we likewise need BASH_ARGC[1]
+        # (the user-function frame's argc) — BASH_ARGC[0] would be the
+        # arg count of `_ct_debug_trap` itself, which is 0.  We also need
+        # to skip BASH_ARGV[0..BASH_ARGC[0]-1] (the trap-frame argv slots,
+        # if any) before reading the user-function frame's argv.
+        local _ct_trap_argc=0
+        if (( ${#BASH_ARGC[@]} > 0 )); then
+            _ct_trap_argc="${BASH_ARGC[0]}"
+        fi
+        if (( ${#BASH_ARGC[@]} > 1 )); then
+            local _ct_argc="${BASH_ARGC[1]}"
+            local _ct_argv_base=$_ct_trap_argc
+            local _ct_arg_idx
+            # BASH_ARGV is reversed: the user-function frame's $1 lives at
+            # index (argv_base + argc - 1), $2 at (argv_base + argc - 2),
+            # and so on.  We walk forward 1..argc to emit ARG name=$1,
+            # name=$2, ... in canonical order.
+            for (( _ct_arg_idx = 1; _ct_arg_idx <= _ct_argc; _ct_arg_idx++ )); do
+                local _ct_arg_slot=$(( _ct_argv_base + _ct_argc - _ct_arg_idx ))
+                local _ct_arg_val="${BASH_ARGV[$_ct_arg_slot]:-}"
+                local _ct_arg_quoted
+                _ct_arg_quoted=$(_ct_quote_value "$_ct_arg_val")
+                printf 'ARG name=$%d value=%s type=s\n' "$_ct_arg_idx" "$_ct_arg_quoted" >&3
+            done
+        fi
+
+        # Emit CALL event (drains the ARG events staged above)
         printf 'CALL name=%s\n' "$_ct_func_name" >&3
     fi
 

@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-use codetracer_trace_types::{EventLogKind, Line, TypeKind, ValueRecord};
+use codetracer_trace_types::{EventLogKind, FullValueRecord, Line, TypeKind, ValueRecord};
 use codetracer_trace_writer_nim::trace_writer::TraceWriter;
 use codetracer_trace_writer_nim::TraceEventsFileFormat;
 
@@ -271,6 +271,17 @@ pub struct TraceBridge {
     /// All registered function names (excluding `<toplevel>`), written as
     /// `symbols.json` sidecar for quick symbol search in the UI.
     registered_functions: BTreeSet<String>,
+    /// Script-level positional parameters captured from CLI `--args`.
+    ///
+    /// Staged onto the implicit top-level call when `START` arrives so the
+    /// frontend's calltrace pane can show `script $1 $2 ...` on the root
+    /// frame.  Mirrors the canonical CTFS call-arg staging pattern (Ruby
+    /// 1.21, Python 1.27, Move 1.46, Cairo 1.50, etc.).
+    script_args: Vec<String>,
+    /// Args staged via `ARG` wire events that have not yet been consumed
+    /// by a `CALL` event.  Drained on every `CALL` so each call frame's
+    /// arg list is exactly the one the recorder emitted before it.
+    pending_call_args: Vec<FullValueRecord>,
 }
 
 impl TraceBridge {
@@ -295,6 +306,8 @@ impl TraceBridge {
             program: program.to_string(),
             registered_paths: Vec::new(),
             registered_functions: BTreeSet::new(),
+            script_args: args.to_vec(),
+            pending_call_args: Vec::new(),
         }
     }
 
@@ -328,6 +341,13 @@ impl TraceBridge {
             }
             WireEvent::Call { name } => {
                 self.handle_call(&name);
+            }
+            WireEvent::Arg {
+                name,
+                value,
+                type_flag,
+            } => {
+                self.handle_arg(&name, &value, &type_flag);
             }
             WireEvent::Var {
                 name,
@@ -390,10 +410,41 @@ impl TraceBridge {
         self.current_file = Some(program.to_string());
         self.current_line = 1;
         self.started = true;
+
+        // Stage script-level positional parameters (the program's argv,
+        // captured by the launcher as `--args ...`) onto the implicit
+        // top-level call so the calltrace pane shows `script $1 $2 ...` on
+        // the root frame.  We register an explicit `<toplevel>` call for
+        // this purpose, mirroring the Ruby 1.21 native-recorder fix
+        // (`<top-level>` opened in `initialize`, closed on
+        // `disable_tracing`).  The matching close happens on the final
+        // `EXIT` event in `handle_event`.
+        //
+        // Note: clone here is necessary because `handle_arg` borrows
+        // `self` mutably and we cannot iterate `self.script_args` while
+        // also calling `&mut self` methods.
+        let script_args: Vec<String> = self.script_args.clone();
+        for (idx, arg_value) in script_args.iter().enumerate() {
+            // Use bash/zsh-style positional-parameter names ($1 .. $N).
+            // The wire-protocol type flag is always "s" since shell
+            // positional parameters are always strings at the OS level.
+            let name = format!("${}", idx + 1);
+            self.handle_arg(&name, arg_value, "s");
+        }
+        // Register the implicit top-level call.  This drains the args we
+        // just staged and pairs with the `register_return` emitted from
+        // the EXIT handler.
+        self.handle_call("<toplevel>");
         Ok(())
     }
 
     /// Handle a CALL event: look up or auto-register the function, then register the call.
+    ///
+    /// Any `ARG` events that arrived since the previous `CALL` are drained
+    /// from `pending_call_args` and passed to `register_call(fid, args)` so
+    /// the call frame in the trace records its positional parameters
+    /// (matching the canonical CTFS call-arg staging pattern from Ruby 1.21
+    /// onwards).
     fn handle_call(&mut self, name: &str) {
         // Use current step's file/line as fallback for auto-registration.
         let file = self
@@ -407,12 +458,26 @@ impl TraceBridge {
         if name != "<toplevel>" {
             self.registered_functions.insert(name.to_string());
         }
-        // No args for now (will be enhanced in M3)
-        TraceWriter::register_call(self.writer.as_mut(), function_id, vec![]);
+        // Drain any args staged by ARG events received since the previous CALL.
+        // Even if the recorder never emits ARG (e.g. an old launcher), this is
+        // a no-op: the pending list stays empty and we register an empty arg
+        // vector, preserving pre-fix behaviour.
+        let args = std::mem::take(&mut self.pending_call_args);
+        TraceWriter::register_call(self.writer.as_mut(), function_id, args);
     }
 
-    /// Handle a VAR event: map the type flag to TypeKind and create the ValueRecord.
-    fn handle_var(&mut self, name: &str, value: &str, type_flag: &str) {
+    /// Handle an ARG event: stage one positional parameter for the next
+    /// `CALL`.  Type-flag handling mirrors `handle_var` so the same wire-
+    /// protocol type vocabulary applies (`i`/`s`/`a`/`A`/`F`).
+    fn handle_arg(&mut self, name: &str, value: &str, type_flag: &str) {
+        let value_record = self.value_record_for_flag(value, type_flag);
+        let full = TraceWriter::arg(self.writer.as_mut(), name, value_record);
+        self.pending_call_args.push(full);
+    }
+
+    /// Build a `ValueRecord` from a wire-protocol typed value.  Shared
+    /// helper so `handle_var` and `handle_arg` agree on the type vocabulary.
+    fn value_record_for_flag(&mut self, value: &str, type_flag: &str) -> ValueRecord {
         let (kind, lang_type) = match type_flag {
             "i" => (TypeKind::Int, "Int"),
             "s" => (TypeKind::String, "String"),
@@ -424,8 +489,10 @@ impl TraceBridge {
 
         let type_id = TraceWriter::ensure_type_id(self.writer.as_mut(), kind, lang_type);
 
-        let value_record = match type_flag {
+        match type_flag {
             "i" => {
+                // Defensive parse: an unparseable integer falls back to 0
+                // rather than dropping the arg or panicking.
                 let i = value.parse::<i64>().unwrap_or(0);
                 ValueRecord::Int { i, type_id }
             }
@@ -433,13 +500,19 @@ impl TraceBridge {
                 let f = value.parse::<f64>().unwrap_or(0.0);
                 ValueRecord::Float { f, type_id }
             }
-            // For "s", "a", "A", and default: store as String
+            // For "s", "a", "A", and default: store as String.  Arrays and
+            // assoc arrays are surfaced as their bash/zsh `declare -p` text
+            // representation; richer structural decoding is a follow-up.
             _ => ValueRecord::String {
                 text: value.to_string(),
                 type_id,
             },
-        };
+        }
+    }
 
+    /// Handle a VAR event: map the type flag to TypeKind and create the ValueRecord.
+    fn handle_var(&mut self, name: &str, value: &str, type_flag: &str) {
+        let value_record = self.value_record_for_flag(value, type_flag);
         TraceWriter::register_variable_with_full_value(self.writer.as_mut(), name, value_record);
     }
 
