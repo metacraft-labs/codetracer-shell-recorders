@@ -163,16 +163,17 @@
               zstd
             ];
 
-            buildInputs =
-              [ pkgs.zstd ]
-              ++ pkgs.lib.optionals isDarwin (
-                with pkgs;
-                [
-                  libiconv
-                  darwin.apple_sdk.frameworks.CoreFoundation
-                  darwin.apple_sdk.frameworks.Security
-                ]
-              );
+            buildInputs = [
+              pkgs.zstd
+            ]
+            ++ pkgs.lib.optionals isDarwin (
+              with pkgs;
+              [
+                libiconv
+                darwin.apple_sdk.frameworks.CoreFoundation
+                darwin.apple_sdk.frameworks.Security
+              ]
+            );
 
             # Build the Nim trace writer static library that the Rust
             # crate codetracer_trace_writer_nim links against at build time.
