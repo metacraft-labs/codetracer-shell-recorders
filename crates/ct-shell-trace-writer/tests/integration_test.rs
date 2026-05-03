@@ -1,9 +1,92 @@
 use std::fs;
 
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
+use codetracer_trace_types::ValueRecord;
+use codetracer_trace_writer_nim::{NimTraceReaderHandle, TraceEventsFileFormat};
 
 use ct_shell_trace_writer::trace_bridge::TraceBridge;
 use ct_shell_trace_writer::wire_protocol::parse_line;
+
+fn bytes_from_json_array(value: &serde_json::Value) -> Vec<u8> {
+    value
+        .as_array()
+        .unwrap_or_else(|| panic!("expected byte array JSON, got {value:#}"))
+        .iter()
+        .map(|byte| {
+            byte.as_u64()
+                .unwrap_or_else(|| panic!("expected byte value, got {byte:#}")) as u8
+        })
+        .collect()
+}
+
+fn decode_value_record(value: &serde_json::Value) -> ValueRecord {
+    let bytes = bytes_from_json_array(value);
+    cbor4ii::serde::from_slice(&bytes)
+        .unwrap_or_else(|e| panic!("failed to decode ValueRecord from {bytes:?}: {e}"))
+}
+
+fn value_as_string(value: &ValueRecord) -> Option<&str> {
+    match value {
+        ValueRecord::String { text, .. } => Some(text),
+        _ => None,
+    }
+}
+
+fn value_as_i64(value: &ValueRecord) -> Option<i64> {
+    match value {
+        ValueRecord::Int { i, .. } => Some(*i),
+        _ => None,
+    }
+}
+
+fn assert_call_args(
+    reader: &NimTraceReaderHandle,
+    calls: &[serde_json::Value],
+    expected: &[(&str, ExpectedArgValue<'_>)],
+) {
+    let found = calls.iter().any(|call| {
+        let Some(args) = call["args"].as_array() else {
+            return false;
+        };
+        if args.len() != expected.len() {
+            return false;
+        }
+
+        args.iter()
+            .zip(expected.iter())
+            .all(|(arg, (name, value))| {
+                let Some(varname_id) = arg["varname_id"].as_u64() else {
+                    return false;
+                };
+                let Ok(actual_name) = reader.varname(varname_id) else {
+                    return false;
+                };
+                if actual_name != *name {
+                    return false;
+                }
+
+                let actual_value = decode_value_record(&arg["value"]);
+                match value {
+                    ExpectedArgValue::String(expected) => {
+                        value_as_string(&actual_value) == Some(*expected)
+                    }
+                    ExpectedArgValue::Int(expected) => {
+                        value_as_i64(&actual_value) == Some(*expected)
+                    }
+                }
+            })
+    });
+
+    assert!(
+        found,
+        "expected a call with args {expected:?}; calls={calls:#?}"
+    );
+}
+
+#[derive(Debug)]
+enum ExpectedArgValue<'a> {
+    String(&'a str),
+    Int(i64),
+}
 
 /// Feed a complete event stream through the wire protocol parser and trace
 /// bridge, then verify that trace files are created and non-empty.
@@ -89,11 +172,9 @@ EXIT code=0"#;
     );
 }
 
-/// Verify that ARG events stage call arguments and that they are drained
-/// onto the next CALL event.  This is the smoke-level reproduction of the
-/// canonical CTFS call-arg staging pattern (Ruby 1.21 / Python 1.27 / etc.)
-/// applied to the shell-recorder wire protocol added in the 2026-05-02
-/// audit.
+/// Verify that ARG events stage call arguments, drain onto the next CALL
+/// event, and survive a read-side CTFS round-trip.  This pins both the
+/// script-level `<toplevel>` argv path and a shell-function call argv path.
 #[test]
 fn test_arg_events_stage_call_args() {
     let input = r#"START program=/tmp/argy.sh shell=bash shell_version=5.2.0
@@ -144,14 +225,33 @@ EXIT code=0"#;
             .unwrap_or_default()
     );
 
-    // The .ct container is binary CBOR+Zstd, so we cannot trivially
-    // assert specific event content here without a CTFS reader in this
-    // crate.  The size assertion confirms events landed (empty traces
-    // produce <1KB containers).
-    let ct_size = fs::metadata(&ct_path).unwrap().len();
+    let reader = NimTraceReaderHandle::open(&ct_path.to_string_lossy())
+        .unwrap_or_else(|e| panic!("failed to open Nim CTFS reader for {ct_path:?}: {e}"));
+    let calls: Vec<serde_json::Value> = (0..reader.call_count())
+        .map(|key| {
+            let json = reader.call_json(key).expect("read call JSON");
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("invalid call JSON: {e}: {json}"))
+        })
+        .collect();
+
     assert!(
-        ct_size >= 1024,
-        "argy.ct should be at least 1KB, got {} bytes",
-        ct_size
+        calls.len() >= 2,
+        "expected at least <toplevel> and greet calls, got {calls:#?}"
+    );
+    assert_call_args(
+        &reader,
+        &calls,
+        &[
+            ("$1", ExpectedArgValue::String("one")),
+            ("$2", ExpectedArgValue::String("two")),
+        ],
+    );
+    assert_call_args(
+        &reader,
+        &calls,
+        &[
+            ("$1", ExpectedArgValue::String("hello world")),
+            ("$2", ExpectedArgValue::Int(42)),
+        ],
     );
 }

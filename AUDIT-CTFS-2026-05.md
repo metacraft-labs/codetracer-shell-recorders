@@ -257,6 +257,10 @@ dedicated `register_*` entry points.
    new `test_arg_events_stage_call_args` end-to-end test driving
    ARG → CALL → register_call through the full pipeline with both
    per-function ARGs and script-level args via `TraceBridge::new`.
+   Follow-up: the same test now opens the produced `.ct` container
+   through `NimTraceReaderHandle` and asserts concrete `Call.args[]`
+   readback content for both the implicit `<toplevel>` script argv
+   and a shell-function call.
 
 ## Verification
 
@@ -266,12 +270,31 @@ direnv exec . cargo build --release   # clean
 direnv exec . cargo test              # 44 tests pass
 direnv exec . cargo clippy --release  # clean
 direnv exec . cargo fmt --check       # clean
+
+# Follow-up read-side assertion run in this environment used
+# `nix shell nixpkgs#capnproto -c ...` because the trace-format
+# Cap'n Proto build script requires the `capnp` executable.
+# cargo fmt --check / cargo build --release / cargo test /
+# cargo clippy --release: clean; cargo test remains 44 passed.
 ```
 
 Test counts: 12 unit (wire_protocol) + 17 bash recording + 2
 integration + 13 zsh recording = **44 tests, all pass**.  Pre-audit
 baseline was 42; +2 for the new `test_parse_arg_event` and
-`test_arg_events_stage_call_args`.
+`test_arg_events_stage_call_args`.  The read-side assertion follow-up
+does not change the test count; it strengthens the existing integration
+test.
+
+## Closed follow-ups
+
+* **Read-side end-to-end content assertions.**  Closed in the
+  follow-up commit: `test_arg_events_stage_call_args` now opens the
+  produced `.ct` container through `NimTraceReaderHandle` and asserts
+  concrete `Call.args[]` content for both the implicit `<toplevel>`
+  script argv (`$1 = one`, `$2 = two`) and a shell-function call
+  (`$1 = hello world`, `$2 = 42`).  The test exercises the shared
+  Rust bridge path; bash/zsh launcher-level ARG emission remains
+  covered by the existing recording tests and shared bridge assertion.
 
 ## Open gaps (deferred follow-ups)
 
@@ -312,13 +335,6 @@ baseline was 42; +2 for the new `test_parse_arg_event` and
   the bridge to support post-call ARG amendments — a more invasive
   protocol change.
 
-* **Read-side end-to-end content assertions.**  The new
-  `test_arg_events_stage_call_args` verifies the trace container
-  is produced and is non-trivially sized, but does not walk it and
-  assert specific Call.args[] field content.  Same assertion-depth
-  follow-up flagged for Cairo / Cardano / Flow / Fuel / PolkaVM /
-  Miden / TON / Circom / Leo / WASM in their respective audits.
-
 ## Cross-cutting findings
 
 * **First audited recorder family with a wire-protocol intermediary
@@ -350,5 +366,5 @@ codetracer-shell-recorders as audited (gaps closed for ARG/CALL
 plumbing, top-level `<toplevel>` register_call, script-level argv
 forwarding; pipelines / subshells as call frames + true stdout
 capture + background-job thread events + typed argv inference +
-read-side content assertions open as recorder-side / writer-side /
-toolchain follow-ups).  Audited recorder count: 17 → 18.
+read-side content assertions closed for the shared Rust bridge path).
+Audited recorder count: 17 → 18.
