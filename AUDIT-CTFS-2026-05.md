@@ -368,3 +368,123 @@ forwarding; pipelines / subshells as call frames + true stdout
 capture + background-job thread events + typed argv inference +
 read-side content assertions closed for the shared Rust bridge path).
 Audited recorder count: 17 → 18.
+
+---
+
+## Convention compliance follow-up — 2026-05-08
+
+This section records the second audit pass that brings both shell
+recorders into compliance with `codetracer-specs/Recorder-CLI-Conventions.md`
+(the canonical CLI shape used by every other CodeTracer recorder).
+The 2026-05-02 audit already pinned the writer's *default* format to
+CTFS; this follow-up removes the residual `--format` plumbing entirely
+and adds the launcher-level conveniences the convention requires.
+
+### Concrete changes
+
+1. **`bash-recorder/launcher.sh` + `zsh-recorder/launcher.zsh`** —
+   rewritten argument parsing.  `--format` was deleted from both the
+   public CLI and the trace-writer invocation; `--help`/`-h`,
+   `--version`/`-V`, and `-o` (alias for `--out-dir`) were added at the
+   launcher level so the user can introspect the CLI without the
+   shell's implicit behaviour leaking through.  Both now read
+   `CODETRACER_BASH_RECORDER_OUT_DIR` / `CODETRACER_ZSH_RECORDER_OUT_DIR`
+   as a fallback when `--out-dir` is omitted, and short-circuit to a
+   bare `bash`/`zsh` exec when `CODETRACER_*_RECORDER_DISABLED` is set
+   to a truthy value.  Help text mentions `ct print` from
+   `codetracer-trace-format-nim` as the canonical CTFS-to-JSON
+   converter.
+
+2. **Top-level `VERSION`** — single source of truth for the launcher
+   `--version` output.  `just bump-version <ver>` now updates both
+   `Cargo.toml` and this file in lockstep so the launcher and the
+   binary always agree.
+
+3. **`crates/ct-shell-trace-writer/src/main.rs`** — `--format` parsing
+   removed; the binary now rejects `--format`/`-f` with a non-zero
+   exit and a message pointing at `ct print`.  Help text mentions
+   `ct print` (mirrors the per-recorder convention §4).  `--version`
+   prints `ct-shell-trace-writer <semver>`.
+
+4. **`crates/ct-shell-trace-writer/src/trace_bridge.rs`** — JSON /
+   CBOR+Zstd dispatch deleted.  `TraceBridge::new` now takes only
+   `(output_dir, program, args)` and unconditionally creates the Nim
+   CTFS writer via `codetracer_trace_writer_nim::create_trace_writer`.
+   The 280-line `RustWriterAdapter` and the `create_writer_for_format`
+   match on `TraceEventsFileFormat::{Json, Binary, BinaryV0}` are
+   gone; the events stream is always written into a `.ct` container.
+
+5. **`crates/ct-shell-trace-writer/Cargo.toml`** — comment about
+   `--format binary` removed; the `codetracer_trace_writer` Rust-native
+   dependency is no longer pulled in (the only consumer was the
+   removed `RustWriterAdapter`).
+
+6. **Tests** — the existing `integration_test.rs` tests
+   (`test_full_event_stream_to_trace`, `test_arg_events_stage_call_args`)
+   were updated to call the new 3-arg `TraceBridge::new` signature
+   without a format parameter; nothing was weakened or skipped.  Three
+   new integration tests exercise the binary's CLI surface directly:
+   `test_cli_rejects_format_flag`, `test_cli_help_omits_format_and_mentions_ct_print`,
+   and `test_cli_version_prints_canonical_line`.
+
+7. **Shell-level CLI tests** — `tests/test_bash_recorder_cli.sh` and
+   `tests/test_zsh_recorder_cli.sh` (8 assertions each).  They cover
+   the launcher's `--help`/`--version` output, `--format` rejection,
+   the `_OUT_DIR` env-var fallback, the `_DISABLED` short-circuit, and
+   a `ct print --json` round-trip on the recorded `.ct` bundle (per
+   the cardano/circom/flow/fuel/leo/miden/move/polkavm/python/ruby
+   precedent — JSON is no longer recorder-emitted, it is `ct print`-emitted).
+
+8. **`tests/verify-cli-convention-no-silent-skip.sh`** — new guard
+   modelled on the Ruby/Flow/Cairo equivalents.  Asserts `--help` /
+   `--version` content, `--format` rejection across both launchers
+   *and* the trace writer, env-var references in source, and that
+   `trace_bridge.rs` no longer branches on
+   `TraceEventsFileFormat::{Json, Binary, BinaryV0}` outside comments.
+   Wired into the `Justfile` as `just verify-cli-convention`, and
+   pulled into both `just lint` and `just test`.
+
+9. **`Justfile`** — `just test` now runs `cargo test`, the verifier,
+   and both shell-level CLI tests.  `just lint` runs the verifier
+   alongside `cargo fmt --check` + `cargo clippy`.  `just bump-version`
+   updates the `VERSION` file in addition to `Cargo.toml`.
+
+10. **READMEs** — `bash-recorder/README.md` and `zsh-recorder/README.md`
+    rewritten from placeholders; both document the convention
+    compliance table, the trace bundle layout, the `ct print`
+    inspection workflow, and the env-var contract.
+
+11. **`codetracer-specs/Recorder-CLI-Conventions.md`** —
+    Implementation Status table updated: Bash and Zsh moved from
+    `☐ Planned` to `✓ Compliant (CTFS-only)` with the recorder
+    description (mirrors the format used for the Ruby / Cairo / Flow
+    rows).
+
+### Verification
+
+```
+cd /home/zahary/metacraft/codetracer-shell-recorders
+direnv exec . cargo build --release          # clean
+direnv exec . just verify-cli-convention      # all assertions pass
+direnv exec . just test-bash-cli              # 8 / 8 ok
+direnv exec . just test-zsh-cli               # 8 / 8 ok
+direnv exec . cargo test                      # 47 tests pass (was 44)
+```
+
+Cargo test breakdown after the follow-up: 12 unit (wire_protocol) + 17
+bash recording + 5 integration + 13 zsh recording = **47 tests, all
+pass**.  Pre-follow-up baseline was 44; +3 for the new
+`test_cli_rejects_format_flag`,
+`test_cli_help_omits_format_and_mentions_ct_print`, and
+`test_cli_version_prints_canonical_line`.  The shell-level CLI tests
+add 8 + 8 = 16 launcher-level assertions plus the verifier's ~30
+guard-line checks (every `ok:` line is a strict, loud assertion — no
+silent skip).
+
+### Closed gaps
+
+* **Convention compliance** for both Shell (Bash) and Shell (Zsh)
+  rows in the spec's Implementation Status table.  After this
+  follow-up the only `☐ Planned` row left is the upstream `wazero`
+  WASM recorder (which is exempt under §1 because it's an upstream
+  tool with its own CLI surface).

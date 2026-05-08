@@ -2,7 +2,7 @@
 name = "ct-shell-trace-writer"
 version = "0.1.0"
 edition = "2021"
-description = "CodeTracer shell recorder — reads debugger wire-protocol events from stdin and writes a CodeTracer trace"
+description = "CodeTracer shell recorder — reads debugger wire-protocol events from stdin and writes a CodeTracer CTFS trace"
 
 [lib]
 name = "ct_shell_trace_writer"
@@ -14,11 +14,12 @@ path = "src/main.rs"
 
 [dependencies]
 codetracer_trace_types = { version = "0.16", path = "../../../codetracer-trace-format/codetracer_trace_types" }
+# CTFS-only backend.  Recorders always emit the canonical CTFS `.ct`
+# container per Recorder-CLI-Conventions §4; the previous Rust-native
+# CBOR+Zstd writer (used by the removed `--format binary` and `--format
+# json` paths) is no longer pulled in here.  Convert recorded `.ct`
+# bundles to JSON via `ct print` from `codetracer-trace-format-nim`.
 codetracer_trace_writer_nim = { path = "../../../codetracer-trace-format/codetracer_trace_writer_nim" }
-# The Rust-native trace writer is used for --format binary (CBOR+Zstd)
-# since the Nim writer always produces CTFS containers, which the
-# db-backend's seek-based reader does not support yet (M37).
-codetracer_trace_writer = { path = "../../../codetracer-trace-format/codetracer_trace_writer" }
 
 [dev-dependencies]
 cbor4ii = { version = "1.0.0", features = ["serde1", "use_std"] }

@@ -1,7 +1,7 @@
 use std::fs;
 
 use codetracer_trace_types::ValueRecord;
-use codetracer_trace_writer_nim::{NimTraceReaderHandle, TraceEventsFileFormat};
+use codetracer_trace_writer_nim::NimTraceReaderHandle;
 
 use ct_shell_trace_writer::trace_bridge::TraceBridge;
 use ct_shell_trace_writer::wire_protocol::parse_line;
@@ -122,9 +122,10 @@ EXIT code=0"#;
     let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let output_dir = tmp_dir.path();
 
-    // Use the default CTFS format — the Nim backend always produces .ct files.
-    let format = TraceEventsFileFormat::Ctfs;
-    let mut bridge = TraceBridge::new(output_dir, format, "/tmp/test_script.sh", &[]);
+    // CTFS-only — the Nim backend always produces .ct files.  The
+    // `--format` dispatch was removed from TraceBridge in the 2026-05
+    // convention compliance pass (Recorder-CLI-Conventions §4).
+    let mut bridge = TraceBridge::new(output_dir, "/tmp/test_script.sh", &[]);
 
     for line_str in input.lines() {
         let line_str = line_str.trim();
@@ -193,10 +194,8 @@ EXIT code=0"#;
 
     // Pass script-level argv through `args` to confirm the implicit
     // top-level call also receives them.
-    let format = TraceEventsFileFormat::Ctfs;
     let mut bridge = TraceBridge::new(
         output_dir,
-        format,
         "/tmp/argy.sh",
         &["one".to_string(), "two".to_string()],
     );
@@ -253,5 +252,110 @@ EXIT code=0"#;
             ("$1", ExpectedArgValue::String("hello world")),
             ("$2", ExpectedArgValue::Int(42)),
         ],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CLI convention compliance — see Recorder-CLI-Conventions.md §4.
+//
+// CTFS is the recorder's sole on-disk output; the previous `--format`
+// dispatch was removed in 2026-05.  The binary must now reject every
+// `--format`/`-f` invocation with a non-zero exit so a stale launcher
+// or external caller surfaces immediately rather than silently writing
+// the wrong format.
+// ---------------------------------------------------------------------------
+
+fn locate_trace_writer_binary() -> std::path::PathBuf {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // The binary lives at <repo>/target/{debug,release}/ct-shell-trace-writer.
+    // We prefer the debug build because cargo test will have just produced it.
+    let workspace_root = manifest_dir
+        .parent()
+        .expect("crates/ parent")
+        .parent()
+        .expect("repo root");
+    for profile in ["debug", "release"] {
+        let candidate = workspace_root
+            .join("target")
+            .join(profile)
+            .join("ct-shell-trace-writer");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    // Fall back to the bin specified by cargo for the integration target.
+    let env_bin = env!("CARGO_BIN_EXE_ct-shell-trace-writer");
+    std::path::PathBuf::from(env_bin)
+}
+
+#[test]
+fn test_cli_rejects_format_flag() {
+    let bin = locate_trace_writer_binary();
+    for flag in ["--format", "-f"] {
+        let output = std::process::Command::new(&bin)
+            .args([flag, "json", "--out-dir", "/tmp"])
+            .output()
+            .unwrap_or_else(|e| panic!("failed to execute {bin:?}: {e}"));
+        assert!(
+            !output.status.success(),
+            "ct-shell-trace-writer must reject `{flag} json` (exit non-zero); \
+             got status {:?}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--format"),
+            "rejection message should mention --format; stderr={stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_cli_help_omits_format_and_mentions_ct_print() {
+    let bin = locate_trace_writer_binary();
+    let output = std::process::Command::new(&bin)
+        .arg("--help")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to execute {bin:?}: {e}"));
+    assert!(output.status.success(), "--help should exit zero");
+    // ct-shell-trace-writer prints `--help` to stderr (it's intended for
+    // the recorder operators, not piped consumers).  Concatenate both
+    // streams so we don't depend on which one carries the text.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("--format"),
+        "--help must NOT mention --format; got: {combined}"
+    );
+    assert!(
+        combined.contains("--out-dir"),
+        "--help missing --out-dir; got: {combined}"
+    );
+    assert!(
+        combined.contains("--version"),
+        "--help missing --version; got: {combined}"
+    );
+    assert!(
+        combined.contains("ct print"),
+        "--help missing 'ct print'; got: {combined}"
+    );
+}
+
+#[test]
+fn test_cli_version_prints_canonical_line() {
+    let bin = locate_trace_writer_binary();
+    let output = std::process::Command::new(&bin)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to execute {bin:?}: {e}"));
+    assert!(output.status.success(), "--version should exit zero");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("ct-shell-trace-writer "),
+        "--version line should start with the binary name; got: {stdout}"
     );
 }

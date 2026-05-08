@@ -3,31 +3,36 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 use std::process;
 
-use codetracer_trace_writer_nim::TraceEventsFileFormat;
-
 use ct_shell_trace_writer::trace_bridge::TraceBridge;
 use ct_shell_trace_writer::wire_protocol;
 
+// CTFS-only.  The shell recorders always write the canonical CTFS `.ct`
+// container — see codetracer-specs/Recorder-CLI-Conventions.md §4.  The
+// previous `--format binary|json` flag was removed in the 2026-05 convention
+// compliance pass; conversion to JSON for debugging or golden snapshots is
+// the job of `ct print` from `codetracer-trace-format-nim`.
+
 fn print_usage() {
     eprintln!(
-        "Usage: ct-shell-trace-writer --out-dir <path> [--format binary|json] \
-         [--program <name>] [--args <arg1> <arg2> ...]"
+        "Usage: ct-shell-trace-writer --out-dir <path> [--program <name>] \
+         [--args <arg1> <arg2> ...]"
     );
     eprintln!();
-    eprintln!("Reads wire protocol events from stdin and writes a CodeTracer trace.");
+    eprintln!("Reads wire protocol events from stdin and writes a CodeTracer CTFS trace.");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --out-dir <path>   Directory where trace files are written (required)");
-    eprintln!("  --format <fmt>        Output format: ctfs (default), binary, or json");
+    eprintln!("  --out-dir <path>      Directory where trace files are written (required)");
     eprintln!("  --program <name>      Override program name (normally from START event)");
     eprintln!("  --args <arg> ...      Program arguments for metadata");
-    eprintln!("  --version             Print version and exit");
-    eprintln!("  --help                Print this help and exit");
+    eprintln!("  --version, -V         Print version and exit");
+    eprintln!("  --help, -h            Print this help and exit");
+    eprintln!();
+    eprintln!("Output: CTFS-only.  Use `ct print` from codetracer-trace-format-nim");
+    eprintln!("to convert the recorded `.ct` bundle to JSON / a follow stream.");
 }
 
 struct CliArgs {
     output_dir: PathBuf,
-    format: TraceEventsFileFormat,
     program: String,
     args: Vec<String>,
 }
@@ -35,8 +40,8 @@ struct CliArgs {
 fn parse_cli_args() -> Result<CliArgs, String> {
     let args: Vec<String> = std::env::args().collect();
 
-    if args.iter().any(|a| a == "--version") {
-        println!("{}", env!("CARGO_PKG_VERSION"));
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("ct-shell-trace-writer {}", env!("CARGO_PKG_VERSION"));
         process::exit(0);
     }
 
@@ -46,7 +51,6 @@ fn parse_cli_args() -> Result<CliArgs, String> {
     }
 
     let mut output_dir: Option<PathBuf> = None;
-    let mut format = TraceEventsFileFormat::Ctfs;
     let mut program = String::from("unknown");
     let mut extra_args: Vec<String> = Vec::new();
 
@@ -59,18 +63,6 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                     return Err("--out-dir requires a value".to_string());
                 }
                 output_dir = Some(PathBuf::from(&args[i]));
-            }
-            "--format" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("--format requires a value".to_string());
-                }
-                format = match args[i].as_str() {
-                    "binary" => TraceEventsFileFormat::Binary,
-                    "json" => TraceEventsFileFormat::Json,
-                    "ctfs" | "ct" => TraceEventsFileFormat::Ctfs,
-                    other => return Err(format!("unknown format: {other}")),
-                };
             }
             "--program" => {
                 i += 1;
@@ -88,6 +80,18 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                 }
                 break;
             }
+            // `--format` was removed in the 2026-05 convention compliance pass.
+            // Recorders never branch on output format — CTFS is the sole
+            // output (see Recorder-CLI-Conventions §4).  We reject it loudly
+            // rather than ignoring it so a stale launcher / caller surfaces
+            // immediately instead of silently writing the wrong format.
+            "--format" | "-f" => {
+                return Err(
+                    "--format is no longer supported (CTFS is the sole output format; \
+                     use `ct print` to convert the recorded .ct bundle to JSON)"
+                        .to_string(),
+                );
+            }
             other => {
                 return Err(format!("unknown option: {other}"));
             }
@@ -99,7 +103,6 @@ fn parse_cli_args() -> Result<CliArgs, String> {
 
     Ok(CliArgs {
         output_dir,
-        format,
         program,
         args: extra_args,
     })
@@ -125,7 +128,7 @@ fn main() {
         process::exit(1);
     }
 
-    let mut bridge = TraceBridge::new(&cli.output_dir, cli.format, &cli.program, &cli.args);
+    let mut bridge = TraceBridge::new(&cli.output_dir, &cli.program, &cli.args);
 
     let stdin = io::stdin();
     let reader = stdin.lock();
