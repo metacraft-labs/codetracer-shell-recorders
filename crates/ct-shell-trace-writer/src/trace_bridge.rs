@@ -47,9 +47,15 @@ pub struct TraceBridge {
     current_line: i64,
     /// Whether `start()` has been called on the writer.
     started: bool,
-    /// Program path from the START event, used for metadata sidecar.
+    /// Program path from the START event.  Captured for diagnostic
+    /// purposes; the recording itself now ships this through `meta.dat`
+    /// inside the CTFS container.
+    #[allow(dead_code)]
     program: String,
-    /// All registered source file paths, written as `trace_paths.json` sidecar.
+    /// All registered source file paths.  Captured for diagnostic
+    /// purposes; the recording itself now ships this through the
+    /// CTFS paths stream inside the container.
+    #[allow(dead_code)]
     registered_paths: Vec<String>,
     /// All registered function names (excluding `<toplevel>`), written as
     /// `symbols.json` sidecar for quick symbol search in the UI.
@@ -173,12 +179,8 @@ impl TraceBridge {
         // from the program basename, so the path we pass here is mostly
         // used as a placeholder.
         let events_path = self.output_dir.join("trace.ct");
-        let metadata_path = self.output_dir.join("trace_metadata.json");
-        let paths_path = self.output_dir.join("trace_paths.json");
 
         TraceWriter::begin_writing_trace_events(self.writer.as_mut(), &events_path)?;
-        TraceWriter::begin_writing_trace_metadata(self.writer.as_mut(), &metadata_path)?;
-        TraceWriter::begin_writing_trace_paths(self.writer.as_mut(), &paths_path)?;
 
         let program_path = PathBuf::from(program);
         TraceWriter::start(self.writer.as_mut(), &program_path, Line(1));
@@ -294,22 +296,21 @@ impl TraceBridge {
 
     /// Finalize trace files. Call this after EXIT or on EOF.
     ///
-    /// This finishes all three output streams (events, metadata, paths) and then
-    /// closes the writer. For the Nim CTFS backend, `close()` is the step that
-    /// actually flushes the `.ct` container file to disk.
+    /// This finishes the events stream, writes branded `meta.dat` via
+    /// `write_meta_dat`, and then closes the writer.  For the Nim CTFS
+    /// backend, `close()` is the step that actually flushes the `.ct`
+    /// container file to disk.
     ///
-    /// After the writer is closed, sidecar JSON files are written to the output
-    /// directory so that launcher scripts and downstream tools can access
-    /// metadata, paths, and symbols without parsing the binary `.ct` container:
-    ///
-    /// - `trace_metadata.json` — program name and basic recording metadata
-    /// - `trace_paths.json` — array of registered source file paths
-    /// - `symbols.json` — array of registered function names (for symbol search)
+    /// After the writer is closed, a `symbols.json` sidecar is written to the
+    /// output directory so that launcher scripts and downstream tools can
+    /// access the registered function names without parsing the binary `.ct`
+    /// container.  The legacy `trace_metadata.json` / `trace_paths.json`
+    /// sidecars were retired with the v3 CTFS rollout — that information now
+    /// lives in `meta.dat` inside the container.
     pub fn finish(&mut self) -> Result<(), Box<dyn Error>> {
         if self.started {
             TraceWriter::finish_writing_trace_events(self.writer.as_mut())?;
-            TraceWriter::finish_writing_trace_metadata(self.writer.as_mut())?;
-            TraceWriter::finish_writing_trace_paths(self.writer.as_mut())?;
+            self.writer.write_meta_dat("codetracer-shell-recorders")?;
             TraceWriter::close(self.writer.as_mut())?;
 
             self.write_sidecar_files()?;
@@ -317,32 +318,12 @@ impl TraceBridge {
         Ok(())
     }
 
-    /// Write JSON sidecar files alongside the `.ct` container.
+    /// Write the `symbols.json` sidecar alongside the `.ct` container.
     ///
-    /// These files duplicate information that is already inside the binary
-    /// container, but in a human-readable form that shell scripts and simple
-    /// tools can consume without a CTFS reader.
+    /// This duplicates information already inside the binary container, but
+    /// in a human-readable form that shell scripts and simple tools can
+    /// consume without a CTFS reader.
     fn write_sidecar_files(&self) -> Result<(), Box<dyn Error>> {
-        // trace_metadata.json — minimal metadata about the recording.
-        // Must include all fields required by TraceMetadata deserialization
-        // (program, args). Workdir has serde(default) and can be omitted.
-        let metadata = format!(
-            "{{\"program\":{},\"args\":[]}}",
-            serde_json_escape(&self.program)
-        );
-        std::fs::write(self.output_dir.join("trace_metadata.json"), metadata)?;
-
-        // trace_paths.json — array of source file paths
-        let paths_json: String = format!(
-            "[{}]",
-            self.registered_paths
-                .iter()
-                .map(|p| serde_json_escape(p))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        std::fs::write(self.output_dir.join("trace_paths.json"), paths_json)?;
-
         // symbols.json — array of function names for quick symbol lookup
         let symbols_json: String = format!(
             "[{}]",

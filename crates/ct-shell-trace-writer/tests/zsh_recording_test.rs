@@ -1,11 +1,15 @@
 // Test that the zsh recorder produces valid trace files.
 //
 // The Nim CTFS backend always produces a binary `.ct` container file.
-// Tests verify the container exists and has valid CTFS magic bytes,
-// and check the JSON sidecar files (trace_metadata.json, trace_paths.json,
-// symbols.json) written by the TraceBridge.
+// Tests verify the container exists, has valid CTFS magic bytes, and
+// expose the expected program / paths via the Nim reader.  Legacy
+// `trace_metadata.json` / `trace_paths.json` sidecars were retired with
+// the v3 CTFS rollout (follow-up #254 phase 2); the `symbols.json`
+// sidecar is still emitted for shell-script consumers.
 use std::path::PathBuf;
 use std::process::Command;
+
+use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use tempfile::TempDir;
 
 /// CTFS magic bytes: 0xC0 0xDE 0x72 0xAC 0xE2
@@ -137,14 +141,25 @@ fn find_ct_file(output_dir: &TempDir) -> PathBuf {
     ct_path.clone()
 }
 
-/// Read trace_paths.json content from an output directory.
-fn read_trace_paths(output_dir: &TempDir) -> Vec<serde_json::Value> {
-    let paths_json = output_dir.path().join("trace_paths.json");
-    assert!(paths_json.exists(), "trace_paths.json not found");
-    serde_json::from_str(
-        &std::fs::read_to_string(&paths_json).expect("Failed to read trace_paths.json"),
-    )
-    .expect("Invalid paths JSON")
+/// Read the registered source paths from the `.ct` container produced
+/// by the recorder.  The legacy `trace_paths.json` sidecar was retired
+/// with the v3 CTFS rollout — paths are now interned in the container's
+/// paths stream.
+fn read_trace_paths(output_dir: &TempDir) -> Vec<String> {
+    let ct_path = find_ct_file(output_dir);
+    let reader = NimTraceReaderHandle::open(ct_path.to_str().expect("ct path must be UTF-8"))
+        .expect("Failed to open .ct container");
+    (0..reader.path_count())
+        .map(|i| reader.path(i).expect("Failed to read path entry"))
+        .collect()
+}
+
+/// Read the recorded program path from the `.ct` container's metadata.
+fn read_trace_program(output_dir: &TempDir) -> String {
+    let ct_path = find_ct_file(output_dir);
+    let reader = NimTraceReaderHandle::open(ct_path.to_str().expect("ct path must be UTF-8"))
+        .expect("Failed to open .ct container");
+    reader.program()
 }
 
 // ============================================================================
@@ -168,29 +183,14 @@ fn test_zsh_step_events() {
     let ct_size = std::fs::metadata(&ct_path).unwrap().len();
     assert!(ct_size > 0, ".ct file is empty");
 
-    // Verify sidecar metadata exists and references the script
-    let metadata_json = output_dir.path().join("trace_metadata.json");
-    assert!(metadata_json.exists(), "trace_metadata.json not found");
-
-    // Verify trace_paths.json exists
-    let paths_json = output_dir.path().join("trace_paths.json");
-    assert!(paths_json.exists(), "trace_paths.json not found");
-
-    // Verify the script path appears in trace_paths.json
+    // Verify the script path appears in the .ct container's paths stream
     let paths = read_trace_paths(&output_dir);
     assert!(!paths.is_empty(), "paths should not be empty");
-    let has_simple = paths
-        .iter()
-        .any(|p| p.as_str().map_or(false, |s| s.contains("simple.zsh")));
+    let has_simple = paths.iter().any(|p| p.contains("simple.zsh"));
     assert!(has_simple, "paths should contain simple.zsh: {:?}", paths);
 
-    // Read metadata and verify it references the script
-    let metadata: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&metadata_json).expect("Failed to read metadata"),
-    )
-    .expect("Invalid metadata JSON");
-
-    let program = metadata["program"].as_str().expect("No program field");
+    // Verify the .ct container records the script as the program
+    let program = read_trace_program(&output_dir);
     assert!(
         program.contains("simple.zsh"),
         "Program should reference simple.zsh, got: {}",
@@ -581,22 +581,17 @@ fn test_zsh_sourced_file() {
         stdout
     );
 
-    // Verify trace_paths.json contains BOTH files
+    // Verify the .ct container's paths stream contains BOTH files
     let paths = read_trace_paths(&output_dir);
 
-    let has_with_source = paths
-        .iter()
-        .any(|p| p.as_str().map_or(false, |s| s.contains("with_source.zsh")));
+    let has_with_source = paths.iter().any(|p| p.contains("with_source.zsh"));
     assert!(
         has_with_source,
         "paths should contain with_source.zsh: {:?}",
         paths
     );
 
-    let has_sourced_lib = paths.iter().any(|p| {
-        p.as_str()
-            .map_or(false, |s| s.contains("zsh_sourced_lib.zsh"))
-    });
+    let has_sourced_lib = paths.iter().any(|p| p.contains("zsh_sourced_lib.zsh"));
     assert!(
         has_sourced_lib,
         "paths should contain zsh_sourced_lib.zsh (the sourced file): {:?}",
@@ -737,24 +732,18 @@ fn e2e_zsh_complex_script() {
         symbols
     );
 
-    // Verify the sourced lib file is tracked in trace_paths.json
+    // Verify the sourced lib file is tracked in the .ct container's paths stream
     let paths = read_trace_paths(&output_dir);
-    let has_sourced_lib = paths.iter().any(|p| {
-        p.as_str()
-            .map_or(false, |s| s.contains("zsh_sourced_lib.zsh"))
-    });
+    let has_sourced_lib = paths.iter().any(|p| p.contains("zsh_sourced_lib.zsh"));
     assert!(
         has_sourced_lib,
-        "trace_paths.json should contain zsh_sourced_lib.zsh: {:?}",
+        "paths should contain zsh_sourced_lib.zsh: {:?}",
         paths
     );
-    let has_comprehensive = paths.iter().any(|p| {
-        p.as_str()
-            .map_or(false, |s| s.contains("comprehensive.zsh"))
-    });
+    let has_comprehensive = paths.iter().any(|p| p.contains("comprehensive.zsh"));
     assert!(
         has_comprehensive,
-        "trace_paths.json should contain comprehensive.zsh: {:?}",
+        "paths should contain comprehensive.zsh: {:?}",
         paths
     );
 

@@ -1,11 +1,15 @@
 // Test that the bash recorder produces valid trace files.
 //
 // The Nim CTFS backend always produces a binary `.ct` container file.
-// Tests verify the container exists and has valid CTFS magic bytes,
-// and check the JSON sidecar files (trace_metadata.json, trace_paths.json,
-// symbols.json) written by the TraceBridge.
+// Tests verify the container exists, has valid CTFS magic bytes, and
+// expose the expected program / paths / function names via the Nim
+// reader.  Legacy `trace_metadata.json` / `trace_paths.json` sidecars
+// were retired with the v3 CTFS rollout (follow-up #254 phase 2); the
+// `symbols.json` sidecar is still emitted for shell-script consumers.
 use std::path::PathBuf;
 use std::process::Command;
+
+use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use tempfile::TempDir;
 
 /// CTFS magic bytes: 0xC0 0xDE 0x72 0xAC 0xE2
@@ -118,14 +122,25 @@ fn find_ct_file(output_dir: &TempDir) -> PathBuf {
     ct_path.clone()
 }
 
-/// Read trace_paths.json content from an output directory.
-fn read_trace_paths(output_dir: &TempDir) -> Vec<serde_json::Value> {
-    let paths_json = output_dir.path().join("trace_paths.json");
-    assert!(paths_json.exists(), "trace_paths.json not found");
-    serde_json::from_str(
-        &std::fs::read_to_string(&paths_json).expect("Failed to read trace_paths.json"),
-    )
-    .expect("Invalid paths JSON")
+/// Read the registered source paths from the `.ct` container produced
+/// by the recorder.  The legacy `trace_paths.json` sidecar was retired
+/// with the v3 CTFS rollout — paths are now interned in the container's
+/// `meta.dat` / paths stream.
+fn read_trace_paths(output_dir: &TempDir) -> Vec<String> {
+    let ct_path = find_ct_file(output_dir);
+    let reader = NimTraceReaderHandle::open(ct_path.to_str().expect("ct path must be UTF-8"))
+        .expect("Failed to open .ct container");
+    (0..reader.path_count())
+        .map(|i| reader.path(i).expect("Failed to read path entry"))
+        .collect()
+}
+
+/// Read the recorded program path from the `.ct` container's metadata.
+fn read_trace_program(output_dir: &TempDir) -> String {
+    let ct_path = find_ct_file(output_dir);
+    let reader = NimTraceReaderHandle::open(ct_path.to_str().expect("ct path must be UTF-8"))
+        .expect("Failed to open .ct container");
+    reader.program()
 }
 
 #[test]
@@ -137,30 +152,18 @@ fn test_bash_step_events_simple() {
     let ct_size = std::fs::metadata(&ct_path).unwrap().len();
     assert!(ct_size > 0, ".ct file is empty");
 
-    // Verify sidecar metadata exists and references the script
-    let metadata_json = output_dir.path().join("trace_metadata.json");
-    assert!(metadata_json.exists(), "trace_metadata.json not found");
-    let metadata: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&metadata_json).expect("Failed to read metadata"),
-    )
-    .expect("Invalid metadata JSON");
-
-    let program = metadata["program"].as_str().expect("No program field");
+    // Verify the recorded program path references the script
+    let program = read_trace_program(&output_dir);
     assert!(
         program.contains("simple.sh"),
         "Program should reference simple.sh, got: {}",
         program
     );
 
-    // Verify trace_paths.json exists and contains the script
-    let paths_json = output_dir.path().join("trace_paths.json");
-    assert!(paths_json.exists(), "trace_paths.json not found");
+    // Verify the .ct container's paths stream includes the script
     let paths = read_trace_paths(&output_dir);
-
     assert!(!paths.is_empty(), "paths should not be empty");
-    let has_simple = paths
-        .iter()
-        .any(|p| p.as_str().map_or(false, |s| s.contains("simple.sh")));
+    let has_simple = paths.iter().any(|p| p.contains("simple.sh"));
     assert!(has_simple, "paths should contain simple.sh: {:?}", paths);
 }
 
@@ -176,9 +179,7 @@ fn test_bash_path_registration() {
         "Expected at least 1 path, got {}",
         paths.len()
     );
-    let has_fixture = paths
-        .iter()
-        .any(|p| p.as_str().map_or(false, |s| s.contains("simple.sh")));
+    let has_fixture = paths.iter().any(|p| p.contains("simple.sh"));
     assert!(has_fixture, "Paths should include simple.sh: {:?}", paths);
 }
 
@@ -475,21 +476,17 @@ fn test_bash_sourced_file() {
         stdout
     );
 
-    // Verify trace_paths.json contains BOTH files
+    // Verify the .ct container's paths stream contains BOTH files
     let paths = read_trace_paths(&output_dir);
 
-    let has_with_source = paths
-        .iter()
-        .any(|p| p.as_str().map_or(false, |s| s.contains("with_source.sh")));
+    let has_with_source = paths.iter().any(|p| p.contains("with_source.sh"));
     assert!(
         has_with_source,
         "paths should contain with_source.sh: {:?}",
         paths
     );
 
-    let has_sourced_lib = paths
-        .iter()
-        .any(|p| p.as_str().map_or(false, |s| s.contains("sourced_lib.sh")));
+    let has_sourced_lib = paths.iter().any(|p| p.contains("sourced_lib.sh"));
     assert!(
         has_sourced_lib,
         "paths should contain sourced_lib.sh (the sourced file): {:?}",
@@ -532,14 +529,6 @@ fn e2e_bash_simple_script() {
     let ct_path = find_ct_file(&output_dir);
     let ct_size = std::fs::metadata(&ct_path).unwrap().len();
     assert!(ct_size > 0, ".ct file is empty");
-
-    // trace_metadata.json exists
-    let metadata_json = output_dir.path().join("trace_metadata.json");
-    assert!(metadata_json.exists(), "trace_metadata.json not found");
-
-    // trace_paths.json exists
-    let paths_json = output_dir.path().join("trace_paths.json");
-    assert!(paths_json.exists(), "trace_paths.json not found");
 
     // trace_db_metadata.json exists with language="bash"
     let db_metadata_json = output_dir.path().join("trace_db_metadata.json");
@@ -595,22 +584,18 @@ fn e2e_bash_multi_file() {
     // Record with_source.sh which sources sourced_lib.sh
     let (output_dir, _stdout, _stderr) = record_fixture("with_source.sh");
 
-    // Verify trace_paths.json has both files
+    // Verify the .ct container's paths stream contains both files
     let paths = read_trace_paths(&output_dir);
-    let has_with_source = paths
-        .iter()
-        .any(|p| p.as_str().map_or(false, |s| s.contains("with_source.sh")));
+    let has_with_source = paths.iter().any(|p| p.contains("with_source.sh"));
     assert!(
         has_with_source,
-        "trace_paths.json should contain with_source.sh: {:?}",
+        "paths should contain with_source.sh: {:?}",
         paths
     );
-    let has_sourced_lib = paths
-        .iter()
-        .any(|p| p.as_str().map_or(false, |s| s.contains("sourced_lib.sh")));
+    let has_sourced_lib = paths.iter().any(|p| p.contains("sourced_lib.sh"));
     assert!(
         has_sourced_lib,
-        "trace_paths.json should contain sourced_lib.sh: {:?}",
+        "paths should contain sourced_lib.sh: {:?}",
         paths
     );
 
@@ -802,22 +787,11 @@ fn e2e_bash_metadata() {
         db_meta["args"]
     );
 
-    // Also verify that the sidecar trace_metadata.json exists and is valid
-    let metadata_json = output_dir.path().join("trace_metadata.json");
-    assert!(
-        metadata_json.exists(),
-        "trace_metadata.json should still exist"
-    );
-    let meta: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&metadata_json).expect("Failed to read trace_metadata.json"),
-    )
-    .expect("Invalid trace_metadata.json");
-    let meta_program = meta["program"]
-        .as_str()
-        .expect("No program field in trace_metadata.json");
+    // Also verify the .ct container's metadata records the script as the program
+    let meta_program = read_trace_program(&output_dir);
     assert!(
         meta_program.contains("simple.sh"),
-        "trace_metadata.json program should reference simple.sh, got: {}",
+        "meta.dat program should reference simple.sh, got: {}",
         meta_program
     );
 }
