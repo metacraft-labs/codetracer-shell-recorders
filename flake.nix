@@ -2,7 +2,7 @@
   description = "Development environment for codetracer-shell-recorders";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     fenix = {
       url = "github:nix-community/fenix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -114,6 +114,7 @@
 
                 # Build automation and dev tools
                 just
+                prek
                 git-lfs
               ]
               ++ pkgs.lib.optionals isLinux [
