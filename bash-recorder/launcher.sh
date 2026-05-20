@@ -191,15 +191,29 @@ else
     exit 1
 fi
 
-# Set up a FIFO for the FD 3 pipe
-_ct_fifo=$(mktemp -u "${TMPDIR:-/tmp}/ct-fifo-XXXXXX")
-mkfifo "$_ct_fifo"
+# Stage the FD 3 event stream through a temp file rather than a FIFO.
+#
+# A Unix FIFO would let `recorder.sh` and the trace writer run concurrently,
+# but `ct-shell-trace-writer` is a *native* binary: on Windows the recorder
+# runs under a Cygwin/MSYS bash whose `mkfifo` produces a Cygwin-emulated
+# pipe that a non-Cygwin executable cannot read — it opens the FIFO path,
+# sees an immediate EOF, and exits before any event arrives ("EOF reached
+# without EXIT event"), which in turn delivers SIGPIPE (exit 141) to the
+# recorder. Routing the events through a plain file is byte-identical from
+# the writer's point of view (it consumes the whole stream from stdin) and
+# works uniformly on every platform. The recorder still finishes long
+# before the script of interest is large enough for streaming to matter.
+_ct_events_file=$(mktemp "${TMPDIR:-/tmp}/ct-events-XXXXXX")
 
 # Clean up on exit
-trap 'rm -f "$_ct_fifo"' EXIT
+trap 'rm -f "$_ct_events_file"' EXIT
 
-# Start the trace writer reading from the FIFO, passing the program name and
-# its positional argv for metadata + top-level call-arg staging.
+# Run the recorder with FD 3 connected to the event file.
+bash "$_ct_script_dir/recorder.sh" "$_ct_script" "${_ct_script_args[@]}" 3>"$_ct_events_file"
+_ct_exit_code=$?
+
+# Feed the recorded event stream to the trace writer, passing the program
+# name and its positional argv for metadata + top-level call-arg staging.
 #
 # `--args` MUST be the last flag because the trace writer treats every
 # remaining token after `--args` as a positional argv element.
@@ -211,21 +225,13 @@ if (( ${#_ct_script_args[@]} > 0 )); then
         --out-dir "$_ct_output_dir" \
         --program "$_ct_script" \
         --args "${_ct_script_args[@]}" \
-        < "$_ct_fifo" &
+        < "$_ct_events_file"
 else
     "$_ct_trace_writer" \
         --out-dir "$_ct_output_dir" \
         --program "$_ct_script" \
-        < "$_ct_fifo" &
+        < "$_ct_events_file"
 fi
-_ct_writer_pid=$!
-
-# Run the recorder with FD 3 connected to the FIFO
-bash "$_ct_script_dir/recorder.sh" "$_ct_script" "${_ct_script_args[@]}" 3>"$_ct_fifo"
-_ct_exit_code=$?
-
-# Wait for the trace writer to finish processing
-wait "$_ct_writer_pid" 2>/dev/null || true
 
 # ============================================================================
 # Post-recording steps: enrich the trace folder for self-containment
