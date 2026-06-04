@@ -57,11 +57,19 @@ jobs:
   cross-repo-tests:
     runs-on: ubuntu-latest
     # Cross-repo tests need access to private submodules (tree-sitter-nim)
-    # in the codetracer repo, which requires the GH_READ_METACRAFT_PRIVATE_REPOS
+    # in the codetracer repo, which requires the CI_TOKEN_PROVIDER_APP_ID
     # secret. Skip gracefully on forks or when the secret is not configured.
     if: ${{ github.event_name == 'repository_dispatch' || github.repository == 'metacraft-labs/codetracer-shell-recorders' }}
 
     steps:
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
       # 1. Checkout this repository (codetracer-shell-recorders)
       - name: Checkout codetracer-shell-recorders
         uses: actions/checkout@v4
@@ -129,7 +137,7 @@ jobs:
           rm -rf "${GITHUB_WORKSPACE}/../codetracer"
 
           # Configure git URL rewriting for private submodules
-          TOKEN="${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}"
+          TOKEN="${{ steps.app-token.outputs.token }}"
           if [ -n "${TOKEN}" ]; then
             git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "git@github.com:"
             git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
@@ -152,12 +160,12 @@ jobs:
             git -C "${GITHUB_WORKSPACE}/../codetracer" checkout "${CODETRACER_REF}"
           fi
 
-          # Initialize and update submodules (requires GH_READ_METACRAFT_PRIVATE_REPOS
+          # Initialize and update submodules (requires CI_TOKEN_PROVIDER_APP_ID
           # for private submodules like tree-sitter-nim)
           cd "${GITHUB_WORKSPACE}/../codetracer"
           git submodule init
           if [ -z "${TOKEN}" ]; then
-            echo "::error::GH_READ_METACRAFT_PRIVATE_REPOS secret is required for cross-repo tests."
+            echo "::error::CI_TOKEN_PROVIDER_APP_ID secret is required for cross-repo tests."
             echo "::error::The codetracer repo has private submodules that need auth."
             echo "::error::Add the secret in Settings > Secrets and variables > Actions."
             exit 1
@@ -188,7 +196,7 @@ jobs:
       - name: Clone codetracer-trace-format (path dependency)
         run: |
           TF_REF="${{ steps.resolve-ref.outputs.trace_format_ref }}"
-          TOKEN="${{ secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}"
+          TOKEN="${{ steps.app-token.outputs.token }}"
           if [ -n "${TOKEN}" ]; then
             CLONE_URL="https://x-access-token:${TOKEN}@github.com/metacraft-labs/codetracer-trace-format.git"
           else
