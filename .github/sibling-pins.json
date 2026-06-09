@@ -8,7 +8,6 @@
   "codetracer-python-recorder": "52811f84a282c02e38ec59f34db6587075c1ff9a",
   "codetracer-rr": "265e010d4d05653b4bc7ddf79c36dee639c4ffeb",
   "codetracer-native-backend": "c10fb0d91d22a3e549bbb31b02d0ba4a41eff562",
-  "codetracer-rr-driver": "3d33a00424bc4665c1c0024b54f09a8aa957c150",
   "codetracer-ruby-recorder": "0e772cc055ac2a5592a7ce79f510a9cd1484f24a",
   "codetracer-specs": "7ed485dc825156b7b699f12c9b107d64eda85b86",
   "codetracer-trace-format": "74c235cd275aded0559b7898f9a34dfc248c6dbb",
