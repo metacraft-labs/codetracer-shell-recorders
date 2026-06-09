@@ -13,7 +13,7 @@ name = "ct-shell-trace-writer"
 path = "src/main.rs"
 
 [dependencies]
-codetracer_trace_types = { version = "0.16", path = "../../../codetracer-trace-format/codetracer_trace_types" }
+codetracer_trace_types = { version = "0.19", path = "../../../codetracer-trace-format/codetracer_trace_types" }
 # CTFS-only backend.  Recorders always emit the canonical CTFS `.ct`
 # container per Recorder-CLI-Conventions §4; the previous Rust-native
 # CBOR+Zstd writer (used by the removed `--format binary` and `--format
