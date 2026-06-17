@@ -208,16 +208,19 @@
             # sibling codetracer-trace-format repo checkout. Patch them to
             # point at the codetracer-trace-format flake input in the nix store.
             postPatch = ''
+              # codetracer_trace_writer (the Rust-native CBOR+Zstd
+              # writer) is no longer pulled in here -- shell
+              # recorders moved to the Nim-backed
+              # codetracer_trace_writer_nim per the CTFS-only
+              # contract.  Drop the third --replace-fail so the
+              # nix build doesn't abort on the obsolete pattern.
               substituteInPlace crates/ct-shell-trace-writer/Cargo.toml \
                 --replace-fail \
                   'path = "../../../codetracer-trace-format/codetracer_trace_types"' \
                   'path = "${codetracer-trace-format}/codetracer_trace_types"' \
                 --replace-fail \
                   'path = "../../../codetracer-trace-format/codetracer_trace_writer_nim"' \
-                  'path = "${codetracer-trace-format}/codetracer_trace_writer_nim"' \
-                --replace-fail \
-                  'path = "../../../codetracer-trace-format/codetracer_trace_writer"' \
-                  'path = "${codetracer-trace-format}/codetracer_trace_writer"'
+                  'path = "${codetracer-trace-format}/codetracer_trace_writer_nim"'
             '';
 
             # Install the binary plus the shell launcher/recorder scripts
