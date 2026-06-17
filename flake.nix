@@ -201,6 +201,21 @@
                 "$nim_src/src/codetracer_trace_writer_ffi.nim"
 
               export CODETRACER_NIM_LIB_DIR="$TMPDIR"
+
+              # codetracer_trace_writer_nim's build.rs (in
+              # codetracer-trace-format) looks for the Nim FFI entry
+              # point at ``../codetracer-trace-format-nim/src/...``
+              # by default, then falls back to
+              # ``CODETRACER_TRACE_FORMAT_NIM_DIR``.  Point it at the
+              # writable copy preBuild made above so the build doesn't
+              # abort with "Nim FFI entry point not found at
+              # /nix/store/codetracer-trace-format-nim/src/...".
+              # Also skip ``nimble install --depsOnly`` because the
+              # nix sandbox has no network access and we've already
+              # supplied stew + results via nim -p paths above.
+              export CODETRACER_TRACE_FORMAT_NIM_DIR="$nim_src"
+              export CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL=1
+              export CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS="${nim-stew}:${nim-results}"
             '';
 
             # The Cargo.toml references codetracer_trace_types and
