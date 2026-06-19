@@ -122,8 +122,6 @@
               ]
               ++ pkgs.lib.optionals isDarwin [
                 libiconv
-                darwin.apple_sdk.frameworks.CoreFoundation
-                darwin.apple_sdk.frameworks.Security
               ]
               ++ preCommit.enabledPackages;
 
@@ -171,8 +169,6 @@
               with pkgs;
               [
                 libiconv
-                darwin.apple_sdk.frameworks.CoreFoundation
-                darwin.apple_sdk.frameworks.Security
               ]
             );
 
