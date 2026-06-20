@@ -55,7 +55,7 @@ on:
 
 jobs:
   cross-repo-tests:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos]
     # Cross-repo tests need access to private submodules (tree-sitter-nim)
     # in the codetracer repo, which requires the CI_TOKEN_PROVIDER_APP_ID
     # secret. Skip gracefully on forks or when the secret is not configured.
@@ -216,11 +216,16 @@ jobs:
           fi
 
       # 5. Generate tree-sitter-nim parser (gitignored generated file)
+      #
+      # We provision tree-sitter-cli via `nix shell nixpkgs#tree-sitter`
+      # because the self-hosted nixos runners don't have npm on PATH (the
+      # previous `npm install -g tree-sitter-cli` step relied on the
+      # ubuntu-latest runner image's Node toolchain).  Using nix here keeps
+      # the step hermetic and matches the rest of the workflow.
       - name: Generate tree-sitter-nim parser
         run: |
-          npm install -g tree-sitter-cli
           cd "${GITHUB_WORKSPACE}/../codetracer/libs/tree-sitter-nim"
-          tree-sitter generate
+          nix shell nixpkgs#tree-sitter --command tree-sitter generate
           ls -la src/parser.c
 
       # 6. Run cross-repo integration tests
