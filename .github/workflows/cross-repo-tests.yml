@@ -55,7 +55,7 @@ on:
 
 jobs:
   cross-repo-tests:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos]
     # Cross-repo tests need access to private submodules (tree-sitter-nim)
     # in the codetracer repo, which requires the CI_TOKEN_PROVIDER_APP_ID
     # secret. Skip gracefully on forks or when the secret is not configured.
