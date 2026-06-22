@@ -21,8 +21,8 @@
 #   Priority cascade for resolving the codetracer ref:
 #     1. workflow_dispatch input `codetracer_ref` (manual override)
 #     2. repository_dispatch `client_payload.codetracer_ref` (bidirectional)
-#     3. `.github/sibling-pins` (lock file)
-#     4. Fallback to `main`
+#     3. repo-workspaces workspace lock (scripts/resolve-sibling-rev.sh,
+#        pinned SHA)
 
 name: Cross-Repo Integration Tests
 
@@ -81,43 +81,74 @@ jobs:
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
           nix-github-token: ${{ secrets.GITHUB_TOKEN }}
-      # 3. Resolve codetracer ref via priority cascade
+
+      - name: Checkout metacraft-manifests (workspace locks)
+        uses: actions/checkout@v5
+        with:
+          repository: metacraft-labs/metacraft-manifests
+          ref: latest
+          path: _manifests
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Resolve cross-repo workspace-lock SHA
+        shell: bash
+        run: |
+          case "${{ github.event_name }}" in
+            pull_request) CANDS="${{ github.event.pull_request.base.sha }}" ;;
+            push) CANDS="${{ github.sha }} ${{ github.event.before }}" ;;
+            *) CANDS="${{ github.sha }}" ;;
+          esac
+          LOCK_SHA=""
+          for c in $CANDS; do
+            [ -z "$c" ] && continue
+            [ "$c" = "0000000000000000000000000000000000000000" ] && continue
+            if "${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
+                 --repo codetracer-shell-recorders --sibling codetracer \
+                 --manifest-dir "${{ github.workspace }}/_manifests" \
+                 --sha "$c" --no-walk >/dev/null 2>&1; then
+              LOCK_SHA="$c"; break
+            fi
+          done
+          if [ -z "$LOCK_SHA" ]; then
+            echo "::error::No repo-workspaces workspace lock for codetracer-shell-recorders (candidates: $CANDS). The commit must be published through the workspace tooling (pre-push hook / 'workspace lock')."
+            exit 1
+          fi
+          echo "CT_MANIFEST_DIR=${{ github.workspace }}/_manifests" >> "$GITHUB_ENV"
+          echo "CT_LOCK_SHA=$LOCK_SHA" >> "$GITHUB_ENV"
+          echo "Resolved cross-repo lock SHA for codetracer-shell-recorders: $LOCK_SHA"
+
+      # 3. Resolve sibling refs via priority cascade:
+      #    1. workflow_dispatch input (manual override)
+      #    2. repository_dispatch payload (bidirectional trigger)
+      #    3. repo-workspaces workspace lock (resolver, pinned SHA)
       - name: Resolve codetracer ref
         id: resolve-ref
+        shell: bash
         run: |
-          SIBLING_PINS=".github/sibling-pins"
-
           # 1. workflow_dispatch input (manual trigger)
           DISPATCH_REF="${{ github.event.inputs.codetracer_ref }}"
           if [ -n "${DISPATCH_REF}" ] && [ "${DISPATCH_REF}" != "main" ]; then
-            echo "codetracer_ref=${DISPATCH_REF}" >> "$GITHUB_OUTPUT"
-            echo "Resolved codetracer ref from workflow_dispatch: ${DISPATCH_REF}"
+            CT_REF="${DISPATCH_REF}"
+            echo "Resolved codetracer ref from workflow_dispatch: ${CT_REF}"
           # 2. repository_dispatch payload (bidirectional trigger)
           elif [ -n "${{ github.event.client_payload.codetracer_ref }}" ]; then
-            PAYLOAD_REF="${{ github.event.client_payload.codetracer_ref }}"
-            echo "codetracer_ref=${PAYLOAD_REF}" >> "$GITHUB_OUTPUT"
-            echo "Resolved codetracer ref from repository_dispatch: ${PAYLOAD_REF}"
-          # 3. sibling-pins
-          elif [ -f "${SIBLING_PINS}" ]; then
-            PINS_REF="$(grep '^codetracer ' "${SIBLING_PINS}" | cut -d' ' -f2)" || true
-            if [ -n "${PINS_REF}" ]; then
-              echo "codetracer_ref=${PINS_REF}" >> "$GITHUB_OUTPUT"
-              echo "Resolved codetracer ref from sibling-pins: ${PINS_REF}"
-            else
-              echo "codetracer_ref=main" >> "$GITHUB_OUTPUT"
-            fi
+            CT_REF="${{ github.event.client_payload.codetracer_ref }}"
+            echo "Resolved codetracer ref from repository_dispatch: ${CT_REF}"
+          # 3. repo-workspaces workspace lock (resolver, pinned SHA)
           else
-            # 4. Fallback
-            echo "codetracer_ref=main" >> "$GITHUB_OUTPUT"
-            echo "Resolved codetracer ref: main (fallback)"
+            CT_REF="$("${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
+              --repo codetracer-shell-recorders --sibling codetracer \
+              --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk)"
+            echo "Resolved codetracer ref from workspace lock: ${CT_REF}"
           fi
+          echo "codetracer_ref=${CT_REF}" >> "$GITHUB_OUTPUT"
 
-          # Resolve trace-format ref (for submodule override)
-          if [ -f "${SIBLING_PINS}" ]; then
-            TF_REF="$(grep '^codetracer-trace-format ' "${SIBLING_PINS}" | cut -d' ' -f2)" || true
-          fi
-          echo "trace_format_ref=${TF_REF:-}" >> "$GITHUB_OUTPUT"
-          echo "Resolved trace-format ref: ${TF_REF:-<default>}"
+          # Resolve trace-format ref (for submodule override) from the lock.
+          TF_REF="$("${{ github.workspace }}/scripts/resolve-sibling-rev.sh" \
+            --repo codetracer-shell-recorders --sibling codetracer-trace-format \
+            --manifest-dir "$CT_MANIFEST_DIR" --sha "$CT_LOCK_SHA" --no-walk)"
+          echo "trace_format_ref=${TF_REF}" >> "$GITHUB_OUTPUT"
+          echo "Resolved trace-format ref: ${TF_REF}"
 
       # 4. Clone the codetracer repo as a sibling directory
       - name: Clone codetracer repo
