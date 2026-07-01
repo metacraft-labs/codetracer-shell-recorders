@@ -7,7 +7,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos]
     steps:
       - name: Generate CI token
         id: app-token
@@ -55,7 +55,7 @@ jobs:
 
   nix-build:
     name: Verify nix flake packages build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nixos]
     steps:
       - uses: actions/checkout@v4
 
