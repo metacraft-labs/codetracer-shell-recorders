@@ -161,50 +161,88 @@ _ct_debug_trap() {
     if (( _ct_depth > _ct_prev_depth )); then
         local _ct_func_name="${FUNCNAME[1]}"
 
-        # Register function if first time seen
+        # Structural frames that are always present in FUNCNAME but are NOT
+        # user-visible function calls:
+        #   FUNCNAME[N-1] = main   — the recorder's own top-level frame
+        #   FUNCNAME[N-2] = source — the recorder's synthetic script-load
+        #                            wrapper (`source "$_ct_target_script"`)
+        #   FUNCNAME[0]   = _ct_debug_trap — this DEBUG-trap frame itself
+        # A genuine user-visible function entry therefore only exists once
+        # FUNCNAME contains at least one frame *between* the trap frame and
+        # the script-load `source` frame, i.e. _ct_depth >= 4.
+        #
+        # This mirrors the zsh recorder's guard (`_ct_depth >= 2`), which
+        # excludes the script-load transition (zsh depth 0 -> 1) so that
+        # only real user-frame entries (zsh depth >= 2) are counted. In bash
+        # the same three non-user frames (main, script-load source, trap)
+        # shift the equivalent threshold to 4. We deliberately use this
+        # stack-depth invariant rather than a `!= "source"` name check: a
+        # user is free to define a function literally named `source`, and
+        # such a call would (correctly) appear at _ct_depth >= 4 and be
+        # counted, while the synthetic script-load wrapper at _ct_depth == 3
+        # is suppressed regardless of its name.
+        local _ct_is_user_call=0
+        if (( _ct_depth >= 4 )); then
+            _ct_is_user_call=1
+        fi
+
+        # Register function if first time seen.  Registration is intentionally
+        # NOT gated by _ct_is_user_call: the script-load `source` wrapper must
+        # still appear in the function table (FUNC event), it just must not
+        # surface as a counted CALL below.
         if [[ -z "${_ct_registered_funcs[$_ct_func_name]+x}" ]]; then
             printf 'FUNC name=%s file=%s line=%d\n' "$_ct_func_name" "$_ct_file" "$_ct_line" >&3
             _ct_registered_funcs["$_ct_func_name"]=1
         fi
 
-        # Stage positional parameters as ARG events BEFORE the CALL event.
-        #
-        # When `extdebug` is on, bash maintains `BASH_ARGC` (per-frame argv
-        # count, top-of-stack = current frame) and `BASH_ARGV` (flat stack
-        # of all positional parameters, reversed: BASH_ARGV[0] is the LAST
-        # positional parameter of the innermost frame).
-        # See: https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html
-        #
-        # Inside this DEBUG trap, FUNCNAME[0] = `_ct_debug_trap` and
-        # FUNCNAME[1] is the user function we are inside.  Since we read
-        # `_ct_func_name` from FUNCNAME[1], we likewise need BASH_ARGC[1]
-        # (the user-function frame's argc) — BASH_ARGC[0] would be the
-        # arg count of `_ct_debug_trap` itself, which is 0.  We also need
-        # to skip BASH_ARGV[0..BASH_ARGC[0]-1] (the trap-frame argv slots,
-        # if any) before reading the user-function frame's argv.
-        local _ct_trap_argc=0
-        if (( ${#BASH_ARGC[@]} > 0 )); then
-            _ct_trap_argc="${BASH_ARGC[0]}"
-        fi
-        if (( ${#BASH_ARGC[@]} > 1 )); then
-            local _ct_argc="${BASH_ARGC[1]}"
-            local _ct_argv_base=$_ct_trap_argc
-            local _ct_arg_idx
-            # BASH_ARGV is reversed: the user-function frame's $1 lives at
-            # index (argv_base + argc - 1), $2 at (argv_base + argc - 2),
-            # and so on.  We walk forward 1..argc to emit ARG name=$1,
-            # name=$2, ... in canonical order.
-            for (( _ct_arg_idx = 1; _ct_arg_idx <= _ct_argc; _ct_arg_idx++ )); do
-                local _ct_arg_slot=$(( _ct_argv_base + _ct_argc - _ct_arg_idx ))
-                local _ct_arg_val="${BASH_ARGV[$_ct_arg_slot]:-}"
-                local _ct_arg_quoted
-                _ct_arg_quoted=$(_ct_quote_value "$_ct_arg_val")
-                printf 'ARG name=$%d value=%s type=s\n' "$_ct_arg_idx" "$_ct_arg_quoted" >&3
-            done
-        fi
+        # The synthetic script-load `source` wrapper (_ct_depth == 3) is
+        # registered in the function table above but must NOT surface as a
+        # counted CALL — nor stage its ARG events (the wrapper carries the
+        # script's own $1..$N, which would otherwise be misattributed to a
+        # phantom call).  Only emit ARG + CALL for genuine user-visible
+        # function entries.  This matches the zsh recorder, whose
+        # `_ct_depth >= 2` guard likewise suppresses the script-load call
+        # while keeping later user-function calls.
+        if (( _ct_is_user_call )); then
+            # Stage positional parameters as ARG events BEFORE the CALL event.
+            #
+            # When `extdebug` is on, bash maintains `BASH_ARGC` (per-frame argv
+            # count, top-of-stack = current frame) and `BASH_ARGV` (flat stack
+            # of all positional parameters, reversed: BASH_ARGV[0] is the LAST
+            # positional parameter of the innermost frame).
+            # See: https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html
+            #
+            # Inside this DEBUG trap, FUNCNAME[0] = `_ct_debug_trap` and
+            # FUNCNAME[1] is the user function we are inside.  Since we read
+            # `_ct_func_name` from FUNCNAME[1], we likewise need BASH_ARGC[1]
+            # (the user-function frame's argc) — BASH_ARGC[0] would be the
+            # arg count of `_ct_debug_trap` itself, which is 0.  We also need
+            # to skip BASH_ARGV[0..BASH_ARGC[0]-1] (the trap-frame argv slots,
+            # if any) before reading the user-function frame's argv.
+            local _ct_trap_argc=0
+            if (( ${#BASH_ARGC[@]} > 0 )); then
+                _ct_trap_argc="${BASH_ARGC[0]}"
+            fi
+            if (( ${#BASH_ARGC[@]} > 1 )); then
+                local _ct_argc="${BASH_ARGC[1]}"
+                local _ct_argv_base=$_ct_trap_argc
+                local _ct_arg_idx
+                # BASH_ARGV is reversed: the user-function frame's $1 lives at
+                # index (argv_base + argc - 1), $2 at (argv_base + argc - 2),
+                # and so on.  We walk forward 1..argc to emit ARG name=$1,
+                # name=$2, ... in canonical order.
+                for (( _ct_arg_idx = 1; _ct_arg_idx <= _ct_argc; _ct_arg_idx++ )); do
+                    local _ct_arg_slot=$(( _ct_argv_base + _ct_argc - _ct_arg_idx ))
+                    local _ct_arg_val="${BASH_ARGV[$_ct_arg_slot]:-}"
+                    local _ct_arg_quoted
+                    _ct_arg_quoted=$(_ct_quote_value "$_ct_arg_val")
+                    printf 'ARG name=$%d value=%s type=s\n' "$_ct_arg_idx" "$_ct_arg_quoted" >&3
+                done
+            fi
 
-        # Emit CALL event (drains the ARG events staged above)
-        printf 'CALL name=%s\n' "$_ct_func_name" >&3
+            # Emit CALL event (drains the ARG events staged above)
+            printf 'CALL name=%s\n' "$_ct_func_name" >&3
+        fi
     fi
 
     _ct_prev_depth=$_ct_depth

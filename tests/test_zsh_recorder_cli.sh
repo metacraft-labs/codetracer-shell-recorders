@@ -265,8 +265,18 @@ pass "T7 path table: fixture_full.zsh present"
 #   - 4 step events (absolute step on the source-load line, delta
 #     step inside greet's body for the echo line, delta steps on
 #     closing `}` / post-call positions)
-#   - 1 user-visible call event (`greet`); the zsh recorder does
-#     NOT stage a synthetic `source` wrapper the way bash does
+#   - 2 call events: the implicit `<toplevel>` root frame PLUS the
+#     single user call (`greet`).  `.counts.calls` counts EVERY
+#     CallRecord in the trace, including the implicit top-level frame
+#     that the writer stages on START (trace_bridge.rs `handle_start`
+#     → `handle_call("<toplevel>")`).  This is the SAME cross-recorder
+#     model as the Python recorder, whose canonical `ct print --full`
+#     fixture asserts `.counts.calls == 3` for its implicit
+#     `<__main__>` frame + `main` + `make_greeting`
+#     (codetracer-python-recorder tests/python/test_cli_integration.py),
+#     and the Ruby recorder's `<top-level>` frame.  Unlike bash, the
+#     zsh recorder does NOT stage a synthetic `source` wrapper, so its
+#     `functions` table is `<toplevel>` + `greet` only.
 #   - 1 io_event (the DEBUG-trap path emits a single ioStdout for
 #     the `echo` source rendering — fewer than bash because zsh's
 #     trap fires once rather than wrapping the builtin)
@@ -275,23 +285,31 @@ pass "T7 path table: fixture_full.zsh present"
 STEPS="$(jq -r .counts.steps <<< "${CT_FULL}")"
 [[ "${STEPS}" == "4" ]] \
   || fail "T7: expected 4 steps, got ${STEPS}; counts=$(jq -c .counts <<< "${CT_FULL}")"
+# 2 calls: the implicit `<toplevel>` root frame + the user `greet` call.
+# The `<toplevel>` frame is a real, counted CallRecord (see the block
+# comment above and the cross-recorder Python `<__main__>` precedent).
 CALLS="$(jq -r .counts.calls <<< "${CT_FULL}")"
-[[ "${CALLS}" == "1" ]] \
-  || fail "T7: expected 1 call, got ${CALLS}; counts=$(jq -c .counts <<< "${CT_FULL}")"
+[[ "${CALLS}" == "2" ]] \
+  || fail "T7: expected 2 calls (<toplevel> + greet), got ${CALLS}; counts=$(jq -c .counts <<< "${CT_FULL}")"
 IO_EVENTS="$(jq -r .counts.io_events <<< "${CT_FULL}")"
 [[ "${IO_EVENTS}" == "1" ]] \
   || fail "T7: expected 1 io_event, got ${IO_EVENTS}; counts=$(jq -c .counts <<< "${CT_FULL}")"
-pass "T7 counts: 4 steps / 1 call / 1 io_event"
+pass "T7 counts: 4 steps / 2 calls / 1 io_event"
 
-# ----- Call sequence: exactly one user-visible call_entry -----------
-# The fixture issues exactly one user call (`greet`).  We anchor the
-# call by its args (the typed String "world" arg uniquely identifies
-# it).  The zsh recorder DOES populate the `function` field on
-# call_entry for this code path, so we can also assert on it.
+# ----- Call sequence: <toplevel> root frame + the user greet call ---
+# Two call_entry events surface: the implicit `<toplevel>` root frame
+# staged on START, then the single user call (`greet`).  This mirrors
+# the Python recorder, whose canonical fixture yields a call_entry
+# sequence of `<__main__>` → `main` → `make_greeting` — the implicit
+# top-level frame is the FIRST call_entry, exactly as `<toplevel>` is
+# here (codetracer-python-recorder tests/python/test_cli_integration.py).
+# We assert the total (2) AND separately anchor the user `greet` call by
+# its typed String "world" arg below (uniquely identifying it vs. the
+# top-level frame, which carries the script's positional args, not $1).
 TOTAL_ENTRIES="$(jq -r '[.events[] | select(.kind == "call_entry")] | length' <<< "${CT_FULL}")"
-[[ "${TOTAL_ENTRIES}" == "1" ]] \
-  || fail "T7: expected exactly 1 call_entry, got ${TOTAL_ENTRIES}: $(jq -c '[.events[] | select(.kind == "call_entry")]' <<< "${CT_FULL}")"
-pass "T7 call sequence: ${TOTAL_ENTRIES} call_entry event"
+[[ "${TOTAL_ENTRIES}" == "2" ]] \
+  || fail "T7: expected 2 call_entry events (<toplevel> + greet), got ${TOTAL_ENTRIES}: $(jq -c '[.events[] | select(.kind == "call_entry")]' <<< "${CT_FULL}")"
+pass "T7 call sequence: ${TOTAL_ENTRIES} call_entry events (<toplevel> + greet)"
 
 # ----- Strict ValueRecord variant invariant -------------------------
 # Every step var / call arg / return value must carry a `value.kind`
@@ -353,28 +371,33 @@ GREET_ARG_TEXT="$(jq -r '
 pass "T7 exact call-arg: greet(\$1=String(\"world\"))"
 
 # ----- Exact decoded step-var: $1 = "world" inside greet's body -----
-# The zsh recorder snapshots positional-arg locals via
-# ValueRecord::Raw (textual rendering — distinct from the typed
-# `String` form used for call_entry args).
+# The zsh recorder shares the ct-shell-trace-writer binary with the bash
+# recorder, so positional-arg step-vars flow through the SAME wire path
+# as call args: `handle_var` → `value_record_for_flag`
+# (ct-shell-trace-writer/src/trace_bridge.rs) maps the `s` (string) type
+# flag to `ValueRecord::String { text }`.  There is no `ValueRecord::Raw`
+# code path in the shell writer at all, so the decoded step-var is
+# `{"kind":"String","text":"world"}` — the same variant asserted for the
+# call_entry arg above (they share the helper).
 STEP_VAR_KIND="$(jq -r '
   [.events[]
    | select(.kind == "step")
    | .vars[]?
-   | select(.varname == "$1" and .value.r == "world")]
+   | select(.varname == "$1" and .value.text == "world")]
    | first
    | .value.kind' <<< "${CT_FULL}")"
-[[ "${STEP_VAR_KIND}" == "Raw" ]] \
-  || fail "T7: step var \$1=\"world\" should decode as Raw, got kind=${STEP_VAR_KIND}"
+[[ "${STEP_VAR_KIND}" == "String" ]] \
+  || fail "T7: step var \$1=\"world\" should decode as String, got kind=${STEP_VAR_KIND}"
 STEP_VAR_TEXT="$(jq -r '
   [.events[]
    | select(.kind == "step")
    | .vars[]?
-   | select(.varname == "$1" and .value.r == "world")]
+   | select(.varname == "$1" and .value.text == "world")]
    | first
-   | .value.r' <<< "${CT_FULL}")"
+   | .value.text' <<< "${CT_FULL}")"
 [[ "${STEP_VAR_TEXT}" == "world" ]] \
   || fail "T7: step var \$1 should snapshot \"world\", got ${STEP_VAR_TEXT}"
-pass "T7 exact step-var: \$1=Raw(\"world\")"
+pass "T7 exact step-var: \$1=String(\"world\")"
 
 # ----- Exact decoded return value: greet returns Int(0) -------------
 # Zsh function exit status surfaces as ValueRecord::Int { i: 0 } via
