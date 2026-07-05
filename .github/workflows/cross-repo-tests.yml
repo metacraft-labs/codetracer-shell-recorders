@@ -17,11 +17,11 @@
 # Local equivalent:
 #   just cross-test
 #
-# Codetracer revision pinning:
+# Cross-repo revision pinning:
 #   Priority cascade for resolving the codetracer ref:
 #     1. workflow_dispatch input `codetracer_ref` (manual override)
 #     2. repository_dispatch `client_payload.codetracer_ref` (bidirectional)
-#     3. repo-workspaces workspace lock (via setup-dev-env, pinned SHA)
+#     3. pull_request base branch when present, otherwise main
 
 name: Cross-Repo Integration Tests
 
@@ -76,16 +76,14 @@ jobs:
       # 2. Set up the dev env and clone sibling repositories.
       #
       # setup-dev-env installs nix and clones the cross-repo siblings
-      # adjacent to this checkout at workspace-lock-pinned revisions:
+      # adjacent to this checkout at explicit revisions:
       #   - codetracer (with submodules; provides the db-backend flow
       #     tests and the tree-sitter-nim submodule)
       #   - codetracer-trace-format (the recorder's Cargo.toml path deps
       #     resolve to ../codetracer-trace-format/...)
-      # The workflow_dispatch input defaults to 'main', which the original
-      # resolver treated as "no override"; preserve that by only passing
-      # the input when it is set to something other than 'main'. The
-      # repository_dispatch payload (empty unless set) also overrides;
-      # empty => lock.
+      # Always pass concrete refs for these cross-repo siblings. The current
+      # checkout may not have a repo-workspaces lock on the PR base commit,
+      # and an empty ref would make setup-dev-env fail before tests start.
       - name: Setup dev env
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
@@ -97,8 +95,8 @@ jobs:
           attic-cache: ${{ vars.ATTIC_CACHE }}
           attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
           siblings: |
-            codetracer=${{ (github.event.inputs.codetracer_ref != 'main' && github.event.inputs.codetracer_ref) || github.event.client_payload.codetracer_ref }}
-            codetracer-trace-format
+            codetracer=${{ github.event.inputs.codetracer_ref || github.event.client_payload.codetracer_ref || github.base_ref || 'main' }}
+            codetracer-trace-format=${{ github.base_ref || 'main' }}
 
       # Override the codetracer/libs/codetracer-trace-format submodule with
       # the workflow-cloned sibling (already at the lock-pinned revision)
