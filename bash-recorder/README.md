@@ -40,12 +40,18 @@ The trace bundle written to `--out-dir` contains:
 ```
 <out-dir>/
   <script>.ct                  # CTFS container with the multi-stream event log
-  trace_metadata.json          # program + args (sidecar; same data inside .ct)
-  trace_paths.json             # registered source file paths
+                               #   (program, args, and interned source paths
+                               #   all live inside meta.dat / the paths stream)
   symbols.json                 # function names for symbol search
   trace_db_metadata.json       # language-specific metadata (bash version, recorder, ...)
   files/                       # copies of every source file referenced by the trace
 ```
+
+The `files/` directory is populated by the trace writer, which copies each
+source file interned in the container's paths stream to
+`files/<absolute-path-without-leading-slash>`, so the bundle is
+self-contained. There is no `trace_paths.json` (retired with the v3 CTFS
+rollout) — the source paths live inside the `.ct` container.
 
 To inspect the bundle:
 

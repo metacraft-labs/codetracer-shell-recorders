@@ -4,10 +4,13 @@
 // into the appropriate sequence of TraceWriter method calls.
 //
 // The Nim CTFS backend packages all trace data (events, metadata, paths)
-// into a single `.ct` container file. Separate JSON sidecar files
-// (`trace_metadata.json`, `trace_paths.json`, `symbols.json`) are written
-// by the bridge itself in `finish()` so that the launcher scripts and
-// downstream tools can consume them without parsing the binary container.
+// into a single `.ct` container file. The bridge additionally writes a
+// `symbols.json` sidecar in `finish()` so that launcher scripts and
+// downstream tools can access the registered function names without
+// parsing the binary container. Source paths are NOT exported as a JSON
+// sidecar: they already live in the container's paths stream, and the
+// bridge copies the source files themselves into `files/` (see
+// `copy_source_files`) so the recorded bundle is self-contained.
 //
 // CTFS-only.  The shell trace writer is hard-pinned to CTFS — see
 // `codetracer-specs/Recorder-CLI-Conventions.md` §4.  The previous
@@ -52,10 +55,11 @@ pub struct TraceBridge {
     /// inside the CTFS container.
     #[allow(dead_code)]
     program: String,
-    /// All registered source file paths.  Captured for diagnostic
-    /// purposes; the recording itself now ships this through the
-    /// CTFS paths stream inside the container.
-    #[allow(dead_code)]
+    /// All registered source file paths (in registration order).  The
+    /// recording ships these through the CTFS paths stream inside the
+    /// container; the bridge additionally copies the corresponding source
+    /// files into `files/` in `finish()` (see `copy_source_files`) so the
+    /// recorded bundle is self-contained.
     registered_paths: Vec<String>,
     /// All registered function names (excluding `<toplevel>`), written as
     /// `symbols.json` sidecar for quick symbol search in the UI.
@@ -306,7 +310,12 @@ impl TraceBridge {
     /// access the registered function names without parsing the binary `.ct`
     /// container.  The legacy `trace_metadata.json` / `trace_paths.json`
     /// sidecars were retired with the v3 CTFS rollout — that information now
-    /// lives in `meta.dat` inside the container.
+    /// lives in `meta.dat` / the paths stream inside the container.
+    ///
+    /// Finally, the source files referenced by the trace are copied into
+    /// `files/` (see `copy_source_files`) so the recorded bundle is
+    /// self-contained.  This is done only after `close()` has flushed the
+    /// container, so a failure copying sources cannot corrupt the trace.
     pub fn finish(&mut self) -> Result<(), Box<dyn Error>> {
         if self.started {
             TraceWriter::finish_writing_trace_events(self.writer.as_mut())?;
@@ -314,7 +323,60 @@ impl TraceBridge {
             TraceWriter::close(self.writer.as_mut())?;
 
             self.write_sidecar_files()?;
+            self.copy_source_files()?;
         }
+        Ok(())
+    }
+
+    /// Copy every recorded source file into the trace bundle's `files/`
+    /// directory so the recording is self-contained.
+    ///
+    /// The source paths already live in the CTFS paths stream inside the
+    /// `.ct` container (interned via `ensure_path_id` on each `Path` wire
+    /// event and mirrored into `self.registered_paths`).  This method reads
+    /// them straight from memory — there is deliberately no `paths.json` /
+    /// `trace_paths.json` sidecar; the launcher no longer participates in
+    /// source-file copying.
+    ///
+    /// Layout mirrors the RR trace-folder spec (`RR-Trace-Folders.md`
+    /// §files/): each absolute source path `/a/b/c.sh` is copied to
+    /// `files/a/b/c.sh` (the leading `/` is stripped and the remaining path
+    /// is reproduced verbatim under `files/`).
+    ///
+    /// Paths that do not resolve to an existing regular file on disk are
+    /// skipped: synthetic paths (`<toplevel>`, `<unknown>`), character
+    /// devices under `/dev/*`, and files deleted between recording and
+    /// finalization are all non-copyable and simply left out of `files/`.
+    /// Duplicate paths (the same file registered more than once) copy the
+    /// file at most once because the destination is idempotent.
+    fn copy_source_files(&self) -> Result<(), Box<dyn Error>> {
+        let files_dir = self.output_dir.join("files");
+
+        for src in &self.registered_paths {
+            let src_path = Path::new(src);
+
+            // Only copy real, existing regular files.  `metadata()` follows
+            // symlinks, so a symlink to a regular file is copied as its
+            // target's contents (matching `cp` semantics).  Anything that is
+            // not a regular file — directories, devices, sockets, or a path
+            // that does not exist — is skipped.
+            match std::fs::metadata(src_path) {
+                Ok(meta) if meta.is_file() => {}
+                _ => continue,
+            }
+
+            // Reproduce the absolute path under `files/` with the leading
+            // separator stripped: `/a/b/c.sh` -> `files/a/b/c.sh`.  Relative
+            // paths (no leading separator) are placed under `files/` as-is.
+            let relative = src_path.strip_prefix("/").unwrap_or(src_path);
+            let dest = files_dir.join(relative);
+
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(src_path, &dest)?;
+        }
+
         Ok(())
     }
 

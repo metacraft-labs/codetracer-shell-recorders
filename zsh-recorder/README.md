@@ -30,13 +30,19 @@ The recorder follows `codetracer-specs/Recorder-CLI-Conventions.md`:
 
 ```
 <out-dir>/
-  <script>.ct                  # CTFS container
-  trace_metadata.json
-  trace_paths.json
+  <script>.ct                  # CTFS container (program, args, and interned
+                               #   source paths live inside meta.dat / the
+                               #   paths stream)
   symbols.json
   trace_db_metadata.json       # language=zsh, zsh_version=...
-  files/
+  files/                       # copies of every source file referenced by the trace
 ```
+
+The `files/` directory is populated by the trace writer, which copies each
+source file interned in the container's paths stream to
+`files/<absolute-path-without-leading-slash>`, so the bundle is
+self-contained. There is no `trace_paths.json` (retired with the v3 CTFS
+rollout) — the source paths live inside the `.ct` container.
 
 Use `ct print --json|--summary|--follow <out-dir>/<script>.ct` from
 `codetracer-trace-format-nim` to inspect the bundle.

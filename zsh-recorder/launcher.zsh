@@ -235,46 +235,12 @@ fi
 # ============================================================================
 # Post-recording steps: enrich the trace folder for self-containment
 # ============================================================================
-
-# Copy source files into the trace folder for self-containment
-_ct_copy_source_files() {
-    local _ct_paths_file="$_ct_output_dir/trace_paths.json"
-    [[ -f "$_ct_paths_file" ]] || return 0
-
-    # Parse the JSON array of paths using python3 (available on most systems)
-    # Fallback: use simple grep if python3 not available
-    local _ct_paths
-    if command -v python3 >/dev/null 2>&1; then
-        _ct_paths=$(python3 -c "
-import json, sys
-paths = json.load(open('$_ct_paths_file'))
-for p in paths:
-    # Convert Path objects to strings
-    s = str(p) if isinstance(p, str) else p
-    # Handle paths that might be serialized as objects
-    if isinstance(p, dict):
-        continue
-    print(s)
-" 2>/dev/null) || _ct_paths=""
-    else
-        _ct_paths=$(grep -oP '"[^"]*"' "$_ct_paths_file" | tr -d '"')
-    fi
-
-    local _ct_files_dir="$_ct_output_dir/files"
-
-    local _ct_src
-    while IFS= read -r _ct_src; do
-        [[ -z "$_ct_src" ]] && continue
-        [[ -f "$_ct_src" ]] || continue
-
-        # Create the directory structure under files/
-        local _ct_dest="$_ct_files_dir$_ct_src"
-        mkdir -p "${_ct_dest:h}"
-        cp "$_ct_src" "$_ct_dest" 2>/dev/null || true
-    done <<< "$_ct_paths"
-}
-
-_ct_copy_source_files
+#
+# Source files are copied into the trace folder's `files/` directory by the
+# trace writer itself (see `crates/ct-shell-trace-writer/src/trace_bridge.rs`,
+# `copy_source_files`).  The writer already holds the interned source paths
+# from the CTFS container, so the launcher no longer reads any paths sidecar
+# or copies source files.
 
 # Write enhanced metadata with language-specific fields
 _ct_write_enhanced_metadata() {
