@@ -36,8 +36,8 @@ jobs:
             codetracer-trace-format=${{ github.base_ref || github.ref_name || 'main' }}
             codetracer-trace-format-nim=${{ github.base_ref || github.ref_name || 'main' }}
 
-      - name: Build Nim trace writer library (sibling artifact)
-        # The Nim FFI trace-writer static lib is built from the
+      - name: Build Nim trace-format sibling artifacts
+        # The Nim FFI trace-writer static lib and ct-print are built from the
         # workflow-cloned ../codetracer-trace-format-nim sibling inside
         # THIS repo's dev shell (which provides nim/nimble/zstd headers).
         run: |
@@ -47,6 +47,8 @@ jobs:
             nimble install -y stew results
             nim c --app:staticlib --mm:arc --noMain -d:release --passC:"-fPIC" -p:src \
               -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
+            nim c -d:release --mm:arc -p:src \
+              -o:ct-print src/codetracer_ct_print.nim
           '
           echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
 
