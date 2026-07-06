@@ -26,6 +26,22 @@ set -eo pipefail
 _ct_script_dir="${0:A:h}"
 _ct_repo_root="${_ct_script_dir:h}"
 
+_ct_resolve_zsh() {
+    if [[ -n "${CODETRACER_ZSH:-}" ]]; then
+        printf '%s\n' "$CODETRACER_ZSH"
+    elif (( ${+commands[zsh]} )); then
+        printf '%s\n' "$commands[zsh]"
+    elif [[ -x "/proc/$$/exe" ]]; then
+        printf '%s\n' "/proc/$$/exe"
+    elif [[ -n "${SHELL:-}" && "${SHELL:t}" == "zsh" && -x "$SHELL" ]]; then
+        printf '%s\n' "$SHELL"
+    else
+        printf '%s\n' "zsh"
+    fi
+}
+
+_ct_zsh="$(_ct_resolve_zsh)"
+
 # ---------------------------------------------------------------------------
 # Version + help
 #
@@ -162,7 +178,7 @@ fi
 _ct_disabled="${CODETRACER_ZSH_RECORDER_DISABLED:-}"
 case "$_ct_disabled" in
     1 | true | TRUE | yes | YES)
-        exec zsh "$_ct_script" "${_ct_script_args[@]}"
+        exec "$_ct_zsh" "$_ct_script" "${_ct_script_args[@]}"
         ;;
 esac
 
@@ -178,16 +194,26 @@ _ct_script="${_ct_script:A}"
 mkdir -p "$_ct_output_dir"
 
 # Find the trace-writer binary
-# Look for it in: PATH, same dir as launcher, workspace target/release, workspace target/debug
+# Look for it in: PATH, Cargo's configured target dir, then the workspace target dirs.
 _ct_trace_writer=""
+_ct_cargo_target_dir="${CARGO_TARGET_DIR:-}"
+case "$_ct_cargo_target_dir" in
+    "" | /* | [A-Za-z]:*) ;;
+    *) _ct_cargo_target_dir="$_ct_script_dir/../$_ct_cargo_target_dir" ;;
+esac
+
 if command -v ct-shell-trace-writer >/dev/null 2>&1; then
     _ct_trace_writer="ct-shell-trace-writer"
+elif [[ -n "$_ct_cargo_target_dir" && -x "$_ct_cargo_target_dir/release/ct-shell-trace-writer" ]]; then
+    _ct_trace_writer="$_ct_cargo_target_dir/release/ct-shell-trace-writer"
+elif [[ -n "$_ct_cargo_target_dir" && -x "$_ct_cargo_target_dir/debug/ct-shell-trace-writer" ]]; then
+    _ct_trace_writer="$_ct_cargo_target_dir/debug/ct-shell-trace-writer"
 elif [[ -x "$_ct_script_dir/../target/release/ct-shell-trace-writer" ]]; then
     _ct_trace_writer="$_ct_script_dir/../target/release/ct-shell-trace-writer"
 elif [[ -x "$_ct_script_dir/../target/debug/ct-shell-trace-writer" ]]; then
     _ct_trace_writer="$_ct_script_dir/../target/debug/ct-shell-trace-writer"
 else
-    echo "Error: ct-shell-trace-writer not found in PATH or target directories" >&2
+    echo "Error: ct-shell-trace-writer not found in PATH, CARGO_TARGET_DIR, or target directories" >&2
     exit 1
 fi
 
@@ -208,7 +234,7 @@ _ct_events_file=$(mktemp "${TMPDIR:-/tmp}/ct-events-XXXXXX")
 trap 'rm -f "$_ct_events_file"' EXIT
 
 # Run the recorder with FD 3 connected to the event file.
-zsh "$_ct_script_dir/recorder.zsh" "$_ct_script" "${_ct_script_args[@]}" 3>"$_ct_events_file"
+"$_ct_zsh" "$_ct_script_dir/recorder.zsh" "$_ct_script" "${_ct_script_args[@]}" 3>"$_ct_events_file"
 _ct_exit_code=$?
 
 # Feed the recorded event stream to the trace writer, passing the program
@@ -260,7 +286,7 @@ _ct_write_enhanced_metadata() {
     _ct_args_json+="]"
 
     local _ct_zsh_version
-    _ct_zsh_version=$(zsh --version | head -1 | grep -oP '\d+\.\d+(\.\d+)?' || echo "$ZSH_VERSION")
+    _ct_zsh_version=$("$_ct_zsh" --version | head -1 | grep -oP '\d+\.\d+(\.\d+)?' || echo "$ZSH_VERSION")
 
     cat > "$_ct_output_dir/trace_db_metadata.json" <<METADATA
 {
