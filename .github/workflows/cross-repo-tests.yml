@@ -11,6 +11,7 @@
 #
 #   $GITHUB_WORKSPACE/../
 #     codetracer/                        <-- cloned by this workflow
+#     codetracer-native-recorder/        <-- cloned by this workflow
 #     codetracer-shell-recorders/        <-- checked out by actions/checkout
 #
 # POLICY: All CI steps should be reproducible locally via `just` targets.
@@ -79,6 +80,8 @@ jobs:
       # adjacent to this checkout at explicit revisions:
       #   - codetracer (with submodules; provides the db-backend flow
       #     tests and the tree-sitter-nim submodule)
+      #   - codetracer-native-recorder (provides native db-backend FFI
+      #     symbols consumed when codetracer's replay-server links)
       #   - codetracer-trace-format (the recorder's Cargo.toml path deps
       #     resolve to ../codetracer-trace-format/...)
       #   - codetracer-trace-format-nim (the trace-format Rust crate builds
@@ -98,6 +101,7 @@ jobs:
           attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
           siblings: |
             codetracer=${{ github.event.inputs.codetracer_ref || github.event.client_payload.codetracer_ref || github.base_ref || 'main' }}
+            codetracer-native-recorder=${{ github.base_ref || 'main' }}
             codetracer-trace-format=${{ github.base_ref || 'main' }}
             codetracer-trace-format-nim=${{ github.base_ref || 'main' }}
 
