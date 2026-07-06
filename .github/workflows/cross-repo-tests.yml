@@ -105,6 +105,11 @@ jobs:
             codetracer-trace-format=${{ github.base_ref || 'main' }}
             codetracer-trace-format-nim=${{ github.base_ref || 'main' }}
 
+      - name: Allow native-recorder direnv
+        run: |
+          cd "${GITHUB_WORKSPACE}/../codetracer-native-recorder"
+          direnv allow
+
       # Override the codetracer/libs/codetracer-trace-format submodule with
       # the workflow-cloned sibling (already at the lock-pinned revision)
       # so the recorder and the db-backend it links against advance
