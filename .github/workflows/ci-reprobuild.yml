@@ -53,10 +53,10 @@ jobs:
           owner: metacraft-labs
 
       - name: Setup dev env (reprobuild flavor)
-        # setup-dev-env clones the siblings listed in .github/sibling-repos
-        # (codetracer-trace-format, codetracer-trace-format-nim) adjacent to
-        # this checkout at the workspace-lock-pinned revisions, then
-        # materialises the reprobuild env.
+        # setup-dev-env clones trace-format siblings adjacent to this
+        # checkout, then materialises the reprobuild env. Pass explicit refs
+        # so pull-request CI does not depend on a repo-workspaces lock for the
+        # base commit.
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
           env-flavor: reprobuild
@@ -67,6 +67,9 @@ jobs:
           attic-token: ${{ secrets.ATTIC_TOKEN }}
           attic-cache: ${{ vars.ATTIC_CACHE }}
           attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          siblings: |
+            codetracer-trace-format=${{ github.base_ref || github.ref_name || 'main' }}
+            codetracer-trace-format-nim=${{ github.base_ref || github.ref_name || 'main' }}
 
       - name: repro build
         # Builds the conventional `build` collection declared in

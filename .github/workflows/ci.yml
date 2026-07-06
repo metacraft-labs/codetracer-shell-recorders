@@ -20,11 +20,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup dev env
-        # setup-dev-env installs nix and clones the siblings listed in
-        # .github/sibling-repos (codetracer-trace-format,
-        # codetracer-trace-format-nim) adjacent to this checkout at the
-        # workspace-lock-pinned revisions. The Rust trace writer's
-        # Cargo.toml path deps resolve to ../codetracer-trace-format/...
+        # setup-dev-env installs nix and clones trace-format siblings
+        # adjacent to this checkout. Pass explicit refs so pull-request CI
+        # does not depend on a repo-workspaces lock for the base commit.
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
         with:
           env-flavor: nix
@@ -34,6 +32,9 @@ jobs:
           attic-token: ${{ secrets.ATTIC_TOKEN }}
           attic-cache: ${{ vars.ATTIC_CACHE }}
           attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          siblings: |
+            codetracer-trace-format=${{ github.base_ref || github.ref_name || 'main' }}
+            codetracer-trace-format-nim=${{ github.base_ref || github.ref_name || 'main' }}
 
       - name: Build Nim trace writer library (sibling artifact)
         # The Nim FFI trace-writer static lib is built from the
