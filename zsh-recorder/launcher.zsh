@@ -194,16 +194,26 @@ _ct_script="${_ct_script:A}"
 mkdir -p "$_ct_output_dir"
 
 # Find the trace-writer binary
-# Look for it in: PATH, same dir as launcher, workspace target/release, workspace target/debug
+# Look for it in: PATH, Cargo's configured target dir, then the workspace target dirs.
 _ct_trace_writer=""
+_ct_cargo_target_dir="${CARGO_TARGET_DIR:-}"
+case "$_ct_cargo_target_dir" in
+    "" | /* | [A-Za-z]:*) ;;
+    *) _ct_cargo_target_dir="$_ct_script_dir/../$_ct_cargo_target_dir" ;;
+esac
+
 if command -v ct-shell-trace-writer >/dev/null 2>&1; then
     _ct_trace_writer="ct-shell-trace-writer"
+elif [[ -n "$_ct_cargo_target_dir" && -x "$_ct_cargo_target_dir/release/ct-shell-trace-writer" ]]; then
+    _ct_trace_writer="$_ct_cargo_target_dir/release/ct-shell-trace-writer"
+elif [[ -n "$_ct_cargo_target_dir" && -x "$_ct_cargo_target_dir/debug/ct-shell-trace-writer" ]]; then
+    _ct_trace_writer="$_ct_cargo_target_dir/debug/ct-shell-trace-writer"
 elif [[ -x "$_ct_script_dir/../target/release/ct-shell-trace-writer" ]]; then
     _ct_trace_writer="$_ct_script_dir/../target/release/ct-shell-trace-writer"
 elif [[ -x "$_ct_script_dir/../target/debug/ct-shell-trace-writer" ]]; then
     _ct_trace_writer="$_ct_script_dir/../target/debug/ct-shell-trace-writer"
 else
-    echo "Error: ct-shell-trace-writer not found in PATH or target directories" >&2
+    echo "Error: ct-shell-trace-writer not found in PATH, CARGO_TARGET_DIR, or target directories" >&2
     exit 1
 fi
 
