@@ -28,7 +28,7 @@ jobs:
         # setup-dev-env installs nix and clones trace-format siblings
         # adjacent to this checkout. Pass explicit refs so pull-request CI
         # does not depend on a repo-workspaces lock for the base commit.
-        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@main
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: nix
           gh-token: ${{ steps.app-token.outputs.token }}
