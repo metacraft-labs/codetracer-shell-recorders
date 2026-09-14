@@ -7,7 +7,7 @@ on:
 
 jobs:
   test:
-    name: Build, test, lint (${{ matrix.runner }})
+    name: Build, test, lint (${{ join(matrix.runner, '-') }})
     strategy:
       fail-fast: false
       matrix:
@@ -67,7 +67,7 @@ jobs:
         run: dev-exec just lint
 
   nix-build:
-    name: Verify nix flake packages build (${{ matrix.runner }})
+    name: Verify nix flake packages build (${{ join(matrix.runner, '-') }})
     strategy:
       fail-fast: false
       matrix:
