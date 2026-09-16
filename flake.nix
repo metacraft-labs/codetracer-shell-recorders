@@ -14,7 +14,7 @@
     # codetracer_trace_writer via relative path deps. This input provides the
     # source so Nix package builds can resolve those paths.
     codetracer-trace-format = {
-      url = "github:metacraft-labs/codetracer-trace-format/main";
+      url = "github:metacraft-labs/codetracer-trace-format/dev";
       flake = false;
     };
 
@@ -22,7 +22,7 @@
     # codetracer_trace_writer_nim links against a pre-built Nim static
     # library (libcodetracer_trace_writer.a) produced from this repo.
     codetracer-trace-format-nim = {
-      url = "github:metacraft-labs/codetracer-trace-format-nim/main";
+      url = "github:metacraft-labs/codetracer-trace-format-nim/dev";
       flake = false;
     };
 
