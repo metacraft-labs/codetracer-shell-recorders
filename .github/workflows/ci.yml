@@ -7,11 +7,11 @@ on:
 
 jobs:
   test:
-    name: Build, test, lint (${{ matrix.runner }})
+    name: Build, test, lint (${{ join(matrix.runner, '-') }})
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Generate CI token
@@ -67,17 +67,17 @@ jobs:
         run: dev-exec just lint
 
   nix-build:
-    name: Verify nix flake packages build (${{ matrix.runner }})
+    name: Verify nix flake packages build (${{ join(matrix.runner, '-') }})
     strategy:
       fail-fast: false
       matrix:
-        runner: [eph-linux-x64, eph-linux-arm64, eph-macos-arm64]
+        runner: [[self-hosted, linux, x64], [self-hosted, linux, arm64], [self-hosted, macos, arm64]]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         with:
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           attic-token: ${{ secrets.ATTIC_TOKEN }}
