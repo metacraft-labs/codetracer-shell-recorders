@@ -61,15 +61,14 @@ pub struct TraceBridge {
     /// files into `files/` in `finish()` (see `copy_source_files`) so the
     /// recorded bundle is self-contained.
     registered_paths: Vec<String>,
-    /// All registered function names (excluding `<toplevel>`), written as
+    /// All user function names (excluding `<toplevel>` and `<script>`), written as
     /// `symbols.json` sidecar for quick symbol search in the UI.
     registered_functions: BTreeSet<String>,
     /// Script-level positional parameters captured from CLI `--args`.
     ///
-    /// Staged onto the implicit top-level call when `START` arrives so the
-    /// frontend's calltrace pane can show `script $1 $2 ...` on the root
-    /// frame.  Mirrors the canonical CTFS call-arg staging pattern (Ruby
-    /// 1.21, Python 1.27, Move 1.46, Cairo 1.50, etc.).
+    /// Staged onto the `<script>` entry when `START` arrives. The canonical
+    /// writer-owned `<toplevel>` remains argument-free, while the script
+    /// frame displays `script $1 $2 ...` in the calltrace pane.
     script_args: Vec<String>,
     /// Args staged via `ARG` wire events that have not yet been consumed
     /// by a `CALL` event.  Drained on every `CALL` so each call frame's
@@ -116,7 +115,7 @@ impl TraceBridge {
             WireEvent::Func { name, file, line } => {
                 let path = PathBuf::from(&file);
                 TraceWriter::ensure_function_id(self.writer.as_mut(), &name, &path, Line(line));
-                if name != "<toplevel>" {
+                if name != "<toplevel>" && name != "<script>" {
                     self.registered_functions.insert(name);
                 }
             }
@@ -193,14 +192,11 @@ impl TraceBridge {
         self.current_line = 1;
         self.started = true;
 
-        // Stage script-level positional parameters (the program's argv,
-        // captured by the launcher as `--args ...`) onto the implicit
-        // top-level call so the calltrace pane shows `script $1 $2 ...` on
-        // the root frame.  We register an explicit `<toplevel>` call for
-        // this purpose, mirroring the Ruby 1.21 native-recorder fix
-        // (`<top-level>` opened in `initialize`, closed on
-        // `disable_tracing`).  The matching close happens on the final
-        // `EXIT` event in `handle_event`.
+        // The writer owns the canonical argument-free <toplevel> root.
+        // Script argv belongs to a separate entry frame, just as a language's
+        // main function follows that root. Opening <toplevel> again produces
+        // two roots and violates trace-events.md's start() contract.
+        // The matching script-frame close happens on the final EXIT event.
         //
         // Note: clone here is necessary because `handle_arg` borrows
         // `self` mutably and we cannot iterate `self.script_args` while
@@ -213,10 +209,10 @@ impl TraceBridge {
             let name = format!("${}", idx + 1);
             self.handle_arg(&name, arg_value, "s");
         }
-        // Register the implicit top-level call.  This drains the args we
+        // Register the script entry call.  This drains the args we
         // just staged and pairs with the `register_return` emitted from
         // the EXIT handler.
-        self.handle_call("<toplevel>");
+        self.handle_call("<script>");
         Ok(())
     }
 
@@ -237,7 +233,7 @@ impl TraceBridge {
         let line = Line(self.current_line);
 
         let function_id = TraceWriter::ensure_function_id(self.writer.as_mut(), name, &path, line);
-        if name != "<toplevel>" {
+        if name != "<toplevel>" && name != "<script>" {
             self.registered_functions.insert(name.to_string());
         }
         // Drain any args staged by ARG events received since the previous CALL.

@@ -302,21 +302,8 @@ pass "T7 path table: fixture_full.sh present"
 #   - 5 step events (absolute step on the source-load line,
 #     delta step inside greet's body for the echo line, delta
 #     steps on closing `}` / post-call positions)
-#   - 2 call events: the implicit `<toplevel>` root frame PLUS the
-#     single user call (`greet`).  `.counts.calls` counts EVERY
-#     CallRecord in the trace, including the implicit top-level frame
-#     that the writer stages on START (trace_bridge.rs `handle_start`
-#     → `handle_call("<toplevel>")`).  This is the SAME cross-recorder
-#     model as the Python recorder, whose canonical `ct print --full`
-#     fixture asserts `.counts.calls == 3` for its implicit
-#     `<__main__>` frame + `main` + `make_greeting`
-#     (codetracer-python-recorder tests/python/test_cli_integration.py),
-#     and the Ruby recorder's `<top-level>` frame.  The recorder ALSO
-#     stages a synthetic `source` wrapper for script-load that surfaces
-#     in the function table (hence `functions` == 3) but is suppressed
-#     from the `calls` count by the stack-depth guard in
-#     bash-recorder/recorder.sh — so it is NOT one of the two counted
-#     calls here.
+#   - 3 calls: writer-owned <toplevel>, the <script> entry carrying
+#     script argv, and greet. The canonical root is never opened twice.
 #   - 2 io_events (the DEBUG-trap path emits an ioStdout event for
 #     the source rendering of each echo; the fixture's single
 #     `echo` surfaces as two events because the trap fires both
@@ -326,32 +313,22 @@ pass "T7 path table: fixture_full.sh present"
 STEPS="$(jq -r .counts.steps <<< "${CT_FULL}")"
 [[ "${STEPS}" == "5" ]] \
   || fail "T7: expected 5 steps, got ${STEPS}; counts=$(jq -c .counts <<< "${CT_FULL}")"
-# 2 calls: the implicit `<toplevel>` root frame + the user `greet` call.
-# The `<toplevel>` frame is a real, counted CallRecord (see the block
-# comment above and the cross-recorder Python `<__main__>` precedent).
 CALLS="$(jq -r .counts.calls <<< "${CT_FULL}")"
-[[ "${CALLS}" == "2" ]] \
-  || fail "T7: expected 2 calls (<toplevel> + greet), got ${CALLS}; counts=$(jq -c .counts <<< "${CT_FULL}")"
+[[ "${CALLS}" == "3" ]] \
+  || fail "T7: expected 3 calls (<toplevel> + <script> + greet), got ${CALLS}; counts=$(jq -c .counts <<< "${CT_FULL}")"
 IO_EVENTS="$(jq -r .counts.io_events <<< "${CT_FULL}")"
 [[ "${IO_EVENTS}" == "2" ]] \
   || fail "T7: expected 2 io_events, got ${IO_EVENTS}; counts=$(jq -c .counts <<< "${CT_FULL}")"
-pass "T7 counts: 5 steps / 2 calls / 2 io_events"
+pass "T7 counts: 5 steps / 3 calls / 2 io_events"
 
-# ----- Call sequence: <toplevel> root frame + the user greet call ---
-# Two call_entry events surface: the implicit `<toplevel>` root frame
-# staged on START, then the single user call (`greet`).  This mirrors
-# the Python recorder, whose canonical fixture yields a call_entry
-# sequence of `<__main__>` → `main` → `make_greeting` — the implicit
-# top-level frame is the FIRST call_entry, exactly as `<toplevel>` is
-# here (codetracer-python-recorder tests/python/test_cli_integration.py).
-# We assert the total (2) AND separately anchor the user `greet` call by
-# its typed String "world" arg below (the bash recorder's `function`
-# field on call_entry is currently null for this code path, so the arg
-# is the stable identifier for the user call vs. the top-level frame).
-TOTAL_ENTRIES="$(jq -r '[.events[] | select(.kind == "call_entry")] | length' <<< "${CT_FULL}")"
-[[ "${TOTAL_ENTRIES}" == "2" ]] \
-  || fail "T7: expected 2 call_entry events (<toplevel> + greet), got ${TOTAL_ENTRIES}: $(jq -c '[.events[] | select(.kind == "call_entry")]' <<< "${CT_FULL}")"
-pass "T7 call sequence: ${TOTAL_ENTRIES} call_entry events (<toplevel> + greet)"
+# Assert identities and parentage, not only the number of frames: accepting
+# three anonymous calls would also accept the old duplicated-root defect.
+CALL_TREE="$(jq -c '[.events[] | select(.kind == "call_entry") | [.function, .depth, .parent_call_key]]' <<< "${CT_FULL}")"
+[[ "${CALL_TREE}" == '[["<toplevel>",0,-1],["<script>",1,0],["greet",2,1]]' ]] \
+  || fail "T7: unexpected call hierarchy: ${CALL_TREE}"
+ROOT_ARG_COUNT="$(jq '[.events[] | select(.kind == "call_entry" and .function == "<toplevel>") | .args[]] | length' <<< "${CT_FULL}")"
+[[ "${ROOT_ARG_COUNT}" == "0" ]] || fail "T7: canonical root has arguments"
+pass "T7 call sequence: unique root, script entry, greet"
 
 # ----- Strict ValueRecord variant invariant -------------------------
 # Every step var / call arg / return value that surfaces must carry a

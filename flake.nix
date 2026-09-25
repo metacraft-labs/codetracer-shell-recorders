@@ -39,34 +39,19 @@
     };
   };
 
-  outputs =
-    {
-      self,
-      nixpkgs,
-      fenix,
-      pre-commit-hooks,
-      codetracer-trace-format,
-      codetracer-trace-format-nim,
-      nim-stew,
-      nim-results,
-    }:
+  outputs = { self, nixpkgs, fenix, pre-commit-hooks, codetracer-trace-format
+    , codetracer-trace-format-nim, nim-stew, nim-results, }:
     let
-      systems = [
-        "x86_64-linux"
-        "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
-      ];
+      systems =
+        [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forEachSystem = nixpkgs.lib.genAttrs systems;
 
-      rust-toolchain-for =
-        system:
+      rust-toolchain-for = system:
         fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
           sha256 = "sha256-Qxt8XAuaUR2OMdKbN4u8dBJOhSHxS+uS06Wl9+flVEk=";
         };
-    in
-    {
+    in {
       checks = forEachSystem (system: {
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
@@ -82,18 +67,15 @@
         };
       });
 
-      devShells = forEachSystem (
-        system:
+      devShells = forEachSystem (system:
         let
           pkgs = import nixpkgs { inherit system; };
           preCommit = self.checks.${system}.pre-commit-check;
           isLinux = pkgs.stdenv.isLinux;
           isDarwin = pkgs.stdenv.isDarwin;
-        in
-        {
+        in {
           default = pkgs.mkShell {
-            packages =
-              with pkgs;
+            packages = with pkgs;
               [
                 # Shell interpreters (for running recorded scripts)
                 bash
@@ -116,27 +98,19 @@
                 just
                 prek
                 git-lfs
-              ]
-              ++ pkgs.lib.optionals isLinux [
-                glibc.dev
-              ]
-              ++ pkgs.lib.optionals isDarwin [
-                libiconv
-              ]
+              ] ++ pkgs.lib.optionals isLinux [ glibc.dev ]
+              ++ pkgs.lib.optionals isDarwin [ libiconv ]
               ++ preCommit.enabledPackages;
 
             inherit (preCommit) shellHook;
           };
-        }
-      );
+        });
 
-      packages = forEachSystem (
-        system:
+      packages = forEachSystem (system:
         let
           pkgs = import nixpkgs { inherit system; };
           isDarwin = pkgs.stdenv.isDarwin;
-        in
-        {
+        in {
           # The ct-shell-trace-writer binary reads debugger wire-protocol events
           # from stdin and writes a CodeTracer trace. This package also installs
           # the bash and zsh launcher/recorder scripts.
@@ -162,15 +136,8 @@
               zstd
             ];
 
-            buildInputs = [
-              pkgs.zstd
-            ]
-            ++ pkgs.lib.optionals isDarwin (
-              with pkgs;
-              [
-                libiconv
-              ]
-            );
+            buildInputs = [ pkgs.zstd ]
+              ++ pkgs.lib.optionals isDarwin (with pkgs; [ libiconv ]);
 
             # Build the Nim trace writer static library that the Rust
             # crate codetracer_trace_writer_nim links against at build time.
@@ -244,7 +211,6 @@
             # fixtures, so they are not runnable inside the Nix sandbox.
             doCheck = false;
           };
-        }
-      );
+        });
     };
 }

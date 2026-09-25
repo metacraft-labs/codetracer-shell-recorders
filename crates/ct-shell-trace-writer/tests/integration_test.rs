@@ -175,7 +175,7 @@ EXIT code=0"#;
 
 /// Verify that ARG events stage call arguments, drain onto the next CALL
 /// event, and survive a read-side CTFS round-trip.  This pins both the
-/// script-level `<toplevel>` argv path and a shell-function call argv path.
+/// script-level `<script>` argv path and a shell-function call argv path.
 #[test]
 fn test_arg_events_stage_call_args() {
     let input = r#"START program=/tmp/argy.sh shell=bash shell_version=5.2.0
@@ -192,8 +192,8 @@ EXIT code=0"#;
     let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let output_dir = tmp_dir.path();
 
-    // Pass script-level argv through `args` to confirm the implicit
-    // top-level call also receives them.
+    // Pass script-level argv through `args` to confirm the script
+    // entry call receives them, while the writer-owned root remains empty.
     let mut bridge = TraceBridge::new(
         output_dir,
         "/tmp/argy.sh",
@@ -233,13 +233,16 @@ EXIT code=0"#;
         })
         .collect();
 
-    assert!(
-        calls.len() >= 2,
-        "expected at least <toplevel> and greet calls, got {calls:#?}"
+    assert_eq!(
+        calls.len(),
+        3,
+        "expected root, script and greet: {calls:#?}"
     );
+    assert_eq!(calls[0]["function_id"], 0);
+    assert_eq!(calls[0]["args"], serde_json::json!([]));
     assert_call_args(
         &reader,
-        &calls,
+        &calls[1..2],
         &[
             ("$1", ExpectedArgValue::String("one")),
             ("$2", ExpectedArgValue::String("two")),
@@ -247,7 +250,7 @@ EXIT code=0"#;
     );
     assert_call_args(
         &reader,
-        &calls,
+        &calls[2..3],
         &[
             ("$1", ExpectedArgValue::String("hello world")),
             ("$2", ExpectedArgValue::Int(42)),

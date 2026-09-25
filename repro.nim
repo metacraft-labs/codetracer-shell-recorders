@@ -80,6 +80,7 @@
 ## is required for uses declarations".
 
 import repro_project_dsl
+import repro_dsl_stdlib/foreign_env
 
 # The three ``bash tests/*.sh`` CLI-convention guards in ``just test`` are
 # run through the typed ``sh`` executable's ``shell(command = ...)``
@@ -91,6 +92,10 @@ import repro_project_dsl
 import repro_dsl_stdlib/packages/sh as shRunner
 
 package codetracer_shell_recorders:
+  devEnv:
+    when not defined(windows):
+      useFlakeDevShell()
+
   defaultToolProvisioning "path"
 
   uses:
