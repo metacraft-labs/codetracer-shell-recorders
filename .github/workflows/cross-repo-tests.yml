@@ -110,8 +110,8 @@ jobs:
           siblings: |
             codetracer=${{ github.event.inputs.codetracer_ref || github.event.client_payload.codetracer_ref || github.base_ref || 'main' }}
             codetracer-native-recorder=${{ github.base_ref || 'main' }}
-            codetracer-trace-format=${{ github.base_ref || 'main' }}
-            codetracer-trace-format-nim=${{ github.base_ref || 'main' }}
+            codetracer-trace-format
+            codetracer-trace-format-nim
 
       - name: Allow native-recorder direnv
         run: |
