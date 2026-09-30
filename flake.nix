@@ -121,7 +121,39 @@
               ++ pkgs.lib.optionals isDarwin [ libiconv ]
               ++ preCommit.enabledPackages;
 
-            inherit (preCommit) shellHook;
+            # `cargo <subcommand>` looks for `cargo-<subcommand>` in
+            # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with
+            # rustup — including the self-hosted macOS runner — that directory
+            # holds rustup's proxies, so `cargo fmt` and `cargo clippy` run
+            # rustup's `cargo-fmt` / `cargo-clippy` instead of this shell's
+            # toolchain, and fail with "'cargo-fmt' is not installed for the
+            # toolchain".
+            #
+            # The shell therefore gets its own CARGO_HOME with no `bin/`, so
+            # subcommand lookup falls through to PATH. `registry/` and `git/`
+            # are symlinks to the real CARGO_HOME, and so are its config and
+            # credentials when present: the download cache is shared, and only
+            # the proxy directory is left behind.
+            shellHook = preCommit.shellHook + ''
+              _ctsh_real_cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
+              _ctsh_cargo_home="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-shell-recorders/cargo-home"
+              if [ "$_ctsh_real_cargo_home" != "$_ctsh_cargo_home" ]; then
+                mkdir -p "$_ctsh_cargo_home" \
+                  "$_ctsh_real_cargo_home/registry" "$_ctsh_real_cargo_home/git"
+                # Re-pointed on every entry, so a changed CARGO_HOME is followed
+                # rather than left sharing the previous one's cache. Only a link
+                # is ever replaced; a real file placed here is left alone.
+                for _ctsh_entry in registry git config.toml credentials.toml; do
+                  if [ -e "$_ctsh_real_cargo_home/$_ctsh_entry" ] &&
+                    { [ -L "$_ctsh_cargo_home/$_ctsh_entry" ] ||
+                      [ ! -e "$_ctsh_cargo_home/$_ctsh_entry" ]; }; then
+                    ln -sfn "$_ctsh_real_cargo_home/$_ctsh_entry" "$_ctsh_cargo_home/$_ctsh_entry"
+                  fi
+                done
+                export CARGO_HOME="$_ctsh_cargo_home"
+              fi
+              unset _ctsh_real_cargo_home _ctsh_cargo_home _ctsh_entry
+            '';
           };
         }
       );
