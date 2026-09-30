@@ -39,19 +39,34 @@
     };
   };
 
-  outputs = { self, nixpkgs, fenix, pre-commit-hooks, codetracer-trace-format
-    , codetracer-trace-format-nim, nim-stew, nim-results, }:
+  outputs =
+    {
+      self,
+      nixpkgs,
+      fenix,
+      pre-commit-hooks,
+      codetracer-trace-format,
+      codetracer-trace-format-nim,
+      nim-stew,
+      nim-results,
+    }:
     let
-      systems =
-        [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
       forEachSystem = nixpkgs.lib.genAttrs systems;
 
-      rust-toolchain-for = system:
+      rust-toolchain-for =
+        system:
         fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
           sha256 = "sha256-Qxt8XAuaUR2OMdKbN4u8dBJOhSHxS+uS06Wl9+flVEk=";
         };
-    in {
+    in
+    {
       checks = forEachSystem (system: {
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
@@ -67,15 +82,18 @@
         };
       });
 
-      devShells = forEachSystem (system:
+      devShells = forEachSystem (
+        system:
         let
           pkgs = import nixpkgs { inherit system; };
           preCommit = self.checks.${system}.pre-commit-check;
           isLinux = pkgs.stdenv.isLinux;
           isDarwin = pkgs.stdenv.isDarwin;
-        in {
+        in
+        {
           default = pkgs.mkShell {
-            packages = with pkgs;
+            packages =
+              with pkgs;
               [
                 # Shell interpreters (for running recorded scripts)
                 bash
@@ -98,19 +116,55 @@
                 just
                 prek
                 git-lfs
-              ] ++ pkgs.lib.optionals isLinux [ glibc.dev ]
+              ]
+              ++ pkgs.lib.optionals isLinux [ glibc.dev ]
               ++ pkgs.lib.optionals isDarwin [ libiconv ]
               ++ preCommit.enabledPackages;
 
-            inherit (preCommit) shellHook;
+            # `cargo <subcommand>` looks for `cargo-<subcommand>` in
+            # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with
+            # rustup — including the self-hosted macOS runner — that directory
+            # holds rustup's proxies, so `cargo fmt` and `cargo clippy` run
+            # rustup's `cargo-fmt` / `cargo-clippy` instead of this shell's
+            # toolchain, and fail with "'cargo-fmt' is not installed for the
+            # toolchain".
+            #
+            # The shell therefore gets its own CARGO_HOME with no `bin/`, so
+            # subcommand lookup falls through to PATH. `registry/` and `git/`
+            # are symlinks to the real CARGO_HOME, and so are its config and
+            # credentials when present: the download cache is shared, and only
+            # the proxy directory is left behind.
+            shellHook = preCommit.shellHook + ''
+              _ctsh_real_cargo_home="''${CARGO_HOME:-$HOME/.cargo}"
+              _ctsh_cargo_home="''${XDG_CACHE_HOME:-$HOME/.cache}/codetracer-shell-recorders/cargo-home"
+              if [ "$_ctsh_real_cargo_home" != "$_ctsh_cargo_home" ]; then
+                mkdir -p "$_ctsh_cargo_home" \
+                  "$_ctsh_real_cargo_home/registry" "$_ctsh_real_cargo_home/git"
+                # Re-pointed on every entry, so a changed CARGO_HOME is followed
+                # rather than left sharing the previous one's cache. Only a link
+                # is ever replaced; a real file placed here is left alone.
+                for _ctsh_entry in registry git config.toml credentials.toml; do
+                  if [ -e "$_ctsh_real_cargo_home/$_ctsh_entry" ] &&
+                    { [ -L "$_ctsh_cargo_home/$_ctsh_entry" ] ||
+                      [ ! -e "$_ctsh_cargo_home/$_ctsh_entry" ]; }; then
+                    ln -sfn "$_ctsh_real_cargo_home/$_ctsh_entry" "$_ctsh_cargo_home/$_ctsh_entry"
+                  fi
+                done
+                export CARGO_HOME="$_ctsh_cargo_home"
+              fi
+              unset _ctsh_real_cargo_home _ctsh_cargo_home _ctsh_entry
+            '';
           };
-        });
+        }
+      );
 
-      packages = forEachSystem (system:
+      packages = forEachSystem (
+        system:
         let
           pkgs = import nixpkgs { inherit system; };
           isDarwin = pkgs.stdenv.isDarwin;
-        in {
+        in
+        {
           # The ct-shell-trace-writer binary reads debugger wire-protocol events
           # from stdin and writes a CodeTracer trace. This package also installs
           # the bash and zsh launcher/recorder scripts.
@@ -136,8 +190,7 @@
               zstd
             ];
 
-            buildInputs = [ pkgs.zstd ]
-              ++ pkgs.lib.optionals isDarwin (with pkgs; [ libiconv ]);
+            buildInputs = [ pkgs.zstd ] ++ pkgs.lib.optionals isDarwin (with pkgs; [ libiconv ]);
 
             # Build the Nim trace writer static library that the Rust
             # crate codetracer_trace_writer_nim links against at build time.
@@ -211,6 +264,7 @@
             # fixtures, so they are not runnable inside the Nix sandbox.
             doCheck = false;
           };
-        });
+        }
+      );
     };
 }
