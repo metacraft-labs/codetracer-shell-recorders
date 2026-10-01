@@ -50,20 +50,19 @@ jobs:
             codetracer-trace-format-nim
 
       - name: Build Nim trace-format sibling artifacts
-        # The Nim FFI trace-writer static lib and ct-print are built from the
-        # workflow-cloned ../codetracer-trace-format-nim sibling inside
-        # THIS repo's dev shell (which provides nim/nimble/zstd headers).
+        # ct-print is built from the workflow-cloned
+        # ../codetracer-trace-format-nim sibling inside THIS repo's dev shell
+        # (which provides nim/nimble/zstd headers). The trace writer's C ABI
+        # archive is not built here: the codetracer_trace_writer_nim crate's
+        # build script compiles and links it with the flags it requires.
         run: |
           dev-exec bash -c '
             set -euo pipefail
             cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
             nimble install -y stew results
-            nim c --app:staticlib --mm:arc --noMain -d:release --passC:"-fPIC" -p:src \
-              -o:libcodetracer_trace_writer.a src/codetracer_trace_writer_ffi.nim
             nim c -d:release --mm:arc -p:src \
               -o:ct-print src/codetracer_ct_print.nim
           '
-          echo "CODETRACER_NIM_LIB_DIR=${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" >> "$GITHUB_ENV"
 
       - name: Build
         run: dev-exec just build

@@ -11,18 +11,21 @@
 
     # Non-flake source for the codetracer trace format crates.
     # The Rust crates in this repo depend on codetracer_trace_types and
-    # codetracer_trace_writer via relative path deps. This input provides the
-    # source so Nix package builds can resolve those paths.
+    # codetracer_trace_writer_nim via relative path deps. This input provides
+    # the source so Nix package builds can resolve those paths. The
+    # codetracer_trace_writer_nim build script compiles the Nim C ABI archive
+    # with the flags the library requires (--threads:off, one process heap),
+    # so this revision must carry that build script.
     codetracer-trace-format = {
-      url = "github:metacraft-labs/codetracer-trace-format/dev";
+      url = "github:metacraft-labs/codetracer-trace-format/8fd695e0521277fe2455b7f717a9d4f631461731";
       flake = false;
     };
 
-    # Nim implementation of the trace writer. The Rust crate
-    # codetracer_trace_writer_nim links against a pre-built Nim static
-    # library (libcodetracer_trace_writer.a) produced from this repo.
+    # Nim implementation of the trace writer: the sources that build script
+    # compiles. This revision must carry the process lock its C ABI needs
+    # when built --threads:off.
     codetracer-trace-format-nim = {
-      url = "github:metacraft-labs/codetracer-trace-format-nim/dev";
+      url = "github:metacraft-labs/codetracer-trace-format-nim/9c4bcfff106f7c083974903ba5153be50be91a39";
       flake = false;
     };
 
@@ -192,10 +195,10 @@
 
             buildInputs = [ pkgs.zstd ] ++ pkgs.lib.optionals isDarwin (with pkgs; [ libiconv ]);
 
-            # Build the Nim trace writer static library that the Rust
-            # crate codetracer_trace_writer_nim links against at build time.
-            # The Nix store source is read-only, so we copy it to a writable
-            # location first.
+            # The Rust crate codetracer_trace_writer_nim compiles the Nim
+            # trace writer's C ABI archive in its build script and links it;
+            # this package does not build that archive itself. The Nix store
+            # source is read-only, so the build script gets a writable copy.
             preBuild = ''
               nim_src="$TMPDIR/codetracer-trace-format-nim"
               cp -r ${codetracer-trace-format-nim} "$nim_src"
@@ -203,20 +206,6 @@
 
               export HOME="$TMPDIR/home"
               mkdir -p "$HOME"
-
-              # Compile the Nim static library. Dependencies (stew, results) are
-              # provided as -p search paths from their flake inputs, so no network
-              # access (nimble install) is needed inside the sandbox.
-              nim c --app:staticlib --mm:arc --noMain -d:release \
-                --passC:'-fPIC' \
-                -p:"$nim_src/src" \
-                -p:${nim-stew} \
-                -p:${nim-results} \
-                --nimcache:"$TMPDIR/nimcache" \
-                -o:"$TMPDIR/libcodetracer_trace_writer.a" \
-                "$nim_src/src/codetracer_trace_writer_ffi.nim"
-
-              export CODETRACER_NIM_LIB_DIR="$TMPDIR"
 
               # codetracer_trace_writer_nim's build.rs (in
               # codetracer-trace-format) looks for the Nim FFI entry
@@ -227,8 +216,8 @@
               # abort with "Nim FFI entry point not found at
               # /nix/store/codetracer-trace-format-nim/src/...".
               # Also skip ``nimble install --depsOnly`` because the
-              # nix sandbox has no network access and we've already
-              # supplied stew + results via nim -p paths above.
+              # nix sandbox has no network access; stew + results come
+              # from their flake inputs as extra Nim paths instead.
               export CODETRACER_TRACE_FORMAT_NIM_DIR="$nim_src"
               export CODETRACER_TRACE_FORMAT_NIM_SKIP_NIMBLE_INSTALL=1
               export CODETRACER_TRACE_FORMAT_NIM_EXTRA_PATHS="${nim-stew}:${nim-results}"
@@ -252,6 +241,24 @@
                 --replace-fail \
                   'path = "../../../codetracer-trace-format/codetracer_trace_writer_nim"' \
                   'path = "${codetracer-trace-format}/codetracer_trace_writer_nim"'
+            '';
+
+            # The trace writer's C ABI library warns at compile time when it
+            # is built --threads:on: a writer closed on another thread than
+            # the one that recorded into it is then freed into a dead
+            # per-thread heap. Refuse a package whose linked archive drew
+            # that warning (the build script's captured output holds it).
+            postBuild = ''
+              ffi_out=$(find target -path '*/build/codetracer_trace_writer_nim-*' \
+                \( -name output -o -name stderr \) -type f)
+              if [ -z "$ffi_out" ]; then
+                echo "codetracer_trace_writer_nim build script output not found" >&2
+                exit 1
+              fi
+              if grep -l "should be built with --threads:off" $ffi_out >&2; then
+                echo "the trace writer C ABI archive was built --threads:on" >&2
+                exit 1
+              fi
             '';
 
             # Install the binary plus the shell launcher/recorder scripts
