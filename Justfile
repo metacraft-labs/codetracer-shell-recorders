@@ -69,3 +69,8 @@ bump-version version:
     sed -i 's/^version = ".*"/version = "{{version}}"/' crates/ct-shell-trace-writer/Cargo.toml
     echo "{{version}}" > VERSION
     @echo "ct-shell-trace-writer → {{version}} (Cargo.toml + VERSION)"
+
+# Entering the dev shell from another git repository must write nothing there.
+# Runs `nix develop`, so it is not part of the in-shell test recipes.
+test-dev-shell:
+    bash tests/test_dev_shell_writes_nothing_elsewhere.sh
