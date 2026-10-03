@@ -18,7 +18,7 @@
     # so this revision must carry that build script.
     codetracer-trace-format = {
       url =
-        "github:metacraft-labs/codetracer-trace-format/8fd695e0521277fe2455b7f717a9d4f631461731";
+        "github:metacraft-labs/codetracer-trace-format/f39e71016715b4ba67b626f4c971acfd6a766977";
       flake = false;
     };
 
@@ -27,7 +27,7 @@
     # when built --threads:off.
     codetracer-trace-format-nim = {
       url =
-        "github:metacraft-labs/codetracer-trace-format-nim/9c4bcfff106f7c083974903ba5153be50be91a39";
+        "github:metacraft-labs/codetracer-trace-format-nim/61c6bbce06dd8864b3b45b6377a81d96f7419bbd";
       flake = false;
     };
 
