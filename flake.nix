@@ -17,7 +17,8 @@
     # with the flags the library requires (--threads:off, one process heap),
     # so this revision must carry that build script.
     codetracer-trace-format = {
-      url = "github:metacraft-labs/codetracer-trace-format/8fd695e0521277fe2455b7f717a9d4f631461731";
+      url =
+        "github:metacraft-labs/codetracer-trace-format/8fd695e0521277fe2455b7f717a9d4f631461731";
       flake = false;
     };
 
@@ -25,7 +26,8 @@
     # compiles. This revision must carry the process lock its C ABI needs
     # when built --threads:off.
     codetracer-trace-format-nim = {
-      url = "github:metacraft-labs/codetracer-trace-format-nim/9c4bcfff106f7c083974903ba5153be50be91a39";
+      url =
+        "github:metacraft-labs/codetracer-trace-format-nim/9c4bcfff106f7c083974903ba5153be50be91a39";
       flake = false;
     };
 
@@ -42,34 +44,19 @@
     };
   };
 
-  outputs =
-    {
-      self,
-      nixpkgs,
-      fenix,
-      pre-commit-hooks,
-      codetracer-trace-format,
-      codetracer-trace-format-nim,
-      nim-stew,
-      nim-results,
-    }:
+  outputs = { self, nixpkgs, fenix, pre-commit-hooks, codetracer-trace-format
+    , codetracer-trace-format-nim, nim-stew, nim-results, }:
     let
-      systems = [
-        "x86_64-linux"
-        "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
-      ];
+      systems =
+        [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forEachSystem = nixpkgs.lib.genAttrs systems;
 
-      rust-toolchain-for =
-        system:
+      rust-toolchain-for = system:
         fenix.packages.${system}.fromToolchainFile {
           file = ./rust-toolchain.toml;
           sha256 = "sha256-Qxt8XAuaUR2OMdKbN4u8dBJOhSHxS+uS06Wl9+flVEk=";
         };
-    in
-    {
+    in {
       checks = forEachSystem (system: {
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
@@ -85,8 +72,7 @@
         };
       });
 
-      devShells = forEachSystem (
-        system:
+      devShells = forEachSystem (system:
         let
           pkgs = import nixpkgs { inherit system; };
           preCommit = self.checks.${system}.pre-commit-check;
@@ -109,11 +95,9 @@
             fi
             unset _own_repo_root
           '';
-        in
-        {
+        in {
           default = pkgs.mkShell {
-            packages =
-              with pkgs;
+            packages = with pkgs;
               [
                 # Shell interpreters (for running recorded scripts)
                 bash
@@ -136,8 +120,7 @@
                 just
                 prek
                 git-lfs
-              ]
-              ++ pkgs.lib.optionals isLinux [ glibc.dev ]
+              ] ++ pkgs.lib.optionals isLinux [ glibc.dev ]
               ++ pkgs.lib.optionals isDarwin [ libiconv ]
               ++ preCommit.enabledPackages;
 
@@ -175,16 +158,13 @@
               unset _ctsh_real_cargo_home _ctsh_cargo_home _ctsh_entry
             '';
           };
-        }
-      );
+        });
 
-      packages = forEachSystem (
-        system:
+      packages = forEachSystem (system:
         let
           pkgs = import nixpkgs { inherit system; };
           isDarwin = pkgs.stdenv.isDarwin;
-        in
-        {
+        in {
           # The ct-shell-trace-writer binary reads debugger wire-protocol events
           # from stdin and writes a CodeTracer trace. This package also installs
           # the bash and zsh launcher/recorder scripts.
@@ -210,7 +190,8 @@
               zstd
             ];
 
-            buildInputs = [ pkgs.zstd ] ++ pkgs.lib.optionals isDarwin (with pkgs; [ libiconv ]);
+            buildInputs = [ pkgs.zstd ]
+              ++ pkgs.lib.optionals isDarwin (with pkgs; [ libiconv ]);
 
             # The Rust crate codetracer_trace_writer_nim compiles the Nim
             # trace writer's C ABI archive in its build script and links it;
@@ -288,7 +269,6 @@
             # fixtures, so they are not runnable inside the Nix sandbox.
             doCheck = false;
           };
-        }
-      );
+        });
     };
 }
