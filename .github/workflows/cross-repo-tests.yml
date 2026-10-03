@@ -19,10 +19,8 @@
 #   just cross-test
 #
 # Cross-repo revision pinning:
-#   Priority cascade for resolving the codetracer ref:
-#     1. workflow_dispatch input `codetracer_ref` (manual override)
-#     2. repository_dispatch `client_payload.codetracer_ref` (bidirectional)
-#     3. pull_request base branch when present, otherwise main
+#   Routine runs use this commit's published workspace record. Optional dispatch
+#   overrides must be explicit immutable 40-hex commit SHAs and are reported.
 
 name: Cross-Repo Integration Tests
 
@@ -35,9 +33,9 @@ on:
   workflow_dispatch:
     inputs:
       codetracer_ref:
-        description: 'Git ref (branch/tag/SHA) of the codetracer repo to test against'
+        description: 'Optional immutable 40-hex codetracer commit SHA (reported override)'
         required: false
-        default: 'main'
+        default: ''
 
   # Bidirectional trigger: the codetracer repo can dispatch this event when
   # shell-recorder-related files change (e.g. db-backend Bash/Zsh support).
@@ -46,7 +44,7 @@ on:
   #   {
   #     "event_type": "cross-repo-test",
   #     "client_payload": {
-  #       "codetracer_ref": "<git-ref-or-sha>",
+  #       "codetracer_ref": "<40-hex-commit-sha>",
   #       "triggered_by": "codetracer PR #123"
   #     }
   #   }
@@ -82,6 +80,22 @@ jobs:
       - name: Checkout codetracer-shell-recorders
         uses: actions/checkout@v4
 
+      - name: Validate explicit immutable integration override
+        id: integration_ref
+        env:
+          CODETRACER_OVERRIDE: ${{ github.event.inputs.codetracer_ref || github.event.client_payload.codetracer_ref }}
+        run: |
+          if [[ -n "$CODETRACER_OVERRIDE" ]]; then
+            if [[ ! "$CODETRACER_OVERRIDE" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "codetracer override must be an immutable 40-hex commit SHA" >&2
+              exit 1
+            fi
+            echo "codetracer_sibling=codetracer!=$CODETRACER_OVERRIDE" >> "$GITHUB_OUTPUT"
+            echo "Explicit integration override: codetracer@$CODETRACER_OVERRIDE" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "codetracer_sibling=codetracer" >> "$GITHUB_OUTPUT"
+          fi
+
       # 2. Set up the dev env and clone sibling repositories.
       #
       # setup-dev-env installs nix and clones the cross-repo siblings
@@ -94,13 +108,14 @@ jobs:
       #     resolve to ../codetracer-trace-format/...)
       #   - codetracer-trace-format-nim (the trace-format Rust crate builds
       #     its Nim FFI entry point from ../codetracer-trace-format-nim/...)
-      # Always pass concrete refs for these cross-repo siblings. The current
-      # checkout may not have a repo-workspaces lock on the PR base commit,
-      # and an empty ref would make setup-dev-env fail before tests start.
+      # Resolve routine sibling revisions from this commit's published lock record.
       - name: Setup dev env
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: nix
+          lock-store: record-store
+          manifests-ref: dev
+          on-lock-override: error
           gh-token: ${{ steps.app-token.outputs.token }}
           substituters: ${{ vars.SUBSTITUTERS }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
@@ -108,8 +123,8 @@ jobs:
           attic-cache: ${{ vars.ATTIC_CACHE }}
           attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
           siblings: |
-            codetracer=${{ github.event.inputs.codetracer_ref || github.event.client_payload.codetracer_ref || github.base_ref || 'main' }}
-            codetracer-native-recorder=${{ github.base_ref || 'main' }}
+            ${{ steps.integration_ref.outputs.codetracer_sibling }}
+            codetracer-native-recorder
             codetracer-trace-format
             codetracer-trace-format-nim
 
@@ -131,15 +146,12 @@ jobs:
 
       # 5. Generate tree-sitter-nim parser (gitignored generated file)
       #
-      # We provision tree-sitter-cli and Node via `nix shell` because the
-      # self-hosted nixos runners don't have npm/node on PATH (the previous
-      # `npm install -g tree-sitter-cli` step relied on the ubuntu-latest
-      # runner image's Node toolchain). Using nix here keeps the step
-      # hermetic and matches the rest of the workflow.
+      # Use the actual lock-pinned codetracer flake environment for parser tools.
       - name: Generate tree-sitter-nim parser
         run: |
           cd "${GITHUB_WORKSPACE}/../codetracer/libs/tree-sitter-nim"
-          nix shell nixpkgs#tree-sitter nixpkgs#nodejs --command tree-sitter generate
+          direnv allow "${GITHUB_WORKSPACE}/../codetracer"
+          direnv exec "${GITHUB_WORKSPACE}/../codetracer" tree-sitter generate
           ls -la src/parser.c
 
       # 6. Run cross-repo integration tests
