@@ -170,6 +170,10 @@
                 capnproto
                 zstd
 
+                # The CLI guards (tests/test_*_recorder_cli.sh) decode
+                # `ct print --json` output with jq.
+                jq
+
                 # Build automation and dev tools
                 just
                 prek

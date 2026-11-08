@@ -74,10 +74,17 @@
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
 ## canonical Rust-recorder recipes (``codetracer-trace-format`` et al.):
 ## the nix dev shell puts ``cargo`` / ``rustc`` / ``nim`` / ``nimble`` /
-## ``capnp`` / ``zstd`` / ``bash`` on ``PATH`` (and ``PKG_CONFIG_PATH``
-## for libzstd), so the weak-local PATH resolver is the right default.
-## Without it ``repro build`` refuses to run with "typed tool provisioning
-## is required for uses declarations".
+## ``capnp`` / ``zstd`` / ``bash`` / ``zsh`` on ``PATH`` (and
+## ``PKG_CONFIG_PATH`` for libzstd), so the weak-local PATH resolver is the
+## right default. Without it ``repro build`` refuses to run with "typed tool
+## provisioning is required for uses declarations".
+##
+## Declaring a tool in ``uses:`` is not enough for an edge to run it: an
+## edge receives only the tools its typed constructor names plus the ones
+## attached to it with ``appendRegisteredActionToolIdentityRefs`` (see the
+## end of ``build:``). A ``repro test`` started from a shell that already
+## has these tools on ``PATH`` hides a missing attachment; a CI runner with
+## a bare ``PATH`` does not.
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
@@ -90,6 +97,11 @@ import repro_dsl_stdlib/foreign_env
 # ``repro_project_dsl``, which is a DIFFERENT proc (the custom-provider
 # fetch/shell registry, not a typed execute edge).
 import repro_dsl_stdlib/packages/sh as shRunner
+
+# ``jq`` is declared in ``uses:`` below; importing its stdlib package
+# registers the nixpkgs channel that provisions it. Without the import the
+# declaration resolves only against the caller's ``PATH``.
+import repro_dsl_stdlib/packages/jq
 
 package codetracer_shell_recorders:
   devEnv:
@@ -146,7 +158,7 @@ package codetracer_shell_recorders:
     # The ``sh`` selector provisions the POSIX shell that fronts each
     # guard (same PortableGit ``sh.exe`` on Windows). The guard body
     # itself re-invokes ``bash`` (and, for the zsh guard, ``zsh``), which
-    # the ``bash`` floor above and the dev-shell ``zsh`` supply.
+    # the ``bash`` floor above and the ``zsh`` declaration below supply.
     "sh"
 
     # pkg-config — ``zstd-sys`` / the zstd link step consult pkg-config to
@@ -156,6 +168,45 @@ package codetracer_shell_recorders:
     # sibling recipe.
     when not defined(windows):
       "pkg-config"
+
+    # git — the Nim FFI build script's ``nimble install --depsOnly``
+    # fetches the FFI's ``requires`` packages with git when they are not
+    # installed yet.
+    "git"
+
+    # The programs the launchers and the CLI-convention guards run besides
+    # bash and cargo: ``jq`` (the guards decode ``ct print --json`` output
+    # with it) and the POSIX utilities the scripts call. reprobuild's stdlib
+    # provisions these from nixpkgs; on Windows they come with the
+    # PortableGit bash, in bash's own directory.
+    #
+    # ``zsh`` is the interpreter of the zsh launcher, which the zsh cargo
+    # suite, the zsh guard and the CLI-convention guard all drive. It has to
+    # be declared and attached like every other tool: an edge does not see
+    # the caller's ``PATH``, so an undeclared zsh is found only when some
+    # other attached tool's directory happens to hold one, and otherwise the
+    # zsh suites skip themselves without failing anything. reprobuild's
+    # stdlib has no ``zsh`` package yet, so under path provisioning this
+    # declaration resolves only against the caller's ``PATH``: the dev shell
+    # supplies it, and a ``repro build`` / ``repro test`` started without
+    # one stops at tool resolution, naming zsh, instead of passing with the
+    # zsh suites skipped. Windows has no zsh and does not declare it.
+    when not defined(windows):
+      "zsh"
+      "jq"
+      "basename"
+      "cat"
+      "chmod"
+      "dirname"
+      "grep"
+      "head"
+      "ls"
+      "mkdir"
+      "mktemp"
+      "rm"
+      "sed"
+      "sort"
+      "tr"
 
   # The single shipping binary. ``name: "ct-shell-trace-writer"`` pins the
   # hyphenated on-disk artifact for the camelCase Nim identifier; the
@@ -292,6 +343,34 @@ package codetracer_shell_recorders:
       actionId = "codetracer-shell-recorders.test-zsh-cli",
       after = @[traceWriterBuild],
       extraInputs = guardInputs & @["tests/test_zsh_recorder_cli.sh"])
+
+    # ---- Tools each edge runs -----------------------------------------
+    #
+    # Every cargo edge runs rustc and the C compiler, and the sibling
+    # ``codetracer_trace_writer_nim`` build script runs nim, nimble (which
+    # may fetch with git), capnp and zstd. The test run spawns bash and zsh
+    # through the launchers, and the recording tests run ``cargo build``
+    # themselves. Each guard runs ``cargo build --quiet`` and drives the
+    # launchers through sh, bash and zsh, with jq and the POSIX utilities
+    # the scripts call.
+    let cargoEdges = @[traceWriterBuild, testsBuild.action, testsRun.action,
+                       verifyCliGuard, bashCliGuard, zshCliGuard]
+    for action in cargoEdges:
+      appendRegisteredActionToolIdentityRefs(action.id,
+        ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(action.id,
+          ["gcc", "pkg-config"])
+      elif defined(macosx):
+        appendRegisteredActionToolIdentityRefs(action.id,
+          ["clang", "pkg-config"])
+    for action in [testsRun.action, verifyCliGuard, bashCliGuard,
+                   zshCliGuard]:
+      appendRegisteredActionToolIdentityRefs(action.id, ["sh", "bash"])
+      when not defined(windows):
+        appendRegisteredActionToolIdentityRefs(action.id,
+          ["zsh", "jq", "basename", "cat", "chmod", "dirname", "grep",
+           "head", "ls", "mkdir", "mktemp", "rm", "sed", "sort", "tr"])
 
     discard collect("test", @[
       testsRun.action, verifyCliGuard, bashCliGuard, zshCliGuard])
