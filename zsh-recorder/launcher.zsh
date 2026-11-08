@@ -3,7 +3,7 @@
 # the ct-shell-trace-writer trace writer.
 #
 # CTFS-only.  CodeTracer recorders always emit the canonical CTFS `.ct`
-# container (see `codetracer-specs/Recorder-CLI-Conventions.md` §4).  Use
+# container; there is no output-format choice to make.  Use
 # `ct print` from `codetracer-trace-format-nim` to convert the recorded
 # `.ct` bundle to JSON for debugging or golden-snapshot fixtures — the
 # recorder itself never produces JSON.
@@ -88,7 +88,7 @@ Options:
   -V, --version           Print the recorder version and exit.
 
 Output:
-  The recorder always writes a CTFS \`.ct\` bundle (Recorder-CLI-Conventions §4).
+  The recorder always writes a CTFS \`.ct\` bundle.
   To inspect or convert the trace to JSON for debugging, run
   \`ct print [--json|--summary|--follow] <out-dir>/<script>.ct\` from
   codetracer-trace-format-nim.  No output-format flag is exposed: the
@@ -187,8 +187,17 @@ if [[ -z "$_ct_output_dir" ]]; then
     exit 2
 fi
 
-# Resolve the script to an absolute path
-_ct_script="${_ct_script:A}"
+# Resolve the script to an absolute path without resolving symlinks, the
+# same result as the bash launcher's `cd "$(dirname ...)" && pwd` (logical
+# `pwd`). `:A` would also resolve symlinks, so on macOS, where /tmp links to
+# /private/tmp, the zsh recorder would report a different `program` than the
+# bash recorder for the same path. `:a` folds `.`/`..` lexically and keeps
+# symlinks, but it makes a relative path absolute against the physical
+# working directory, so join a relative path to the logical $PWD first.
+# recorder.zsh resolves its target the same way.
+# https://zsh.sourceforge.io/Doc/Release/Expansion.html#Modifiers
+[[ "$_ct_script" == /* ]] || _ct_script="$PWD/$_ct_script"
+_ct_script="${_ct_script:a}"
 
 # Create output directory
 mkdir -p "$_ct_output_dir"
@@ -243,8 +252,8 @@ _ct_exit_code=$?
 # `--args` MUST be the last flag because the trace writer treats every
 # remaining token after `--args` as a positional argv element.
 #
-# The CTFS format is hard-pinned in the writer (see Recorder-CLI-Conventions
-# §4); no `--format` flag is forwarded here.
+# The CTFS format is hard-pinned in the writer, which rejects `--format`;
+# no such flag is forwarded here.
 if (( ${#_ct_script_args[@]} > 0 )); then
     "$_ct_trace_writer" \
         --out-dir "$_ct_output_dir" \
@@ -285,8 +294,14 @@ _ct_write_enhanced_metadata() {
     done
     _ct_args_json+="]"
 
+    # The version is the FIRST x.y[.z] on the `zsh --version` banner. The
+    # banner also names the host triple, which on macOS carries a version of
+    # its own ("(aarch64-apple-darwin24.0)"); `grep -o` prints every match on
+    # its own line, so only the first is kept, or the JSON string would hold
+    # a raw newline. An empty result falls back to the running zsh's version.
     local _ct_zsh_version
-    _ct_zsh_version=$("$_ct_zsh" --version | head -1 | grep -oP '\d+\.\d+(\.\d+)?' || echo "$ZSH_VERSION")
+    _ct_zsh_version=$("$_ct_zsh" --version | head -n 1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1) || true
+    [[ -n "$_ct_zsh_version" ]] || _ct_zsh_version="$ZSH_VERSION"
 
     cat > "$_ct_output_dir/trace_db_metadata.json" <<METADATA
 {

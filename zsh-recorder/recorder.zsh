@@ -12,8 +12,13 @@ if [[ -z "$_ct_target_script" ]]; then
     exit 1
 fi
 
-# Resolve absolute path using Zsh's :A modifier
-_ct_target_script="${_ct_target_script:A}"
+# Resolve to an absolute path without resolving symlinks: join a relative
+# path to the logical $PWD (`:a` alone would use the physical working
+# directory), then let `:a` fold `.`/`..`. This must match launcher.zsh,
+# which passes the same path to the trace writer as `--program`; keeping
+# symlinks matches the bash recorder's logical `cd && pwd` as well.
+[[ "$_ct_target_script" == /* ]] || _ct_target_script="$PWD/$_ct_target_script"
+_ct_target_script="${_ct_target_script:a}"
 
 # Emit START event
 printf 'START program=%s shell=zsh shell_version=%s\n' "$_ct_target_script" "$ZSH_VERSION" >&3

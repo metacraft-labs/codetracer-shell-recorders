@@ -9,7 +9,8 @@ canonical CodeTracer CTFS `.ct` container.
   the FD 3 FIFO between the recorder and the trace writer, and forwards
   argv as `--args ...` so the implicit `<toplevel>` call records the
   script's positional parameters.  Wrapped by `codetracer-bash-recorder`
-  for binary-name compliance with `Recorder-CLI-Conventions.md` §1.
+  so the recorder is invoked by its canonical `codetracer-<lang>-recorder`
+  name.
 * `recorder.sh` — DEBUG/ERR/RETURN-trap-based instrumentation layer.
   Emits the line-oriented wire protocol consumed by
   `crates/ct-shell-trace-writer/`.
@@ -22,16 +23,16 @@ codetracer-bash-recorder --help
 codetracer-bash-recorder --version
 ```
 
-The recorder follows `codetracer-specs/Recorder-CLI-Conventions.md`:
+The recorder follows the CLI conventions shared by every CodeTracer recorder:
 
-| Convention §        | Compliance                                                                     |
+| Convention          | Compliance                                                                     |
 | ------------------- | ------------------------------------------------------------------------------ |
-| §1 Binary name      | `codetracer-bash-recorder` (wrapper script delegates to `launcher.sh`)         |
-| §3 `--out-dir`/`-o` | Required (or `CODETRACER_BASH_RECORDER_OUT_DIR`)                               |
-| §3 `--help`/`-h`    | Prints binary name + version, options, env vars, and `ct print` instructions   |
-| §3 `--version`/`-V` | Prints `codetracer-bash-recorder <version>` from the top-level `VERSION` file  |
-| §4 Output format    | CTFS-only — no `--format` flag; convert via `ct print` from the trace-format-nim repo |
-| §5 Env vars         | `CODETRACER_BASH_RECORDER_OUT_DIR`, `CODETRACER_BASH_RECORDER_DISABLED`        |
+| Binary name         | `codetracer-bash-recorder` (wrapper script delegates to `launcher.sh`)         |
+| `--out-dir`/`-o`    | Required (or `CODETRACER_BASH_RECORDER_OUT_DIR`)                               |
+| `--help`/`-h`       | Prints binary name + version, options, env vars, and `ct print` instructions   |
+| `--version`/`-V`    | Prints `codetracer-bash-recorder <version>` from the top-level `VERSION` file  |
+| Output format       | CTFS-only — no `--format` flag; convert via `ct print` from the trace-format-nim repo |
+| Env vars            | `CODETRACER_BASH_RECORDER_OUT_DIR`, `CODETRACER_BASH_RECORDER_DISABLED`        |
 
 ## Output
 

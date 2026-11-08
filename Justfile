@@ -6,20 +6,31 @@ build:
     cargo build --release
 
 # Run all tests: cargo (unit + integration) + CLI convention guards.
-test:
+# The CLI guards decode their recordings with `ct-print`, so it is rebuilt
+# first from the sibling checkout they read it from.
+test: build-ct-print
     cargo test
     just verify-cli-convention
     just test-bash-cli
     just test-zsh-cli
 
-# Verify both launchers and the trace writer comply with
-# `Recorder-CLI-Conventions.md` (CTFS-only, env-var fallbacks, etc.).
+# Build `ct-print` in the sibling codetracer-trace-format-nim checkout. The
+# CLI guards (`test-bash-cli`, `test-zsh-cli`) decode every recording with
+# `../codetracer-trace-format-nim/ct-print` (or `$CT_PRINT`), so a binary
+# left there from another revision of the sibling would be used without a
+# word. The sibling's own `buildCtPrint` nimble task owns the compile flags.
+build-ct-print:
+    cd ../codetracer-trace-format-nim && nimble buildCtPrint
+
+# Verify both launchers and the trace writer follow the recorder CLI
+# conventions: CTFS-only output with no `--format` flag, the `_OUT_DIR` /
+# `_DISABLED` env-var fallbacks, and the `--help` / `--version` text.
 # See tests/verify-cli-convention-no-silent-skip.sh for the assertion list.
 verify-cli-convention:
     bash tests/verify-cli-convention-no-silent-skip.sh
 
 # End-to-end Bash launcher CLI tests (env vars, format rejection,
-# ct-print round-trip).
+# ct-print round-trip). Needs `just build-ct-print` first.
 test-bash-cli:
     bash tests/test_bash_recorder_cli.sh
 
@@ -69,3 +80,8 @@ bump-version version:
     sed -i 's/^version = ".*"/version = "{{version}}"/' crates/ct-shell-trace-writer/Cargo.toml
     echo "{{version}}" > VERSION
     @echo "ct-shell-trace-writer → {{version}} (Cargo.toml + VERSION)"
+
+# Entering the dev shell from another git repository must write nothing there.
+# Runs `nix develop`, so it is not part of the in-shell test recipes.
+test-dev-shell:
+    bash tests/test_dev_shell_writes_nothing_elsewhere.sh

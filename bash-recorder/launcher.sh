@@ -3,7 +3,7 @@
 # the ct-shell-trace-writer trace writer.
 #
 # CTFS-only.  CodeTracer recorders always emit the canonical CTFS `.ct`
-# container (see `codetracer-specs/Recorder-CLI-Conventions.md` §4).  Use
+# container; there is no output-format choice to make.  Use
 # `ct print` from `codetracer-trace-format-nim` to convert the recorded
 # `.ct` bundle to JSON for debugging or golden-snapshot fixtures — the
 # recorder itself never produces JSON.
@@ -72,7 +72,7 @@ Options:
   -V, --version           Print the recorder version and exit.
 
 Output:
-  The recorder always writes a CTFS \`.ct\` bundle (Recorder-CLI-Conventions §4).
+  The recorder always writes a CTFS \`.ct\` bundle.
   To inspect or convert the trace to JSON for debugging, run
   \`ct print [--json|--summary|--follow] <out-dir>/<script>.ct\` from
   codetracer-trace-format-nim.  No output-format flag is exposed: the
@@ -228,8 +228,8 @@ _ct_exit_code=$?
 # `--args` MUST be the last flag because the trace writer treats every
 # remaining token after `--args` as a positional argv element.
 #
-# The CTFS format is hard-pinned in the writer (see Recorder-CLI-Conventions
-# §4); no `--format` flag is forwarded here.
+# The CTFS format is hard-pinned in the writer, which rejects `--format`;
+# no such flag is forwarded here.
 if (( ${#_ct_script_args[@]} > 0 )); then
     "$_ct_trace_writer" \
         --out-dir "$_ct_output_dir" \
@@ -270,6 +270,16 @@ _ct_write_enhanced_metadata() {
     done
     _ct_args_json+="]"
 
+    # The version is the FIRST x.y.z on the `bash --version` banner. The
+    # banner also names the host triple, which on macOS carries a version of
+    # its own ("(aarch64-apple-darwin24.6.0)"); `grep -o` prints every match
+    # on its own line, so without `head -n 1` that second number landed in
+    # the JSON string as a raw newline and made the file unparseable. A
+    # banner with no version leaves the field empty instead of aborting the
+    # launcher under `set -e -o pipefail`.
+    local _ct_bash_version
+    _ct_bash_version=$(bash --version | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1) || true
+
     cat > "$_ct_output_dir/trace_db_metadata.json" <<METADATA
 {
   "language": "bash",
@@ -277,7 +287,7 @@ _ct_write_enhanced_metadata() {
   "args": $_ct_args_json,
   "workdir": "$(pwd)",
   "recorder": "codetracer-bash-recorder",
-  "bash_version": "$(bash --version | head -1 | grep -oP '\d+\.\d+\.\d+')"
+  "bash_version": "$_ct_bash_version"
 }
 METADATA
 }

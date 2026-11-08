@@ -124,7 +124,7 @@ EXIT code=0"#;
 
     // CTFS-only — the Nim backend always produces .ct files.  The
     // `--format` dispatch was removed from TraceBridge in the 2026-05
-    // convention compliance pass (Recorder-CLI-Conventions §4).
+    // convention compliance pass: CTFS is the only output format.
     let mut bridge = TraceBridge::new(output_dir, "/tmp/test_script.sh", &[]);
 
     for line_str in input.lines() {
@@ -259,7 +259,7 @@ EXIT code=0"#;
 }
 
 // ---------------------------------------------------------------------------
-// CLI convention compliance — see Recorder-CLI-Conventions.md §4.
+// CLI convention compliance: CTFS is the only output format.
 //
 // CTFS is the recorder's sole on-disk output; the previous `--format`
 // dispatch was removed in 2026-05.  The binary must now reject every

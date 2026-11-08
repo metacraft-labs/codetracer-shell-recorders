@@ -7,8 +7,8 @@ use ct_shell_trace_writer::trace_bridge::TraceBridge;
 use ct_shell_trace_writer::wire_protocol;
 
 // CTFS-only.  The shell recorders always write the canonical CTFS `.ct`
-// container — see codetracer-specs/Recorder-CLI-Conventions.md §4.  The
-// previous `--format binary|json` flag was removed in the 2026-05 convention
+// container, with no output-format choice, like every CodeTracer recorder.
+// The previous `--format binary|json` flag was removed in the 2026-05 convention
 // compliance pass; conversion to JSON for debugging or golden snapshots is
 // the job of `ct print` from `codetracer-trace-format-nim`.
 
@@ -82,7 +82,7 @@ fn parse_cli_args() -> Result<CliArgs, String> {
             }
             // `--format` was removed in the 2026-05 convention compliance pass.
             // Recorders never branch on output format — CTFS is the sole
-            // output (see Recorder-CLI-Conventions §4).  We reject it loudly
+            // output.  We reject it loudly
             // rather than ignoring it so a stale launcher / caller surfaces
             // immediately instead of silently writing the wrong format.
             "--format" | "-f" => {

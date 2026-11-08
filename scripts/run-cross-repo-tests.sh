@@ -160,6 +160,24 @@ run_cargo_test() {
 	(
 		cd "${DB_BACKEND_DIR}"
 
+		# db-backend's build.rs regenerates the native recorder's C sources
+		# with ct_emulator/build_native_api.sh. By default it wraps that
+		# script in `repro exec <native-recorder>`, which needs `repro` on
+		# PATH and a full nested activation of the recorder's environment.
+		# Codetracer's own Linux builds (scripts/build-once.sh, the Nix
+		# package, and the CI jobs that build db-backend) set
+		# CODETRACER_DB_BACKEND_SKIP_DIRENV=1 instead, so the script runs
+		# with the nim/nimble already on PATH, and point
+		# CT_EMULATOR_EXTRA_NIM_PATHS at codetracer's vendored nim-stew and
+		# nim-results so `nim c` resolves `stew` and `results` without a
+		# nimble package store. Both dev shells this function can run in
+		# (this repo's and codetracer's) provide nim and nimble. A caller's
+		# own values win.
+		export CODETRACER_DB_BACKEND_SKIP_DIRENV="${CODETRACER_DB_BACKEND_SKIP_DIRENV:-1}"
+		if [[ -z ${CT_EMULATOR_EXTRA_NIM_PATHS:-} ]]; then
+			export CT_EMULATOR_EXTRA_NIM_PATHS="${CODETRACER_REPO}/libs/nim-stew/stew:${CODETRACER_REPO}/libs/nim-stew:${CODETRACER_REPO}/libs/nim-result"
+		fi
+
 		# The db-backend build needs capnproto, tree-sitter grammars, etc.
 		# If capnp is on PATH (e.g. inside the codetracer nix shell), use it
 		# directly. Otherwise, try wrapping with nix develop on the codetracer

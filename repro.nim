@@ -12,12 +12,11 @@
 ## Mirrors the dev shell declared in ``flake.nix`` (Linux/macOS).
 ## ``repro build`` / ``repro test`` reproduce the same artefact and the
 ## same test set that ``just build`` / ``just test`` (``cargo build
-## --release`` / ``cargo test``) produce today. Per
-## ``codetracer-specs/Repo-Requirements.md`` §2.8 the recipe expresses
-## build and test execution NATIVELY through typed-tool edges
-## (``cargo.build``, ``cargo.test``) — no ``shell(command = "bash
-## scripts/...")`` delegation, which would defeat the engine's
-## incremental-build, action-cache, and per-test invalidation.
+## --release`` / ``cargo test``) produce today. The recipe expresses build
+## and test execution NATIVELY through typed-tool edges (``cargo.build``,
+## ``cargo.test``) — no ``shell(command = "bash scripts/...")``
+## delegation, which would defeat the engine's incremental-build,
+## action-cache, and per-test invalidation.
 ##
 ## **This repo is a LEAF (single-crate Rust workspace).** The lone
 ## member ``crates/ct-shell-trace-writer`` depends on TWO crates from the
@@ -31,10 +30,9 @@
 ## the consumption happens inside cargo, OUT of reprobuild's reach. The
 ## reprobuild SC-11 develop-mode source-threading only threads a sibling
 ## ``library``'s ``src/`` onto a CONSUMER's OWN ``nim c --path:`` — it has
-## no cargo/Rust-path channel (see
-## ``reprobuild-specs/Cross-Repo-Source-Consumption.md`` §13: the landed
-## channels are the executable, C/C++ library, and Nim-source channels;
-## there is no from-source cargo channel). So — like
+## no cargo/Rust-path channel (reprobuild consumes a sibling's sources
+## through executable, C/C++ library and Nim-source channels only; there is
+## no from-source cargo channel). So — like
 ## ``codetracer-trace-format`` itself — this repo declares NO
 ## ``uses: "<sibling>"`` edge; the ``uses:`` block is the toolchain floor
 ## only, and the cross-repo ``codetracer_trace_writer_nim`` FFI is built
@@ -61,12 +59,13 @@
 ## per-file host gate: there is no ``#[cfg(target_os = …)]``
 ## test-selection conditional and no ``#[ignore]`` anywhere in the cargo
 ## suite. The zsh cargo suite self-adapts at RUNTIME via the in-file
-## ``require_zsh!()`` macro (which prints "skipping: zsh not found" and
-## returns when ``zsh`` is not on ``PATH``) rather than via a
-## compile-time OS gate — the nix dev shell puts ``zsh`` on ``PATH`` so
-## those tests run in full here. Likewise the ``test_zsh_recorder_cli.sh``
-## guard prints "ok: zsh not available — skipping" and exits 0 when
-## ``zsh`` is missing, so it is safe on every host. The bash / integration
+## ``require_zsh!()`` macro (which prints "SKIPPED: zsh not available on
+## this system" to stderr and returns when ``zsh --version`` does not
+## run) rather than via a compile-time OS gate — the nix dev shell puts
+## ``zsh`` on ``PATH`` so those tests run in full here. Likewise the
+## ``test_zsh_recorder_cli.sh`` guard prints "ok: zsh not available —
+## skipping test_zsh_recorder_cli" and exits 0 when ``zsh`` is missing,
+## so it is safe on every host. The bash / integration
 ## suites spawn ``bash`` + the built writer binary and run on every host
 ## cargo supports. So the corpus runs identically on every host — there
 ## is no per-OS partition to model.
@@ -74,10 +73,20 @@
 ## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
 ## canonical Rust-recorder recipes (``codetracer-trace-format`` et al.):
 ## the nix dev shell puts ``cargo`` / ``rustc`` / ``nim`` / ``nimble`` /
-## ``capnp`` / ``zstd`` / ``bash`` on ``PATH`` (and ``PKG_CONFIG_PATH``
-## for libzstd), so the weak-local PATH resolver is the right default.
-## Without it ``repro build`` refuses to run with "typed tool provisioning
-## is required for uses declarations".
+## ``capnp`` / ``zstd`` / ``bash`` / ``zsh`` on ``PATH`` (and
+## ``PKG_CONFIG_PATH`` for libzstd), so the weak-local PATH resolver is the
+## right default. Without it ``repro build`` refuses to run with "typed tool
+## provisioning is required for uses declarations". A tool whose package
+## declares a nix realisation (the stdlib's ``jq`` and coreutils, and the
+## repo-local ``zsh`` of ``zsh_tools.nim``) is provisioned from it when
+## ``PATH`` has none.
+##
+## Declaring a tool in ``uses:`` is not enough for an edge to run it: an
+## edge receives only the tools its typed constructor names plus the ones
+## attached to it with ``appendRegisteredActionToolIdentityRefs`` (see the
+## end of ``build:``). A ``repro test`` started from a shell that already
+## has these tools on ``PATH`` hides a missing attachment; a CI runner with
+## a bare ``PATH`` does not.
 
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
@@ -90,6 +99,15 @@ import repro_dsl_stdlib/foreign_env
 # ``repro_project_dsl``, which is a DIFFERENT proc (the custom-provider
 # fetch/shell registry, not a typed execute edge).
 import repro_dsl_stdlib/packages/sh as shRunner
+
+# ``jq`` is declared in ``uses:`` below; importing its stdlib package
+# registers the nixpkgs channel that provisions it. Without the import the
+# declaration resolves only against the caller's ``PATH``.
+import repro_dsl_stdlib/packages/jq
+
+# ``zsh`` is declared in ``uses:`` below; reprobuild's stdlib has no package
+# for it, so this repository declares the one its flake provides.
+import zsh_tools
 
 package codetracer_shell_recorders:
   devEnv:
@@ -146,7 +164,7 @@ package codetracer_shell_recorders:
     # The ``sh`` selector provisions the POSIX shell that fronts each
     # guard (same PortableGit ``sh.exe`` on Windows). The guard body
     # itself re-invokes ``bash`` (and, for the zsh guard, ``zsh``), which
-    # the ``bash`` floor above and the dev-shell ``zsh`` supply.
+    # the ``bash`` floor above and the ``zsh`` declaration below supply.
     "sh"
 
     # pkg-config — ``zstd-sys`` / the zstd link step consult pkg-config to
@@ -156,6 +174,43 @@ package codetracer_shell_recorders:
     # sibling recipe.
     when not defined(windows):
       "pkg-config"
+
+    # git — the Nim FFI build script's ``nimble install --depsOnly``
+    # fetches the FFI's ``requires`` packages with git when they are not
+    # installed yet.
+    "git"
+
+    # The programs the launchers and the CLI-convention guards run besides
+    # bash and cargo: ``jq`` (the guards decode ``ct print --json`` output
+    # with it) and the POSIX utilities the scripts call. reprobuild's stdlib
+    # provisions these from nixpkgs; on Windows they come with the
+    # PortableGit bash, in bash's own directory.
+    #
+    # ``zsh`` is the interpreter of the zsh launcher, which the zsh cargo
+    # suite, the zsh guard and the CLI-convention guard all drive. It has to
+    # be declared and attached like every other tool: an edge does not see
+    # the caller's ``PATH``, so an undeclared zsh is found only when some
+    # other attached tool's directory happens to hold one, and otherwise the
+    # zsh suites skip themselves without failing anything. reprobuild's
+    # stdlib has no ``zsh`` package, so ``zsh_tools.nim`` declares one: the
+    # flake's nixpkgs zsh, the same binary the dev shell puts on ``PATH``.
+    # Windows has no zsh and does not declare it.
+    when not defined(windows):
+      "zsh"
+      "jq"
+      "basename"
+      "cat"
+      "chmod"
+      "dirname"
+      "grep"
+      "head"
+      "ls"
+      "mkdir"
+      "mktemp"
+      "rm"
+      "sed"
+      "sort"
+      "tr"
 
   # The single shipping binary. ``name: "ct-shell-trace-writer"`` pins the
   # hyphenated on-disk artifact for the camelCase Nim identifier; the
@@ -168,10 +223,8 @@ package codetracer_shell_recorders:
     #
     # Native release cargo build — the whole (single-member) workspace,
     # exactly what ``just build`` → ``cargo build --release`` does.
-    # Enrolled into the conventional ``default`` collection per
-    # reprobuild-specs/Build-Graph-Collections.md §"`default`" so
-    # ``repro build`` (no positional target) materialises this edge's
-    # closure.
+    # Enrolled into the conventional ``default`` collection, the one
+    # ``repro build`` with no positional target materialises.
     #
     # ``locked = true`` because the root ``Cargo.lock`` IS committed: the
     # build must fail rather than silently regenerate the lock if a
@@ -202,8 +255,8 @@ package codetracer_shell_recorders:
 
     # ---- Test-binary build + run edges (the `test` collection) --------
     #
-    # Two-stage shape per Repo-Requirements.md §2.8: ``cargo.test(noRun =
-    # true)`` builds every workspace test binary into
+    # Two-stage shape — build the test binaries, then run them:
+    # ``cargo.test(noRun = true)`` builds every workspace test binary into
     # ``target/debug/deps/<crate>-<hash>`` (the engine tracks the deps
     # directory as the build edge's effect set because the hashed
     # filename floats with input content); the second ``cargo.test``
@@ -292,6 +345,34 @@ package codetracer_shell_recorders:
       actionId = "codetracer-shell-recorders.test-zsh-cli",
       after = @[traceWriterBuild],
       extraInputs = guardInputs & @["tests/test_zsh_recorder_cli.sh"])
+
+    # ---- Tools each edge runs -----------------------------------------
+    #
+    # Every cargo edge runs rustc and the C compiler, and the sibling
+    # ``codetracer_trace_writer_nim`` build script runs nim, nimble (which
+    # may fetch with git), capnp and zstd. The test run spawns bash and zsh
+    # through the launchers, and the recording tests run ``cargo build``
+    # themselves. Each guard runs ``cargo build --quiet`` and drives the
+    # launchers through sh, bash and zsh, with jq and the POSIX utilities
+    # the scripts call.
+    let cargoEdges = @[traceWriterBuild, testsBuild.action, testsRun.action,
+                       verifyCliGuard, bashCliGuard, zshCliGuard]
+    for action in cargoEdges:
+      appendRegisteredActionToolIdentityRefs(action.id,
+        ["cargo", "rustc", "nim", "nimble", "git", "capnp", "zstd"])
+      when defined(linux):
+        appendRegisteredActionToolIdentityRefs(action.id,
+          ["gcc", "pkg-config"])
+      elif defined(macosx):
+        appendRegisteredActionToolIdentityRefs(action.id,
+          ["clang", "pkg-config"])
+    for action in [testsRun.action, verifyCliGuard, bashCliGuard,
+                   zshCliGuard]:
+      appendRegisteredActionToolIdentityRefs(action.id, ["sh", "bash"])
+      when not defined(windows):
+        appendRegisteredActionToolIdentityRefs(action.id,
+          ["zsh", "jq", "basename", "cat", "chmod", "dirname", "grep",
+           "head", "ls", "mkdir", "mktemp", "rm", "sed", "sort", "tr"])
 
     discard collect("test", @[
       testsRun.action, verifyCliGuard, bashCliGuard, zshCliGuard])
