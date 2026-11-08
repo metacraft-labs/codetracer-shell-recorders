@@ -59,12 +59,13 @@
 ## per-file host gate: there is no ``#[cfg(target_os = …)]``
 ## test-selection conditional and no ``#[ignore]`` anywhere in the cargo
 ## suite. The zsh cargo suite self-adapts at RUNTIME via the in-file
-## ``require_zsh!()`` macro (which prints "skipping: zsh not found" and
-## returns when ``zsh`` is not on ``PATH``) rather than via a
-## compile-time OS gate — the nix dev shell puts ``zsh`` on ``PATH`` so
-## those tests run in full here. Likewise the ``test_zsh_recorder_cli.sh``
-## guard prints "ok: zsh not available — skipping" and exits 0 when
-## ``zsh`` is missing, so it is safe on every host. The bash / integration
+## ``require_zsh!()`` macro (which prints "SKIPPED: zsh not available on
+## this system" to stderr and returns when ``zsh --version`` does not
+## run) rather than via a compile-time OS gate — the nix dev shell puts
+## ``zsh`` on ``PATH`` so those tests run in full here. Likewise the
+## ``test_zsh_recorder_cli.sh`` guard prints "ok: zsh not available —
+## skipping test_zsh_recorder_cli" and exits 0 when ``zsh`` is missing,
+## so it is safe on every host. The bash / integration
 ## suites spawn ``bash`` + the built writer binary and run on every host
 ## cargo supports. So the corpus runs identically on every host — there
 ## is no per-OS partition to model.
@@ -75,7 +76,10 @@
 ## ``capnp`` / ``zstd`` / ``bash`` / ``zsh`` on ``PATH`` (and
 ## ``PKG_CONFIG_PATH`` for libzstd), so the weak-local PATH resolver is the
 ## right default. Without it ``repro build`` refuses to run with "typed tool
-## provisioning is required for uses declarations".
+## provisioning is required for uses declarations". A tool whose package
+## declares a nix realisation (the stdlib's ``jq`` and coreutils, and the
+## repo-local ``zsh`` of ``zsh_tools.nim``) is provisioned from it when
+## ``PATH`` has none.
 ##
 ## Declaring a tool in ``uses:`` is not enough for an edge to run it: an
 ## edge receives only the tools its typed constructor names plus the ones
@@ -100,6 +104,10 @@ import repro_dsl_stdlib/packages/sh as shRunner
 # registers the nixpkgs channel that provisions it. Without the import the
 # declaration resolves only against the caller's ``PATH``.
 import repro_dsl_stdlib/packages/jq
+
+# ``zsh`` is declared in ``uses:`` below; reprobuild's stdlib has no package
+# for it, so this repository declares the one its flake provides.
+import zsh_tools
 
 package codetracer_shell_recorders:
   devEnv:
@@ -184,11 +192,9 @@ package codetracer_shell_recorders:
     # the caller's ``PATH``, so an undeclared zsh is found only when some
     # other attached tool's directory happens to hold one, and otherwise the
     # zsh suites skip themselves without failing anything. reprobuild's
-    # stdlib has no ``zsh`` package yet, so under path provisioning this
-    # declaration resolves only against the caller's ``PATH``: the dev shell
-    # supplies it, and a ``repro build`` / ``repro test`` started without
-    # one stops at tool resolution, naming zsh, instead of passing with the
-    # zsh suites skipped. Windows has no zsh and does not declare it.
+    # stdlib has no ``zsh`` package, so ``zsh_tools.nim`` declares one: the
+    # flake's nixpkgs zsh, the same binary the dev shell puts on ``PATH``.
+    # Windows has no zsh and does not declare it.
     when not defined(windows):
       "zsh"
       "jq"
