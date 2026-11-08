@@ -187,8 +187,17 @@ if [[ -z "$_ct_output_dir" ]]; then
     exit 2
 fi
 
-# Resolve the script to an absolute path
-_ct_script="${_ct_script:A}"
+# Resolve the script to an absolute path without resolving symlinks, the
+# same result as the bash launcher's `cd "$(dirname ...)" && pwd` (logical
+# `pwd`). `:A` would also resolve symlinks, so on macOS, where /tmp links to
+# /private/tmp, the zsh recorder would report a different `program` than the
+# bash recorder for the same path. `:a` folds `.`/`..` lexically and keeps
+# symlinks, but it makes a relative path absolute against the physical
+# working directory, so join a relative path to the logical $PWD first.
+# recorder.zsh resolves its target the same way.
+# https://zsh.sourceforge.io/Doc/Release/Expansion.html#Modifiers
+[[ "$_ct_script" == /* ]] || _ct_script="$PWD/$_ct_script"
+_ct_script="${_ct_script:a}"
 
 # Create output directory
 mkdir -p "$_ct_output_dir"
