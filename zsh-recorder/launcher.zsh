@@ -285,8 +285,14 @@ _ct_write_enhanced_metadata() {
     done
     _ct_args_json+="]"
 
+    # The version is the FIRST x.y[.z] on the `zsh --version` banner. The
+    # banner also names the host triple, which on macOS carries a version of
+    # its own ("(aarch64-apple-darwin24.0)"); `grep -o` prints every match on
+    # its own line, so only the first is kept, or the JSON string would hold
+    # a raw newline. An empty result falls back to the running zsh's version.
     local _ct_zsh_version
-    _ct_zsh_version=$("$_ct_zsh" --version | head -1 | grep -oP '\d+\.\d+(\.\d+)?' || echo "$ZSH_VERSION")
+    _ct_zsh_version=$("$_ct_zsh" --version | head -n 1 | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n 1) || true
+    [[ -n "$_ct_zsh_version" ]] || _ct_zsh_version="$ZSH_VERSION"
 
     cat > "$_ct_output_dir/trace_db_metadata.json" <<METADATA
 {

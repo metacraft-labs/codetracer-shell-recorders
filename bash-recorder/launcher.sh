@@ -270,6 +270,16 @@ _ct_write_enhanced_metadata() {
     done
     _ct_args_json+="]"
 
+    # The version is the FIRST x.y.z on the `bash --version` banner. The
+    # banner also names the host triple, which on macOS carries a version of
+    # its own ("(aarch64-apple-darwin24.6.0)"); `grep -o` prints every match
+    # on its own line, so without `head -n 1` that second number landed in
+    # the JSON string as a raw newline and made the file unparseable. A
+    # banner with no version leaves the field empty instead of aborting the
+    # launcher under `set -e -o pipefail`.
+    local _ct_bash_version
+    _ct_bash_version=$(bash --version | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1) || true
+
     cat > "$_ct_output_dir/trace_db_metadata.json" <<METADATA
 {
   "language": "bash",
@@ -277,7 +287,7 @@ _ct_write_enhanced_metadata() {
   "args": $_ct_args_json,
   "workdir": "$(pwd)",
   "recorder": "codetracer-bash-recorder",
-  "bash_version": "$(bash --version | head -1 | grep -oP '\d+\.\d+\.\d+')"
+  "bash_version": "$_ct_bash_version"
 }
 METADATA
 }
