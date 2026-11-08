@@ -1,5 +1,6 @@
-# Cross-repo siblings cloned by setup-dev-env at workspace-lock-pinned
-# revisions (see codetracer-specs/Testing/Cross-Repo-CI-Integration.md).
+# Cross-repo siblings that setup-dev-env clones next to this checkout, each
+# at the revision this commit's repro.lock pins for it, so CI builds against
+# the same sibling sources a local workspace locked.
 # The Rust trace writer's Cargo.toml has path deps at
 # ../codetracer-trace-format/...; the Nim FFI trace-writer lib is built
 # from ../codetracer-trace-format-nim.

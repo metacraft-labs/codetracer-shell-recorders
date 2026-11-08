@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # Verify that the codetracer-bash-recorder, codetracer-zsh-recorder, and
-# the underlying ct-shell-trace-writer CLIs comply with
-# `codetracer-specs/Recorder-CLI-Conventions.md` (no silent skip — every
-# assertion either passes or fails loudly):
+# the underlying ct-shell-trace-writer CLIs follow the CLI conventions
+# shared by every CodeTracer recorder (no silent skip — every assertion
+# either passes or fails loudly):
 #
 #   * `--format` / `-f` is absent from `--help` for both launchers and the
-#     trace writer (CTFS-only — convention §4).
-#   * `CODETRACER_FORMAT` is absent from `--help` (convention §5).
-#   * `--out-dir` and `--version` are present in `--help` (§3).
-#   * `--help` mentions `ct print` (the canonical conversion tool, §4).
+#     trace writer (CTFS is the only output format).
+#   * `CODETRACER_FORMAT` is absent from `--help` (no env var selects a
+#     format either).
+#   * `--out-dir` and `--version` are present in `--help`.
+#   * `--help` mentions `ct print` (the canonical conversion tool).
 #   * `CODETRACER_<LANG>_RECORDER_OUT_DIR` and
 #     `CODETRACER_<LANG>_RECORDER_DISABLED` are referenced in source so the
-#     env-var fallbacks (§5) cannot regress silently.
+#     env-var fallbacks cannot regress silently.
 #   * Passing `--format json` (or any other format token) to either
 #     launcher and to ct-shell-trace-writer is rejected with a non-zero
 #     exit (i.e. neither component silently accepts the flag).

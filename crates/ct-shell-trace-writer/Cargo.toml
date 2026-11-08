@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 codetracer_trace_types = { version = "0.19", path = "../../../codetracer-trace-format/codetracer_trace_types" }
 # CTFS-only backend.  Recorders always emit the canonical CTFS `.ct`
-# container per Recorder-CLI-Conventions §4; the previous Rust-native
+# container and offer no output-format choice; the previous Rust-native
 # CBOR+Zstd writer (used by the removed `--format binary` and `--format
 # json` paths) is no longer pulled in here.  Convert recorded `.ct`
 # bundles to JSON via `ct print` from `codetracer-trace-format-nim`.

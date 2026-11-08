@@ -12,12 +12,11 @@
 ## Mirrors the dev shell declared in ``flake.nix`` (Linux/macOS).
 ## ``repro build`` / ``repro test`` reproduce the same artefact and the
 ## same test set that ``just build`` / ``just test`` (``cargo build
-## --release`` / ``cargo test``) produce today. Per
-## ``codetracer-specs/Repo-Requirements.md`` §2.8 the recipe expresses
-## build and test execution NATIVELY through typed-tool edges
-## (``cargo.build``, ``cargo.test``) — no ``shell(command = "bash
-## scripts/...")`` delegation, which would defeat the engine's
-## incremental-build, action-cache, and per-test invalidation.
+## --release`` / ``cargo test``) produce today. The recipe expresses build
+## and test execution NATIVELY through typed-tool edges (``cargo.build``,
+## ``cargo.test``) — no ``shell(command = "bash scripts/...")``
+## delegation, which would defeat the engine's incremental-build,
+## action-cache, and per-test invalidation.
 ##
 ## **This repo is a LEAF (single-crate Rust workspace).** The lone
 ## member ``crates/ct-shell-trace-writer`` depends on TWO crates from the
@@ -31,10 +30,9 @@
 ## the consumption happens inside cargo, OUT of reprobuild's reach. The
 ## reprobuild SC-11 develop-mode source-threading only threads a sibling
 ## ``library``'s ``src/`` onto a CONSUMER's OWN ``nim c --path:`` — it has
-## no cargo/Rust-path channel (see
-## ``reprobuild-specs/Cross-Repo-Source-Consumption.md`` §13: the landed
-## channels are the executable, C/C++ library, and Nim-source channels;
-## there is no from-source cargo channel). So — like
+## no cargo/Rust-path channel (reprobuild consumes a sibling's sources
+## through executable, C/C++ library and Nim-source channels only; there is
+## no from-source cargo channel). So — like
 ## ``codetracer-trace-format`` itself — this repo declares NO
 ## ``uses: "<sibling>"`` edge; the ``uses:`` block is the toolchain floor
 ## only, and the cross-repo ``codetracer_trace_writer_nim`` FFI is built
@@ -219,10 +217,8 @@ package codetracer_shell_recorders:
     #
     # Native release cargo build — the whole (single-member) workspace,
     # exactly what ``just build`` → ``cargo build --release`` does.
-    # Enrolled into the conventional ``default`` collection per
-    # reprobuild-specs/Build-Graph-Collections.md §"`default`" so
-    # ``repro build`` (no positional target) materialises this edge's
-    # closure.
+    # Enrolled into the conventional ``default`` collection, the one
+    # ``repro build`` with no positional target materialises.
     #
     # ``locked = true`` because the root ``Cargo.lock`` IS committed: the
     # build must fail rather than silently regenerate the lock if a
@@ -253,8 +249,8 @@ package codetracer_shell_recorders:
 
     # ---- Test-binary build + run edges (the `test` collection) --------
     #
-    # Two-stage shape per Repo-Requirements.md §2.8: ``cargo.test(noRun =
-    # true)`` builds every workspace test binary into
+    # Two-stage shape — build the test binaries, then run them:
+    # ``cargo.test(noRun = true)`` builds every workspace test binary into
     # ``target/debug/deps/<crate>-<hash>`` (the engine tracks the deps
     # directory as the build edge's effect set because the hashed
     # filename floats with input content); the second ``cargo.test``

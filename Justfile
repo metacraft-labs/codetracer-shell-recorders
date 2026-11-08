@@ -22,8 +22,9 @@ test: build-ct-print
 build-ct-print:
     cd ../codetracer-trace-format-nim && nimble buildCtPrint
 
-# Verify both launchers and the trace writer comply with
-# `Recorder-CLI-Conventions.md` (CTFS-only, env-var fallbacks, etc.).
+# Verify both launchers and the trace writer follow the recorder CLI
+# conventions: CTFS-only output with no `--format` flag, the `_OUT_DIR` /
+# `_DISABLED` env-var fallbacks, and the `--help` / `--version` text.
 # See tests/verify-cli-convention-no-silent-skip.sh for the assertion list.
 verify-cli-convention:
     bash tests/verify-cli-convention-no-silent-skip.sh

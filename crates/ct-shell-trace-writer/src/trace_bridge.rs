@@ -12,8 +12,8 @@
 // bridge copies the source files themselves into `files/` (see
 // `copy_source_files`) so the recorded bundle is self-contained.
 //
-// CTFS-only.  The shell trace writer is hard-pinned to CTFS — see
-// `codetracer-specs/Recorder-CLI-Conventions.md` §4.  The previous
+// CTFS-only.  The shell trace writer is hard-pinned to CTFS: CodeTracer
+// recorders offer no output-format choice.  The previous
 // `TraceEventsFileFormat` dispatch (which selected between CTFS, the
 // Rust-native CBOR+Zstd writer, and JSON) was removed in the 2026-05
 // convention compliance pass.  Conversion to JSON for debugging or
@@ -35,7 +35,7 @@ use crate::wire_protocol::WireEvent;
 /// The shell recorders always produce a `.ct` container with the canonical
 /// multi-stream CTFS layout (steps.dat, calls.dat, paths.dat, etc.).  The
 /// previous `Binary` and `Json` branches were removed in the 2026-05
-/// convention compliance pass — see Recorder-CLI-Conventions §4.
+/// convention compliance pass: CTFS is the only output format.
 fn create_writer(program: &str, args: &[String]) -> Box<dyn TraceWriter> {
     codetracer_trace_writer_nim::create_trace_writer(program, args, TraceEventsFileFormat::Ctfs)
 }

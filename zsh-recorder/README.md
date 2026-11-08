@@ -15,16 +15,16 @@ codetracer-zsh-recorder --help
 codetracer-zsh-recorder --version
 ```
 
-The recorder follows `codetracer-specs/Recorder-CLI-Conventions.md`:
+The recorder follows the CLI conventions shared by every CodeTracer recorder:
 
-| Convention §        | Compliance                                                                     |
+| Convention          | Compliance                                                                     |
 | ------------------- | ------------------------------------------------------------------------------ |
-| §1 Binary name      | `codetracer-zsh-recorder` (wrapper script delegates to `launcher.zsh`)         |
-| §3 `--out-dir`/`-o` | Required (or `CODETRACER_ZSH_RECORDER_OUT_DIR`)                                |
-| §3 `--help`/`-h`    | Prints binary name + version, options, env vars, and `ct print` instructions   |
-| §3 `--version`/`-V` | Prints `codetracer-zsh-recorder <version>` from the top-level `VERSION` file   |
-| §4 Output format    | CTFS-only — no `--format` flag; convert via `ct print` from the trace-format-nim repo |
-| §5 Env vars         | `CODETRACER_ZSH_RECORDER_OUT_DIR`, `CODETRACER_ZSH_RECORDER_DISABLED`          |
+| Binary name         | `codetracer-zsh-recorder` (wrapper script delegates to `launcher.zsh`)         |
+| `--out-dir`/`-o`    | Required (or `CODETRACER_ZSH_RECORDER_OUT_DIR`)                                |
+| `--help`/`-h`       | Prints binary name + version, options, env vars, and `ct print` instructions   |
+| `--version`/`-V`    | Prints `codetracer-zsh-recorder <version>` from the top-level `VERSION` file   |
+| Output format       | CTFS-only — no `--format` flag; convert via `ct print` from the trace-format-nim repo |
+| Env vars            | `CODETRACER_ZSH_RECORDER_OUT_DIR`, `CODETRACER_ZSH_RECORDER_DISABLED`          |
 
 ## Output
 

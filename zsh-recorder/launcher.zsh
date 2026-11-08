@@ -3,7 +3,7 @@
 # the ct-shell-trace-writer trace writer.
 #
 # CTFS-only.  CodeTracer recorders always emit the canonical CTFS `.ct`
-# container (see `codetracer-specs/Recorder-CLI-Conventions.md` §4).  Use
+# container; there is no output-format choice to make.  Use
 # `ct print` from `codetracer-trace-format-nim` to convert the recorded
 # `.ct` bundle to JSON for debugging or golden-snapshot fixtures — the
 # recorder itself never produces JSON.
@@ -88,7 +88,7 @@ Options:
   -V, --version           Print the recorder version and exit.
 
 Output:
-  The recorder always writes a CTFS \`.ct\` bundle (Recorder-CLI-Conventions §4).
+  The recorder always writes a CTFS \`.ct\` bundle.
   To inspect or convert the trace to JSON for debugging, run
   \`ct print [--json|--summary|--follow] <out-dir>/<script>.ct\` from
   codetracer-trace-format-nim.  No output-format flag is exposed: the
@@ -243,8 +243,8 @@ _ct_exit_code=$?
 # `--args` MUST be the last flag because the trace writer treats every
 # remaining token after `--args` as a positional argv element.
 #
-# The CTFS format is hard-pinned in the writer (see Recorder-CLI-Conventions
-# §4); no `--format` flag is forwarded here.
+# The CTFS format is hard-pinned in the writer, which rejects `--format`;
+# no such flag is forwarded here.
 if (( ${#_ct_script_args[@]} > 0 )); then
     "$_ct_trace_writer" \
         --out-dir "$_ct_output_dir" \
