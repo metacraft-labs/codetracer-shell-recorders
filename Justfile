@@ -6,11 +6,21 @@ build:
     cargo build --release
 
 # Run all tests: cargo (unit + integration) + CLI convention guards.
-test:
+# The CLI guards decode their recordings with `ct-print`, so it is rebuilt
+# first from the sibling checkout they read it from.
+test: build-ct-print
     cargo test
     just verify-cli-convention
     just test-bash-cli
     just test-zsh-cli
+
+# Build `ct-print` in the sibling codetracer-trace-format-nim checkout. The
+# CLI guards (`test-bash-cli`, `test-zsh-cli`) decode every recording with
+# `../codetracer-trace-format-nim/ct-print` (or `$CT_PRINT`), so a binary
+# left there from another revision of the sibling would be used without a
+# word. The sibling's own `buildCtPrint` nimble task owns the compile flags.
+build-ct-print:
+    cd ../codetracer-trace-format-nim && nimble buildCtPrint
 
 # Verify both launchers and the trace writer comply with
 # `Recorder-CLI-Conventions.md` (CTFS-only, env-var fallbacks, etc.).
@@ -19,7 +29,7 @@ verify-cli-convention:
     bash tests/verify-cli-convention-no-silent-skip.sh
 
 # End-to-end Bash launcher CLI tests (env vars, format rejection,
-# ct-print round-trip).
+# ct-print round-trip). Needs `just build-ct-print` first.
 test-bash-cli:
     bash tests/test_bash_recorder_cli.sh
 

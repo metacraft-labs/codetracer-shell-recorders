@@ -52,16 +52,17 @@ jobs:
       - name: Build Nim trace-format sibling artifacts
         # ct-print is built from the workflow-cloned
         # ../codetracer-trace-format-nim sibling inside THIS repo's dev shell
-        # (which provides nim/nimble/zstd headers). The trace writer's C ABI
-        # archive is not built here: the codetracer_trace_writer_nim crate's
-        # build script compiles and links it with the flags it requires.
+        # (which provides nim/nimble/zstd headers), by the same
+        # `just build-ct-print` recipe `just test` runs. The trace writer's
+        # C ABI archive is not built here: the codetracer_trace_writer_nim
+        # crate's build script compiles and links it with the flags it
+        # requires.
         run: |
           dev-exec bash -c '
             set -euo pipefail
-            cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-            nimble install -y stew results
-            nim c -d:release --mm:arc -p:src \
-              -o:ct-print src/codetracer_ct_print.nim
+            (cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim" &&
+              nimble install -y stew results)
+            just build-ct-print
           '
 
       - name: Build

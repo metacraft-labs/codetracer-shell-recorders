@@ -77,7 +77,6 @@ jobs:
         uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
         with:
           env-flavor: reprobuild
-          repro-build-pin: codex/attic-ci-cache-vars
           gh-token: ${{ steps.ci_token.outputs.token }}
           substituters: ${{ vars.SUBSTITUTERS }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
@@ -177,16 +176,21 @@ jobs:
 
       - name: Build Nim trace-format sibling artifacts
         # The shell CLI guards require ct-print from the workflow-cloned
-        # ../codetracer-trace-format-nim sibling. The Nim FFI static library
-        # the Rust path dependency links is compiled by that crate's build
-        # script, with the flags the library requires, not here.
+        # ../codetracer-trace-format-nim sibling. It is built there with the
+        # sibling's own `buildCtPrint` nimble task, the one `just
+        # build-ct-print` runs, so the compile flags live in one place. The
+        # task is called directly rather than through `just` because on the
+        # Windows legs there is no flake dev shell, so the environment holds
+        # what repro.nim declares, and it does not declare `just`. The Nim
+        # FFI static library the Rust path dependency links is compiled by
+        # that crate's build script, with the flags the library requires, not
+        # here.
         run: |
           dev-exec bash -c '
             set -euo pipefail
             cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
             nimble install -y stew results
-            nim c -d:release --mm:arc -p:src \
-              -o:ct-print src/codetracer_ct_print.nim
+            nimble buildCtPrint
           '
 
       - name: repro build
