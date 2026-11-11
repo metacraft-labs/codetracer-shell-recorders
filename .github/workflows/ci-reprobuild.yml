@@ -172,25 +172,6 @@ jobs:
           fi
           echo "CT_SANDBOX_TOOLS_DIR=${sandbox}" >> "${GITHUB_ENV}"
 
-      - name: Build Nim trace-format sibling artifacts
-        # The shell CLI guards require ct-print from the workflow-cloned
-        # ../codetracer-trace-format-nim sibling. It is built there with the
-        # sibling's own `buildCtPrint` nimble task, the one `just
-        # build-ct-print` runs, so the compile flags live in one place. The
-        # task is called directly rather than through `just` because on the
-        # Windows legs there is no flake dev shell, so the environment holds
-        # what repro.nim declares, and it does not declare `just`. The Nim
-        # FFI static library the Rust path dependency links is compiled by
-        # that crate's build script, with the flags the library requires, not
-        # here.
-        run: |
-          dev-exec bash -c '
-            set -euo pipefail
-            cd "${GITHUB_WORKSPACE}/../codetracer-trace-format-nim"
-            nimble install -y stew results
-            nimble buildCtPrint
-          '
-
       - name: repro build
         # Builds the conventional `build` collection declared in
         # `repro.nim`. Verifies the primary shipping artefact (the
@@ -199,7 +180,12 @@ jobs:
         run: dev-exec repro build
 
       - name: repro test
-        # Materialises the `test` collection.
+        # Materialises the `test` collection. It also builds ct-print in the
+        # sibling `../codetracer-trace-format-nim`, which the bash and zsh CLI
+        # guards decode every recording with: `repro.nim` declares that
+        # compile as an edge, through the sibling's own `buildCtPrint`
+        # constructor, so the declared gcc and zstd-dev reach it on every
+        # host, Windows included.
         run: dev-exec repro test
 
       # Diagnostics on failure. Three things below are load-bearing:
