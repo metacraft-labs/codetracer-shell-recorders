@@ -50,7 +50,15 @@ pass() {
   PASS_COUNT=$((PASS_COUNT + 1))
 }
 
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ct-bash-cli-XXXXXX")"
+# The recorder stores each traced path in canonical form, and the
+# assertions below compare it with FIXTURE byte for byte, so FIXTURE must
+# not carry the doubled slash a trailing-slash TMPDIR would put into it
+# (macOS sets TMPDIR to ".../T/"). A TMPDIR of "/" leaves it empty.
+TMP_ROOT="${TMPDIR:-/tmp}"
+while [[ ${TMP_ROOT} == */ ]]; do
+  TMP_ROOT="${TMP_ROOT%/}"
+done
+WORK_DIR="$(mktemp -d "${TMP_ROOT}/ct-bash-cli-XXXXXX")"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 # Build the trace writer once up-front so the launcher can find it.
