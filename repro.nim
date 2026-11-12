@@ -70,16 +70,24 @@
 ## cargo supports. So the corpus runs identically on every host — there
 ## is no per-OS partition to model.
 ##
-## **Tool provisioning.** ``defaultToolProvisioning "path"`` matches the
-## canonical Rust-recorder recipes (``codetracer-trace-format`` et al.):
-## the nix dev shell puts ``cargo`` / ``rustc`` / ``nim`` / ``nimble`` /
-## ``capnp`` / ``zstd`` / ``bash`` / ``zsh`` on ``PATH`` (and
-## ``PKG_CONFIG_PATH`` for libzstd), so the weak-local PATH resolver is the
-## right default. Without it ``repro build`` refuses to run with "typed tool
-## provisioning is required for uses declarations". A tool whose package
-## declares a nix realisation (the stdlib's ``jq`` and coreutils, and the
-## repo-local ``zsh`` of ``zsh_tools.nim``) is provisioned from it when
-## ``PATH`` has none.
+## **Tool provisioning.** On Linux and macOS ``defaultToolProvisioning``
+## is ``path``, matching the canonical Rust-recorder recipes
+## (``codetracer-trace-format`` et al.): the nix dev shell puts ``cargo`` /
+## ``rustc`` / ``nim`` / ``nimble`` / ``capnp`` / ``zstd`` / ``bash`` /
+## ``zsh`` on ``PATH`` (and ``PKG_CONFIG_PATH`` for libzstd), so the
+## weak-local PATH resolver is the right default. Without a mode ``repro
+## build`` refuses to run with "typed tool provisioning is required for uses
+## declarations". A tool whose package declares a nix realisation (the
+## stdlib's ``jq`` and coreutils, and the repo-local ``zsh`` of
+## ``zsh_tools.nim``) is provisioned from it when ``PATH`` has none.
+##
+## On Windows it is ``tarball``: there is no dev shell there, so every
+## declared tool is realized from the archive its package pins rather than
+## taken from whatever the host's ``PATH`` holds first. That matters most
+## for the ct-print edge's ``gcc``: path mode takes the first ``gcc.exe`` on
+## the runner's ``PATH``, which need not be a working MinGW gcc at all,
+## while tarball mode realizes the pinned WinLibs gcc that the ``zstd-dev``
+## archive is built to link with.
 ##
 ## Declaring a tool in ``uses:`` is not enough for an edge to run it: an
 ## edge receives only the tools its typed constructor names plus the ones
@@ -109,12 +117,21 @@ import repro_dsl_stdlib/packages/jq
 # for it, so this repository declares the one its flake provides.
 import zsh_tools
 
+# The owning constructor of ``ct-print``, which the bash and zsh CLI guards
+# decode every recording with. It lives in the sibling checkout this
+# repository's cargo ``path`` dependencies already resolve at
+# ``../codetracer-trace-format-nim``, and the guards read the binary it
+# builds there.
+import "../codetracer-trace-format-nim/build_writer_artifacts"
+
+const traceFormatNimRoot = "../codetracer-trace-format-nim"
+
 package codetracer_shell_recorders:
   devEnv:
     when not defined(windows):
       useFlakeDevShell()
 
-  defaultToolProvisioning "path"
+  defaultToolProvisioning (when defined(windows): tarball else: path)
 
   uses:
     # Rust toolchain — declared by version so the tarball-direct
@@ -126,11 +143,20 @@ package codetracer_shell_recorders:
     "cargo >=1.85"
     # C compiler driver — rustc links through `cc`, and build scripts
     # (cc-rs, the Nim FFI) compile C. Declaring it puts its directory on
-    # every cargo edge's PATH. Windows links with MSVC instead.
-    when defined(linux):
-      "gcc"
-    elif defined(macosx):
+    # every cargo edge's PATH. Windows links with MSVC instead, so its cargo
+    # edges are not given a C compiler (see the tool refs at the end of
+    # ``build:``).
+    #
+    # Windows still declares ``gcc``: the ct-print edge that
+    # ``build_writer_artifacts.buildCtPrint`` constructs compiles with
+    # ``nim c``'s gcc back-end on every host but macOS and names ``gcc`` on
+    # its edge itself. That ref provisions nothing unless the package
+    # declares the tool here, and ``buildCtPrint`` refuses a package that
+    # does not (the module's "Native tool contract").
+    when defined(macosx):
       "clang"
+    else:
+      "gcc"
 
     # Nim toolchain — the ``codetracer_trace_writer_nim`` cargo dependency
     # (a sibling-repo ``path`` crate) carries a ``build.rs`` that compiles
@@ -149,6 +175,14 @@ package codetracer_shell_recorders:
     # links libzstd; the Nim FFI's C output ``#include``s ``zstd.h``.
     "capnp"
     "zstd"
+
+    # zstd.h + libzstd for the sibling ct-print edge
+    # (``build_writer_artifacts.buildCtPrint`` compiles and links against
+    # them; ``zstd`` is the CLI only). The constructor cannot provision a
+    # tool from inside ``build:`` and refuses a recipe that omits it, on
+    # every host: on Windows ``zstd-dev`` is a MinGW static ``libzstd.a``
+    # for the ct-print edge's gcc back-end, beside the ``gcc`` above.
+    "zstd-dev"
 
     # ``bash`` is the launcher interpreter AND the process the bash /
     # integration test suites spawn (``Command::new("bash")`` in
@@ -293,6 +327,27 @@ package codetracer_shell_recorders:
       after = @[testsBuild.action],
       extraInputs = testInputs & @["target/debug/deps"])
 
+    # ---- ``ct-print`` prerequisite of the bash and zsh CLI guards -----
+    #
+    # Both guards decode their recordings with ``ct-print`` at the fixed
+    # sibling path ``../codetracer-trace-format-nim/ct-print`` and FAIL when
+    # it is missing. ``just test`` builds it first (``just build-ct-print``);
+    # here it is an edge of the graph, constructed by the sibling's own
+    # ``buildCtPrint`` so the compile flags stay in the repository that owns
+    # them, and so the engine threads the declared ``zstd-dev`` onto the
+    # compile's ``CPATH`` / ``LIBRARY_PATH`` on every host. The two guard
+    # edges order after it and name the binary as an input, so a missing or
+    # rebuilt ``ct-print`` re-runs them.
+    #
+    # It runs after the test build because that build's
+    # ``codetracer_trace_writer_nim`` ``build.rs`` is what installs the
+    # sibling's nimble ``requires`` (``results``, ``stew``) into the nimble
+    # path the ct-print compile resolves them from. ``just build-ct-print``
+    # gets the same packages from ``nimble buildCtPrint``.
+    let ctPrintBuild = buildCtPrint(traceFormatNimRoot,
+                                    after = @[testsBuild.action])
+    let ctPrintBinary = ctPrintPath(traceFormatNimRoot)
+
     # ---- CLI-convention guard edges (the `test` collection) ----------
     #
     # ``just test`` does NOT stop at ``cargo test`` — after it, the
@@ -337,14 +392,16 @@ package codetracer_shell_recorders:
     let bashCliGuard = shRunner.shell(
       command = "bash tests/test_bash_recorder_cli.sh",
       actionId = "codetracer-shell-recorders.test-bash-cli",
-      after = @[traceWriterBuild],
-      extraInputs = guardInputs & @["tests/test_bash_recorder_cli.sh"])
+      after = @[traceWriterBuild, ctPrintBuild],
+      extraInputs = guardInputs & @["tests/test_bash_recorder_cli.sh",
+                                    ctPrintBinary])
 
     let zshCliGuard = shRunner.shell(
       command = "bash tests/test_zsh_recorder_cli.sh",
       actionId = "codetracer-shell-recorders.test-zsh-cli",
-      after = @[traceWriterBuild],
-      extraInputs = guardInputs & @["tests/test_zsh_recorder_cli.sh"])
+      after = @[traceWriterBuild, ctPrintBuild],
+      extraInputs = guardInputs & @["tests/test_zsh_recorder_cli.sh",
+                                    ctPrintBinary])
 
     # ---- Tools each edge runs -----------------------------------------
     #

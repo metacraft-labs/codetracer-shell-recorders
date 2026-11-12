@@ -170,19 +170,25 @@ run_cargo_test() {
 		# with the nim/nimble already on PATH, and point
 		# CT_EMULATOR_EXTRA_NIM_PATHS at codetracer's vendored nim-stew and
 		# nim-results so `nim c` resolves `stew` and `results` without a
-		# nimble package store. Both dev shells this function can run in
-		# (this repo's and codetracer's) provide nim and nimble. A caller's
-		# own values win.
+		# nimble package store. Codetracer's dev shell, which the cargo test
+		# below runs in, provides nim and nimble. A caller's own values win.
 		export CODETRACER_DB_BACKEND_SKIP_DIRENV="${CODETRACER_DB_BACKEND_SKIP_DIRENV:-1}"
 		if [[ -z ${CT_EMULATOR_EXTRA_NIM_PATHS:-} ]]; then
 			export CT_EMULATOR_EXTRA_NIM_PATHS="${CODETRACER_REPO}/libs/nim-stew/stew:${CODETRACER_REPO}/libs/nim-stew:${CODETRACER_REPO}/libs/nim-result"
 		fi
 
-		# The db-backend build needs capnproto, tree-sitter grammars, etc.
-		# If capnp is on PATH (e.g. inside the codetracer nix shell), use it
-		# directly. Otherwise, try wrapping with nix develop on the codetracer
-		# flake.
-		if command -v capnp >/dev/null 2>&1; then
+		# db-backend is codetracer's code, so it is compiled and tested in
+		# codetracer's own dev shell: that shell carries the toolchain and the
+		# native dependencies (capnproto, tree-sitter grammars, ...) the
+		# codetracer revision under test was written against. This repo's
+		# dev shell is not a substitute even though it has a cargo and a
+		# capnp: its Rust is the one rust-toolchain.toml pins for this
+		# repository, and codetracer's tests can require a newer one (they
+		# call std's File::lock, stable only since Rust 1.89). Codetracer's
+		# dev shell marks itself with CT_DEV_SHELL=1 (its ci-base.nix), so a
+		# caller already inside it runs cargo directly and anyone else enters
+		# it.
+		if [[ ${CT_DEV_SHELL:-} == 1 ]]; then
 			cargo test --test "${test_name}" -- --nocapture
 		else
 			nix develop "${CODETRACER_REPO}" --command \

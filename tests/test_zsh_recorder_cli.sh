@@ -43,7 +43,15 @@ pass() {
   PASS_COUNT=$((PASS_COUNT + 1))
 }
 
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ct-zsh-cli-XXXXXX")"
+# The recorder stores each traced path in canonical form, and the
+# assertions below compare it with FIXTURE byte for byte, so FIXTURE must
+# not carry the doubled slash a trailing-slash TMPDIR would put into it
+# (macOS sets TMPDIR to ".../T/"). A TMPDIR of "/" leaves it empty.
+TMP_ROOT="${TMPDIR:-/tmp}"
+while [[ ${TMP_ROOT} == */ ]]; do
+  TMP_ROOT="${TMP_ROOT%/}"
+done
+WORK_DIR="$(mktemp -d "${TMP_ROOT}/ct-zsh-cli-XXXXXX")"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 ( cd "${REPO_ROOT}" && cargo build --quiet )
