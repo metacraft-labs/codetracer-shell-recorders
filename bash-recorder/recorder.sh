@@ -17,15 +17,47 @@ fi
 # Resolve absolute path
 _ct_target_script="$(cd "$(dirname "$_ct_target_script")" && pwd)/$(basename "$_ct_target_script")"
 
+# The trace writer is a native executable. On Windows this recorder runs
+# under an MSYS2 or Cygwin bash, whose paths (`/c/...`, `/tmp/...`) only
+# that runtime can resolve, and MSYS rewrites command-line arguments but not
+# the events stream. Every path sent to the writer is therefore converted
+# once to Windows mixed form: drive letter, forward slashes and long names
+# (`C:/Users/...`), which both the writer and the trace readers open.
+# Everywhere else the path is sent unchanged.
+# https://www.msys2.org/docs/filesystem-paths/
+# https://cygwin.com/cygwin-ug-net/cygpath.html
+_ct_use_cygpath=0
+case "$OSTYPE" in
+    msys* | cygwin*)
+        command -v cygpath >/dev/null 2>&1 && _ct_use_cygpath=1
+        ;;
+esac
+
+# Sets _ct_np to the writer's form of the path in $1. A variable rather than
+# stdout, so that no subshell is spawned off Windows.
+_ct_native_path() {
+    _ct_np="$1"
+    if (( _ct_use_cygpath )); then
+        _ct_np="$(cygpath -m -l -- "$1")" || {
+            echo "ct-bash-recorder: cygpath could not convert '$1'" >&2
+            _ct_np="$1"
+        }
+    fi
+}
+
+_ct_native_path "$_ct_target_script"
+_ct_target_script_native="$_ct_np"
+
 # Emit START event
-printf 'START program=%s shell=bash shell_version=%s\n' "$_ct_target_script" "$BASH_VERSION" >&3
+printf 'START program=%s shell=bash shell_version=%s\n' "$_ct_target_script_native" "$BASH_VERSION" >&3
 
 # Register the main script path
-printf 'PATH file=%s\n' "$_ct_target_script" >&3
+printf 'PATH file=%s\n' "$_ct_target_script_native" >&3
 
-# Track which files we've already registered
+# Files already registered, keyed by the path bash reports in BASH_SOURCE,
+# mapped to the form sent to the writer (see _ct_native_path).
 declare -A _ct_registered_paths
-_ct_registered_paths["$_ct_target_script"]=1
+_ct_registered_paths["$_ct_target_script"]="$_ct_target_script_native"
 
 # Track which functions we've already registered
 declare -A _ct_registered_funcs
@@ -144,9 +176,11 @@ _ct_debug_trap() {
 
     # Register new source files
     if [[ -z "${_ct_registered_paths[$_ct_file]+x}" ]]; then
-        printf 'PATH file=%s\n' "$_ct_file" >&3
-        _ct_registered_paths["$_ct_file"]=1
+        _ct_native_path "$_ct_file"
+        printf 'PATH file=%s\n' "$_ct_np" >&3
+        _ct_registered_paths["$_ct_file"]="$_ct_np"
     fi
+    local _ct_file_native="${_ct_registered_paths[$_ct_file]}"
 
     # Detect function return: depth decreased compared to previous trap invocation.
     # At this point, _ct_status holds the return value of the function that just
@@ -191,7 +225,7 @@ _ct_debug_trap() {
         # still appear in the function table (FUNC event), it just must not
         # surface as a counted CALL below.
         if [[ -z "${_ct_registered_funcs[$_ct_func_name]+x}" ]]; then
-            printf 'FUNC name=%s file=%s line=%d\n' "$_ct_func_name" "$_ct_file" "$_ct_line" >&3
+            printf 'FUNC name=%s file=%s line=%d\n' "$_ct_func_name" "$_ct_file_native" "$_ct_line" >&3
             _ct_registered_funcs["$_ct_func_name"]=1
         fi
 
@@ -257,7 +291,7 @@ _ct_debug_trap() {
     fi
 
     # Emit step event
-    printf 'STEP file=%s line=%d\n' "$_ct_file" "$_ct_line" >&3
+    printf 'STEP file=%s line=%d\n' "$_ct_file_native" "$_ct_line" >&3
 
     # Capture variables at this step
     _ct_capture_variables
