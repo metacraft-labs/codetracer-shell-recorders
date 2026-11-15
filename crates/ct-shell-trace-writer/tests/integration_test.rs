@@ -1,7 +1,7 @@
 use std::fs;
 
 use codetracer_trace_types::ValueRecord;
-use codetracer_trace_writer_nim::NimTraceReaderHandle;
+use codetracer_trace_writer_nim::{decode_cbor_value_record, NimTraceReaderHandle};
 
 use ct_shell_trace_writer::trace_bridge::TraceBridge;
 use ct_shell_trace_writer::wire_protocol::parse_line;
@@ -256,6 +256,97 @@ EXIT code=0"#;
             ("$2", ExpectedArgValue::Int(42)),
         ],
     );
+}
+
+/// Feed `input` through a `TraceBridge` for `program` and return every call
+/// in the resulting trace as (function name, decoded return value).
+fn record_calls(program: &str, input: &str) -> Vec<(String, ValueRecord)> {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let output_dir = tmp_dir.path();
+    let mut bridge = TraceBridge::new(output_dir, program, &[]);
+    for line_str in input.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let event =
+            parse_line(line_str).unwrap_or_else(|e| panic!("failed to parse '{line_str}': {e}"));
+        bridge
+            .handle_event(event)
+            .unwrap_or_else(|e| panic!("failed to handle event from '{line_str}': {e}"));
+    }
+    bridge.finish().expect("finish() should succeed");
+
+    let stem = std::path::Path::new(program).file_stem().unwrap();
+    let ct_path = output_dir.join(stem).with_extension("ct");
+    let reader = NimTraceReaderHandle::open(&ct_path.to_string_lossy())
+        .unwrap_or_else(|e| panic!("failed to open Nim CTFS reader for {ct_path:?}: {e}"));
+    (0..reader.call_count())
+        .map(|key| {
+            let json = reader.call_json(key).expect("read call JSON");
+            let call: serde_json::Value = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("invalid call JSON: {e}: {json}"));
+            let function_id = call["function_id"].as_u64().expect("function_id");
+            let name = reader.function(function_id).expect("function name");
+            // `decode_cbor_value_record` rather than `decode_value_record`:
+            // a frame finalisation closed without a value carries a byte
+            // that is not a CBOR item, and must surface as a wrong value in
+            // the assertion message rather than as a decode panic.
+            let bytes = bytes_from_json_array(&call["return_value"]);
+            (name, decode_cbor_value_record(&bytes))
+        })
+        .collect()
+}
+
+fn assert_returns_int(calls: &[(String, ValueRecord)], function: &str, expected: i64) {
+    let found: Vec<&ValueRecord> = calls
+        .iter()
+        .filter(|(name, _)| name == function)
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(found.len(), 1, "expected one {function} call: {calls:?}");
+    match found[0] {
+        ValueRecord::Int { i, .. } if *i == expected => {}
+        other => panic!("{function} should return Int {expected}, got {other:?}; calls: {calls:?}"),
+    }
+}
+
+/// A script that calls `exit` inside nested functions ends with two user
+/// frames open: no `RETURN` reaches them. The `EXIT` event must close each
+/// open frame with the exit status, and then `<script>` with the exit code,
+/// instead of closing only the innermost frame and leaving `<script>` for
+/// finalisation to close without a value.
+#[test]
+fn test_exit_closes_frames_left_open_by_exit_inside_functions() {
+    let calls = record_calls(
+        "/tmp/nested_exit.sh",
+        r#"START program=/tmp/nested_exit.sh shell=bash shell_version=5.2.0
+PATH file=/tmp/nested_exit.sh
+FUNC name=outer file=/tmp/nested_exit.sh line=2
+FUNC name=inner file=/tmp/nested_exit.sh line=5
+STEP file=/tmp/nested_exit.sh line=8
+CALL name=outer
+STEP file=/tmp/nested_exit.sh line=3
+CALL name=inner
+STEP file=/tmp/nested_exit.sh line=6
+EXIT code=4"#,
+    );
+    assert_returns_int(&calls, "inner", 4);
+    assert_returns_int(&calls, "outer", 4);
+    assert_returns_int(&calls, "<script>", 4);
+}
+
+/// A `RETURN` with no user frame open (the recorder lost the matching
+/// `CALL`) must not close the writer-owned `<script>` frame, or `EXIT` would
+/// then close `<toplevel>` with the exit code and leave `<script>` without it.
+#[test]
+fn test_unmatched_return_does_not_close_the_script_frame() {
+    let calls = record_calls(
+        "/tmp/stray_return.sh",
+        r#"START program=/tmp/stray_return.sh shell=bash shell_version=5.2.0
+PATH file=/tmp/stray_return.sh
+STEP file=/tmp/stray_return.sh line=1
+RETURN status=7
+STEP file=/tmp/stray_return.sh line=2
+EXIT code=3"#,
+    );
+    assert_returns_int(&calls, "<script>", 3);
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,8 @@ use std::process::Command;
 use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use tempfile::TempDir;
 
+mod common;
+
 /// CTFS magic bytes: 0xC0 0xDE 0x72 0xAC 0xE2
 const CTFS_MAGIC: &[u8] = &[0xC0, 0xDE, 0x72, 0xAC, 0xE2];
 
@@ -317,18 +319,11 @@ fn test_bash_nested_functions() {
 
 #[test]
 fn test_bash_exit_code() {
-    let (output_dir, _stdout, _stderr) = record_fixture("simple.sh");
-
-    // Verify .ct container exists — the exit code is encoded inside the binary
-    // container as a Return event. We verify the container is valid (magic bytes)
-    // and trust the integration_test.rs unit test for detailed event parsing.
-    let ct_path = find_ct_file(&output_dir);
-    let ct_size = std::fs::metadata(&ct_path).unwrap().len();
-    assert!(
-        ct_size >= 1024,
-        ".ct file should be at least 1KB, got {} bytes",
-        ct_size
-    );
+    build_trace_writer();
+    // The script's exit code reaches the event stream and the trace however
+    // the script ends: off its last line, with `exit 0`, `exit 3`, or `exit`
+    // inside a function. See `common::check_exit_codes` for the claims.
+    common::check_exit_codes(&common::BASH);
 }
 
 // ============================================================================

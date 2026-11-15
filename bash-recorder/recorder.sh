@@ -137,6 +137,17 @@ _ct_debug_trap() {
     local _ct_line="${BASH_LINENO[0]}"
     local _ct_depth=${#FUNCNAME[@]}
 
+    # A trap action is not a script command. Bash runs the DEBUG trap before
+    # each command of the EXIT trap's action too, with BASH_SOURCE naming the
+    # script and LINENO counting lines of the action string, which would add
+    # a STEP at a line the script never ran (and a RETURN, when `exit` in a
+    # sourced file has already unwound that file's frame). While a trap
+    # action runs, BASH_COMMAND is "the command executing at the time of the
+    # trap", which is the recorder's own script-load command below: it is
+    # never a command of the script itself.
+    # See: https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html#index-BASH_005fCOMMAND
+    [[ "$BASH_COMMAND" == "$_ct_load_command" ]] && return 0
+
     # Skip events from the recorder itself or when inside the RETURN trap
     [[ "$_ct_file" == "$0" ]] && return 0
     [[ "$_ct_file" == "" ]] && return 0
@@ -292,22 +303,61 @@ _ct_return_trap() {
     _ct_in_return_trap=0
 }
 
+# The recorder's own shell. `$BASHPID` differs from it in every subshell,
+# `( ... )` and `$( ... )` included, while `$$` does not.
+# See: https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html
+_ct_recorder_pid=$BASHPID
+
+# Set once the EXIT event has been written, so it is written exactly once.
+_ct_exit_emitted=0
+
+# Emit the EXIT event for exit status $1: the event that closes the
+# `<script>` frame and carries the script's exit code.
+#
+# It has two callers. The EXIT trap covers a script that calls `exit`, which
+# ends this shell inside the `source` below, so no line after `source` runs.
+# The call after `source` covers a script that runs off its end, and is the
+# fallback for a script that replaced the EXIT trap with its own (the trap
+# chaining limitation in the Shell Recorder spec). Whichever runs first
+# writes the event; the flag makes the other a no-op.
+#
+# Only the recorder's own shell writes it. The EXIT trap is not run by a
+# subshell in bash, but the PID test keeps a subshell's `exit` from ever
+# being mistaken for the script's exit.
+# See: https://www.gnu.org/software/bash/manual/html_node/Command-Execution-Environment.html
+_ct_emit_exit() {
+    local _ct_code="$1"
+    (( BASHPID == _ct_recorder_pid )) || return 0
+    (( _ct_exit_emitted )) && return 0
+    _ct_exit_emitted=1
+
+    # Nothing after this point belongs to the script: stop recording before
+    # writing the event, so it is the last one in the stream.
+    trap - DEBUG
+    trap - RETURN
+    trap - ERR
+
+    printf 'EXIT code=%d\n' "$_ct_code" >&3
+}
+
 trap '_ct_debug_trap' DEBUG
 trap '_ct_return_trap' RETURN
 trap '_ct_err_trap' ERR
+# `$?` in an EXIT trap is the status the shell is exiting with: the argument
+# of `exit`, or the status of the last command when it is omitted.
+# See: https://www.gnu.org/software/bash/manual/html_node/Bourne-Shell-Builtins.html#index-trap
+trap '_ct_emit_exit "$?"' EXIT
 
 # Execute the target script by sourcing it so traps apply
 # Set positional parameters for the script
 set -- "$@"
+# `_ct_load_command` must be the exact text of the `source` command below:
+# the DEBUG trap compares BASH_COMMAND against it to recognise trap actions.
+# shellcheck disable=SC2016 # the unexpanded command text is the point
+_ct_load_command='source "$_ct_target_script"'
 source "$_ct_target_script"
 _ct_exit_code=$?
 
-# Disable traps before cleanup
-trap '' DEBUG
-trap '' RETURN
-trap '' ERR
-
-# Emit EXIT event
-printf 'EXIT code=%d\n' "$_ct_exit_code" >&3
+_ct_emit_exit "$_ct_exit_code"
 
 exit "$_ct_exit_code"

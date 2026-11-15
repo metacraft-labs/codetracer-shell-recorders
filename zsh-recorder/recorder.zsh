@@ -38,8 +38,11 @@ typeset -A _ct_registered_funcs
 # At top-level (before source), depth is 0.
 _ct_prev_depth=0
 
-# Store the recorder script path so we can filter it out
+# Store the recorder script path so we can filter it out. funcsourcetrace
+# names this file by the path it was run as, which is relative when the
+# recorder is run by a relative path, so both spellings are kept.
 _ct_recorder_path="${0:A}"
+_ct_recorder_path_as_run="$0"
 
 # Store the last command seen in the DEBUG trap, for use in the ZERR trap
 _ct_last_cmd=""
@@ -52,6 +55,65 @@ _ct_in_trap=0
 # and clobbers $?)
 _ct_last_error_status=0
 _ct_had_error=0
+
+# Set once the EXIT event has been written, so it is written exactly once.
+_ct_exit_emitted=0
+
+# Emit the EXIT event for exit status $1: the event that closes the
+# `<script>` frame and carries the script's exit code.
+#
+# It has three callers. The `zshexit` hook covers a script that calls `exit`,
+# which ends this shell inside the `source` below, so no line after `source`
+# runs. The ZERR trap covers an ERR_EXIT exit, which runs no zshexit hook.
+# The call after `source` covers a script that runs off its end. Whichever
+# runs first writes the event; the flag makes the others no-ops.
+#
+# Only the recorder's own shell writes it. zsh runs the zshexit hooks in a
+# subshell that exits, too, so `( exit 2 )` or `$(exit 5)` would call it
+# there with the subshell's status; ZSH_SUBSHELL is 0 only in the recorder's
+# own shell.
+# See: https://zsh.sourceforge.io/Doc/Release/Parameters.html#index-ZSH_005fSUBSHELL
+_ct_emit_exit() {
+    # zsh keeps the full argument of `exit` in `$?` (`exit 300` leaves 300,
+    # `exit -1` leaves -1), while the process exit status the parent sees is
+    # its low eight bits (44, 255). Record the status the process ends with,
+    # as bash does.
+    # See: https://pubs.opengroup.org/onlinepubs/9799919799/functions/_Exit.html
+    local _ct_code=$(( $1 & 255 ))
+    (( ZSH_SUBSHELL == 0 )) || return 0
+    (( _ct_exit_emitted )) && return 0
+    _ct_exit_emitted=1
+
+    # Nothing after this point belongs to the script: stop recording before
+    # writing the event, so it is the last one in the stream.
+    trap - DEBUG
+    trap - ZERR
+
+    printf 'EXIT code=%d\n' "$_ct_code" >&3
+}
+
+# A zshexit hook rather than an EXIT trap. With a DEBUG trap set, as here,
+# zsh (5.9, 5.9.1) runs the EXIT trap at the first command after any ZERR
+# trap has run, with that command's status, and then not at the real exit.
+# A script file holding these six lines
+#
+#   trap 'print EXIT $?' EXIT
+#   trap : DEBUG
+#   trap : ZERR
+#   false
+#   echo mid
+#   exit 3
+#
+# prints "mid", then "EXIT 0", and exits 3. The zshexit hooks run once, at
+# the exit, with `$?` set to the exit status. They also leave the EXIT trap
+# free for the script's own use.
+# See: https://zsh.sourceforge.io/Doc/Release/Functions.html#Hook-Functions
+_ct_zshexit_hook() {
+    _ct_emit_exit "$?"
+}
+# Registered before the variable baseline below, so that the recorder's own
+# `zshexit_functions` entry is not reported as a variable of the script.
+zshexit_functions+=(_ct_zshexit_hook)
 
 # Snapshot all variable names that exist BEFORE the target script runs.
 # Any variable not in this set was created by the user script and should be captured.
@@ -208,7 +270,9 @@ trap '
             fi
 
             # Skip events from the recorder itself
-            if [[ "$_ct_file" == "$_ct_recorder_path" ]] || [[ -z "$_ct_file" ]]; then
+            if [[ "$_ct_file" == "$_ct_recorder_path" ]] ||
+               [[ "$_ct_file" == "$_ct_recorder_path_as_run" ]] ||
+               [[ -z "$_ct_file" ]]; then
                 _ct_in_trap=0
             fi
         fi
@@ -296,6 +360,14 @@ trap '
             # Save the error status for the next DEBUG trap (for RETURN detection)
             _ct_last_error_status=$_ct_zerr_status
             _ct_had_error=1
+            # With ERR_EXIT set, the shell exits right after this trap, and
+            # does not run the zshexit hooks (an errexit exit is not a
+            # "normal" exit), so this is the last point to write EXIT. ZERR
+            # runs only where ERR_EXIT applies, so the exit is certain.
+            # See: https://zsh.sourceforge.io/Doc/Release/Options.html#index-ERREXIT
+            if [[ -o errexit ]]; then
+                _ct_emit_exit "$_ct_zerr_status"
+            fi
         fi
 
         _ct_in_trap=0
@@ -306,11 +378,6 @@ trap '
 source "$_ct_target_script" "$@"
 _ct_exit_code=$?
 
-# Disable traps before cleanup
-trap - DEBUG
-trap - ZERR
-
-# Emit EXIT event
-printf 'EXIT code=%d\n' "$_ct_exit_code" >&3
+_ct_emit_exit "$_ct_exit_code"
 
 exit "$_ct_exit_code"
