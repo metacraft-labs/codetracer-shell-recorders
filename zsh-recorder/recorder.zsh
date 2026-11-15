@@ -115,15 +115,24 @@ _ct_zshexit_hook() {
 # `zshexit_functions` entry is not reported as a variable of the script.
 zshexit_functions+=(_ct_zshexit_hook)
 
+# The start of one parameter's line in `typeset -p` output, up to and
+# including its name: the declaration keyword, the option flags, the name.
+# match[1] is the keyword, match[2] the flags ("-g -i " or ""), match[4] the
+# name. Shared by the baseline snapshot and `_ct_capture_variables`, so that
+# the two accept exactly the same lines: a line the capture accepts but the
+# baseline skips would report an inherited parameter as one of the script's.
+# See the `typeset -p` output format above `_ct_capture_variables`.
+_ct_decl_prefix_re='^(typeset|export) (([-][[:alpha:]]+ )*)([_[:alpha:]][_[:alnum:]]*)'
+
 # Snapshot all variable names that exist BEFORE the target script runs.
 # Any variable not in this set was created by the user script and should be captured.
 typeset -A _ct_baseline_vars
 {
     local _ct_baseline_line
     typeset -p 2>/dev/null | while IFS= read -r _ct_baseline_line; do
-        # Match: typeset [optional flags] varname[=value]
-        if [[ "$_ct_baseline_line" =~ "^typeset (([-][[:alpha:]]+ )*)([_[:alpha:]][_[:alnum:]]*)" ]]; then
-            _ct_baseline_vars[${match[3]}]=1
+        # Match: typeset|export [optional flags] varname[=value]
+        if [[ "$_ct_baseline_line" =~ $_ct_decl_prefix_re ]]; then
+            _ct_baseline_vars[${match[4]}]=1
         fi
     done
 }
@@ -154,7 +163,18 @@ _ct_inline_quote() {
 #   typeset -A name=( [k]=v ... )        (associative array)
 #   typeset -g -a name=( ... )           (global array)
 #
-# Regex: ^typeset ((-flag )*)name=value
+# An exported scalar parameter is printed with the keyword `export` instead
+# of `typeset`, and without the -x flag (zsh 5.9, 5.9.1):
+#   export name=value                     (export name=value, or
+#                                          typeset -gx name=value in a function)
+#   export -i name=value                  (exported integer)
+#   export -F name=value                  (exported float)
+# An exported array keeps the keyword: `typeset -ax name=( ... )`.
+# See `typeset -p` under "typeset" in
+# https://zsh.sourceforge.io/Doc/Release/Shell-Builtin-Commands.html
+#
+# Regex: ^(typeset|export) ((-flag )*)name=value ($_ct_decl_prefix_re, then
+# `=value`)
 _ct_capture_variables() {
     local _ct_decl_output
     _ct_decl_output=$(typeset -p 2>/dev/null) || return
@@ -169,15 +189,15 @@ _ct_capture_variables() {
         local _ct_has_value=0
         local _ct_raw_value=""
 
-        # Match: typeset [optional flags] name=value
-        if [[ "$_ct_decl_line" =~ "^typeset (([-][[:alpha:]]+ )*)([_[:alpha:]][_[:alnum:]]*)=(.*)" ]]; then
-            _ct_flags_raw="${match[1]}"
-            _ct_varname="${match[3]}"
-            _ct_raw_value="${match[4]}"
+        # Match: typeset|export [optional flags] name=value
+        if [[ "$_ct_decl_line" =~ "${_ct_decl_prefix_re}=(.*)" ]]; then
+            _ct_flags_raw="${match[2]}"
+            _ct_varname="${match[4]}"
+            _ct_raw_value="${match[5]}"
             _ct_has_value=1
-        elif [[ "$_ct_decl_line" =~ "^typeset (([-][[:alpha:]]+ )*)([_[:alpha:]][_[:alnum:]]*)" ]]; then
-            _ct_flags_raw="${match[1]}"
-            _ct_varname="${match[3]}"
+        elif [[ "$_ct_decl_line" =~ $_ct_decl_prefix_re ]]; then
+            _ct_flags_raw="${match[2]}"
+            _ct_varname="${match[4]}"
         else
             continue
         fi

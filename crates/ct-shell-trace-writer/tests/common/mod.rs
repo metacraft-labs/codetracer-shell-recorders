@@ -1,5 +1,6 @@
-// Shared helpers for the recorder exit-code tests in `bash_recording_test.rs`
-// and `zsh_recording_test.rs`.
+// Shared helpers for the recorder tests in `bash_recording_test.rs` and
+// `zsh_recording_test.rs`: the exit-code claims, and reading the variables
+// recorded at a step back out of a `.ct` container.
 //
 // The exit-code claims are identical for both shells (spec
 // `Recording-Backends/Shell-Recorder.md`, "Bash Traps" / "Zsh Traps": the
@@ -202,6 +203,16 @@ pub fn write_trace(events_file: &Path, program: &Path) -> (TempDir, String) {
 
 /// Run the launcher on `script` and return its output directory and output.
 pub fn run_launcher(shell: &Shell, script: &Path) -> (TempDir, Output) {
+    run_launcher_with_env(shell, script, &[])
+}
+
+/// Run the launcher on `script` with `env` added to the inherited
+/// environment, and return its output directory and output.
+pub fn run_launcher_with_env(
+    shell: &Shell,
+    script: &Path,
+    env: &[(&str, &str)],
+) -> (TempDir, Output) {
     let out = TempDir::new().expect("failed to create temp dir");
     let output = Command::new(shell.interpreter)
         .args([
@@ -210,21 +221,66 @@ pub fn run_launcher(shell: &Shell, script: &Path) -> (TempDir, Output) {
             out.path().to_str().unwrap(),
             script.to_str().unwrap(),
         ])
+        .envs(env.iter().copied())
         .output()
         .expect("failed to run the launcher");
     (out, output)
+}
+
+/// The single `.ct` container in a launcher's output directory, opened
+/// through the Nim reader.
+fn open_trace(out_dir: &Path) -> NimTraceReaderHandle {
+    let ct = std::fs::read_dir(out_dir)
+        .expect("failed to read the output dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|ext| ext == "ct"))
+        .expect("no .ct file in the output dir");
+    NimTraceReaderHandle::open(ct.to_str().unwrap()).expect("failed to open .ct")
+}
+
+/// The variables recorded at the last step of the trace, as (name, decoded
+/// value), in the order the trace holds them. The recorders emit the full
+/// variable state after every step, so the last step carries every variable
+/// the script created that is still set at its end.
+pub fn last_step_vars(out_dir: &Path) -> Vec<(String, ValueRecord)> {
+    let reader = open_trace(out_dir);
+    let steps = reader.step_count();
+    assert!(steps > 0, "the trace has no steps");
+    let last = steps - 1;
+    (0..reader.step_value_count(last))
+        .map(|idx| {
+            let (varname_id, _type_id, cbor) = reader.step_value(last, idx).expect("step_value");
+            let name = reader.varname(varname_id).expect("varname");
+            (name, decode_cbor_value_record(&cbor))
+        })
+        .collect()
+}
+
+/// The value of the variable `name` among `vars`, if it was recorded.
+pub fn var<'a>(vars: &'a [(String, ValueRecord)], name: &str) -> Option<&'a ValueRecord> {
+    vars.iter().find(|(n, _)| n == name).map(|(_, v)| v)
+}
+
+/// The recorded variable names, sorted, for set comparisons and messages.
+pub fn var_names(vars: &[(String, ValueRecord)]) -> Vec<String> {
+    let mut names: Vec<String> = vars.iter().map(|(n, _)| n.clone()).collect();
+    names.sort();
+    names
+}
+
+/// Assert `value` is `String <expected>`, with the text compared exactly.
+pub fn assert_string(value: Option<&ValueRecord>, expected: &str, what: &str) {
+    match value {
+        Some(ValueRecord::String { text, .. }) if text == expected => {}
+        other => panic!("{what}: expected String {expected:?}, got {other:?}"),
+    }
 }
 
 /// Every call in the trace, in call-key order, as (function name, decoded
 /// return value). A frame that finalisation closed because no `RETURN` or
 /// `EXIT` event reached it decodes to a non-`Int` value (`Void`).
 pub fn call_returns(out_dir: &Path) -> Vec<(String, ValueRecord)> {
-    let ct = std::fs::read_dir(out_dir)
-        .expect("failed to read the output dir")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.extension().is_some_and(|ext| ext == "ct"))
-        .expect("no .ct file in the output dir");
-    let reader = NimTraceReaderHandle::open(ct.to_str().unwrap()).expect("failed to open .ct");
+    let reader = open_trace(out_dir);
     (0..reader.call_count())
         .map(|key| {
             let (function_id, ..) = reader.call_fields(key).expect("call_fields");

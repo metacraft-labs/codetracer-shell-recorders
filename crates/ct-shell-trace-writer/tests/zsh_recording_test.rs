@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use codetracer_trace_types::ValueRecord;
 use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use tempfile::TempDir;
 
@@ -266,6 +267,141 @@ fn test_zsh_variable_capture() {
         ".ct file should be at least 1KB for a script with variables, got {} bytes",
         ct_size
     );
+}
+
+/// Environment for the exported-variable tests: an inherited `HOME` the test
+/// controls, so that "HOME is not recorded" is a claim about a variable that
+/// really is in the script's environment, and one more inherited variable
+/// whose name no shell defines for itself.
+fn inherited_env(home: &TempDir) -> [(&str, &str); 2] {
+    [
+        ("HOME", home.path().to_str().unwrap()),
+        ("CT_INHERITED_MARKER", "inherited"),
+    ]
+}
+
+/// Assert no variable inherited from the environment of `inherited_env` was
+/// reported as a variable of the script.
+fn assert_no_inherited_vars(vars: &[(String, ValueRecord)], what: &str) {
+    for name in ["HOME", "CT_INHERITED_MARKER"] {
+        assert!(
+            common::var(vars, name).is_none(),
+            "{what}: the inherited {name} must not be recorded as a variable of the script; \
+             recorded: {:?}",
+            common::var_names(vars)
+        );
+    }
+}
+
+/// Record `script` through `shell`'s launcher, with `inherited_env` added to
+/// its environment, and return the variables of its last step.
+fn record_last_step_vars(
+    shell: &common::Shell,
+    script: &std::path::Path,
+) -> Vec<(String, ValueRecord)> {
+    build_trace_writer();
+    let home = TempDir::new().expect("failed to create temp dir");
+    let (out, output) = common::run_launcher_with_env(shell, script, &inherited_env(&home));
+    assert!(
+        output.status.success(),
+        "{} launcher failed on {}: {}",
+        shell.interpreter,
+        script.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::last_step_vars(out.path())
+}
+
+// Issue `2026-11-15-zsh-recorder-does-not-record-exported-variables`: zsh's
+// `typeset -p` prints an exported parameter with the keyword `export`, and
+// the recorder accepted only `typeset` lines, so an exported variable of the
+// script was never recorded. Spec `Recording-Backends/Shell-Recorder.md`,
+// "Variable Capture": exported (`-x`) and other attributes do not affect the
+// type mapping.
+#[test]
+fn test_zsh_exported_variable_capture() {
+    require_zsh!();
+    let vars = record_last_step_vars(&common::ZSH, &fixture_path("exported_variables.zsh"));
+
+    // `export DEPLOY_ENV=staging` is recorded, with its exact text.
+    common::assert_string(
+        common::var(&vars, "DEPLOY_ENV"),
+        "staging",
+        "DEPLOY_ENV at the last step",
+    );
+    // An inherited environment variable is not a variable of the script.
+    assert_no_inherited_vars(&vars, "zsh exported_variables");
+    // The non-exported variables are still recorded.
+    assert!(
+        common::var(&vars, "plain").is_some(),
+        "plain missing at the last step: {:?}",
+        common::var_names(&vars)
+    );
+    assert!(
+        common::var(&vars, "FIXED").is_some(),
+        "FIXED missing at the last step: {:?}",
+        common::var_names(&vars)
+    );
+}
+
+// The type of an exported parameter comes from its type flag, as for any
+// other parameter (spec `Recording-Backends/Shell-Recorder.md`, "Variable
+// Capture": exported (`-x`) attributes do not affect the type mapping). Each
+// exported parameter must carry the same trace type as a non-exported one of
+// the same zsh type: `export -i`, `export -F`, an exported array, and
+// `typeset -gx` inside a function (printed `export`, like a plain string).
+#[test]
+fn test_zsh_exported_variable_types() {
+    require_zsh!();
+    let vars = record_last_step_vars(&common::ZSH, &fixture_path("exported_typed.zsh"));
+    let get = |name: &str| {
+        common::var(&vars, name).unwrap_or_else(|| {
+            panic!(
+                "{name} not recorded at the last step: {:?}",
+                common::var_names(&vars)
+            )
+        })
+    };
+
+    common::assert_int(get("COUNT"), 3, "COUNT (export -i)");
+    match get("RATIO") {
+        ValueRecord::Float { f, .. } if *f == 1.5 => {}
+        other => panic!("RATIO (export -F): expected Float 1.5, got {other:?}"),
+    }
+    // Arrays are recorded as their `typeset -p` text (trace_bridge.rs
+    // `value_record_for_flag`), under the Array type.
+    common::assert_string(Some(get("LIST")), "( 1 2 )", "LIST (typeset -ax)");
+    common::assert_string(
+        Some(get("FROM_FN")),
+        "fn",
+        "FROM_FN (typeset -gx in a function)",
+    );
+
+    for (exported, plain) in [
+        ("COUNT", "plain_count"),
+        ("RATIO", "plain_ratio"),
+        ("LIST", "plain_list"),
+        ("FROM_FN", "plain_str"),
+    ] {
+        assert_eq!(
+            type_id_of(get(exported)),
+            type_id_of(get(plain)),
+            "{exported} must have the trace type of the non-exported {plain}: {:?} vs {:?}",
+            get(exported),
+            get(plain)
+        );
+    }
+    assert_no_inherited_vars(&vars, "zsh exported_typed");
+}
+
+/// The trace type of a scalar value record.
+fn type_id_of(value: &ValueRecord) -> u64 {
+    match value {
+        ValueRecord::Int { type_id, .. }
+        | ValueRecord::Float { type_id, .. }
+        | ValueRecord::String { type_id, .. } => type_id.0 as u64,
+        other => panic!("unexpected value record {other:?}"),
+    }
 }
 
 #[test]
@@ -877,4 +1013,33 @@ fn e2e_cross_shell_equivalence() {
         "Zsh trace should have language='zsh', got: {:?}",
         zsh_db_meta["language"]
     );
+}
+
+// Issue `2026-11-15-zsh-recorder-does-not-record-exported-variables`, spec
+// `CLI/recorders/shell.md` "Rules": both shells produce interchangeable
+// traces. The same script records the same variables in both, an exported
+// one included, and neither reports an inherited environment variable.
+#[test]
+fn e2e_cross_shell_exported_variables() {
+    require_zsh!();
+    let bash_vars = record_last_step_vars(&common::BASH, &cross_shell_fixture_path("exported.sh"));
+    let zsh_vars = record_last_step_vars(&common::ZSH, &cross_shell_fixture_path("exported.zsh"));
+
+    assert_eq!(
+        common::var_names(&zsh_vars),
+        common::var_names(&bash_vars),
+        "zsh and bash must record the same variables at the last step"
+    );
+    common::assert_string(
+        common::var(&bash_vars, "DEPLOY_ENV"),
+        "staging",
+        "bash DEPLOY_ENV at the last step",
+    );
+    common::assert_string(
+        common::var(&zsh_vars, "DEPLOY_ENV"),
+        "staging",
+        "zsh DEPLOY_ENV at the last step",
+    );
+    assert_no_inherited_vars(&bash_vars, "bash exported.sh");
+    assert_no_inherited_vars(&zsh_vars, "zsh exported.zsh");
 }
