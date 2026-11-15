@@ -326,6 +326,24 @@ fn test_bash_exit_code() {
     common::check_exit_codes(&common::BASH);
 }
 
+// The launcher writes the trace and passes the status through when the
+// script ends non-zero. See `common::check_nonzero_exit_keeps_trace`.
+
+#[test]
+fn test_bash_trace_written_when_script_calls_exit_nonzero() {
+    common::check_nonzero_exit_keeps_trace(&common::BASH, "exit_three", 3, 4);
+}
+
+#[test]
+fn test_bash_trace_written_when_last_command_fails() {
+    common::check_nonzero_exit_keeps_trace(&common::BASH, "exit_status_last_command", 1, 5);
+}
+
+#[test]
+fn test_bash_trace_written_when_errexit_stops_the_script() {
+    common::check_nonzero_exit_keeps_trace(&common::BASH, "exit_status_errexit", 1, 7);
+}
+
 // ============================================================================
 // M4: Variable Capture & Type Inference Tests
 // ============================================================================

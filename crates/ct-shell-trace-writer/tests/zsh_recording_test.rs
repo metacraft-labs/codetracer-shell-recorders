@@ -468,6 +468,27 @@ fn test_zsh_exit_code() {
     common::check_exit_codes(&common::ZSH);
 }
 
+// The launcher writes the trace and passes the status through when the
+// script ends non-zero. See `common::check_nonzero_exit_keeps_trace`.
+
+#[test]
+fn test_zsh_trace_written_when_script_calls_exit_nonzero() {
+    require_zsh!();
+    common::check_nonzero_exit_keeps_trace(&common::ZSH, "exit_three", 3, 4);
+}
+
+#[test]
+fn test_zsh_trace_written_when_last_command_fails() {
+    require_zsh!();
+    common::check_nonzero_exit_keeps_trace(&common::ZSH, "exit_status_last_command", 1, 5);
+}
+
+#[test]
+fn test_zsh_trace_written_when_errexit_stops_the_script() {
+    require_zsh!();
+    common::check_nonzero_exit_keeps_trace(&common::ZSH, "exit_status_errexit", 1, 7);
+}
+
 #[test]
 fn e2e_zsh_metadata() {
     require_zsh!();

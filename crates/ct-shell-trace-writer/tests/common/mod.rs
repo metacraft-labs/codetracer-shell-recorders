@@ -363,9 +363,10 @@ pub fn check_exit_codes(shell: &Shell) {
     let calls0 = call_returns(out0.path());
     assert_int(&return_of(&calls0, "<script>"), 0, "<script> of exit_zero");
 
-    // (c) Non-zero exits. The launcher does not yet write a trace for a
-    // non-zero exit (a separate defect), so the recorder's event file is fed
-    // to the writer directly, exactly as the launcher would.
+    // (c) Non-zero exits. The recorder's event file is fed to the writer
+    // directly, exactly as the launcher would, so these claims hold for the
+    // writer on its own; the launcher's handling of a non-zero exit is
+    // covered by `check_nonzero_exit_keeps_trace`.
     let (out3, stderr3) = write_trace(&three.events_file, &shell.fixture("exit_three"));
     assert!(
         !stderr3.contains(MISSING_EXIT_WARNING),
@@ -389,4 +390,139 @@ pub fn check_exit_codes(shell: &Shell) {
         4,
         "<script> of exit_in_function",
     );
+}
+
+/// Run the launcher on `script` with the directory of the
+/// `ct-shell-trace-writer` that cargo built for this test run first on
+/// `PATH`, and return its output directory and output.
+///
+/// The launchers look for the writer on `PATH` before any `target/`
+/// directory, and among those they prefer `target/release` to
+/// `target/debug`. A test that only rebuilt the debug profile would
+/// otherwise record with whatever release binary is left in the tree
+/// (codetracer-pm issue
+/// `2026-11-15-shell-recorder-tests-run-a-leftover-release-writer-instead-of-the-one-they-just-built`).
+pub fn run_launcher_with_built_writer(shell: &Shell, script: &Path) -> (TempDir, Output) {
+    let writer_dir = Path::new(env!("CARGO_BIN_EXE_ct-shell-trace-writer"))
+        .parent()
+        .expect("the writer binary has a parent directory")
+        .to_path_buf();
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(writer_dir).chain(std::env::split_paths(&inherited)))
+            .expect("PATH entries must be joinable");
+    run_launcher_with_env(
+        shell,
+        script,
+        &[("PATH", path.to_str().expect("UTF-8 PATH"))],
+    )
+}
+
+/// Record the fixture `stem` through the launcher and assert the complete
+/// recording a launcher promises, whatever status the script ends with:
+///
+/// - the launcher exits with exactly the script's status `status`
+///   (spec `Recorder-CLI-Conventions.md` §6 "Exit Codes": "N — Target
+///   program exit code (pass-through)");
+/// - the output directory holds the `.ct` container, `symbols.json`,
+///   `trace_db_metadata.json` and the script's copy under `files/`;
+/// - the writer saw the `EXIT` event (no missing-EXIT warning), and the
+///   `<script>` frame returns `Int <status>`;
+/// - the container names the fixture as its program, and its last step is
+///   at `exit_line` of the fixture: the line of the command that ended it.
+pub fn assert_launcher_records(shell: &Shell, stem: &str, status: i32, exit_line: u64) {
+    let fixture = shell.fixture(stem);
+    let file_name = fixture.file_name().unwrap().to_str().unwrap().to_string();
+    let (out, output) = run_launcher_with_built_writer(shell, &fixture);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(status),
+        "{} launcher must pass the script's exit status through for {file_name}: stderr={stderr}",
+        shell.interpreter
+    );
+    let present: Vec<String> = std::fs::read_dir(out.path())
+        .expect("failed to read the output dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    assert!(
+        !present.is_empty(),
+        "a script exiting with status {status} must still produce a trace, but the output directory is empty ({file_name}); stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains(MISSING_EXIT_WARNING),
+        "{} {file_name}: writer warned of a missing EXIT event: {stderr}",
+        shell.interpreter
+    );
+
+    let expected_ct = format!("{}.ct", fixture.file_stem().unwrap().to_str().unwrap());
+    for name in [
+        expected_ct.as_str(),
+        "symbols.json",
+        "trace_db_metadata.json",
+    ] {
+        assert!(
+            out.path().join(name).is_file(),
+            "{} {file_name}: {name} missing from the output dir; present: {present:?}",
+            shell.interpreter
+        );
+    }
+    // The writer copies each recorded source to `files/<absolute path
+    // without its leading separator>` (`copy_source_files` in
+    // `src/trace_bridge.rs`).
+    let copied = out
+        .path()
+        .join("files")
+        .join(fixture.strip_prefix("/").unwrap_or(&fixture));
+    assert!(
+        copied.is_file(),
+        "{} {file_name}: the script was not copied to {}; present: {present:?}",
+        shell.interpreter,
+        copied.display()
+    );
+
+    let reader = open_trace(out.path());
+    let program = reader.program();
+    assert!(
+        program.contains(&file_name),
+        "{} {file_name}: program should reference the fixture, got {program}",
+        shell.interpreter
+    );
+    let steps = reader.step_count();
+    assert!(
+        steps > 0,
+        "{} {file_name}: the trace has no steps",
+        shell.interpreter
+    );
+    let (path_id, line) = reader.step_location(steps - 1).expect("step_location");
+    let step_path = reader.path(path_id).expect("path of the last step");
+    assert!(
+        step_path.ends_with(&file_name) && line == exit_line,
+        "{} {file_name}: the last step should be at line {exit_line} of the fixture, got {step_path}:{line}",
+        shell.interpreter
+    );
+    drop(reader);
+
+    let calls = call_returns(out.path());
+    assert_int(
+        &return_of(&calls, "<script>"),
+        i64::from(status),
+        &format!("<script> of {file_name}"),
+    );
+}
+
+/// Recording a script that ends with a non-zero status must still write the
+/// trace, and the launcher must still return the script's status (codetracer-pm
+/// issue `2026-11-15-shell-recorders-write-no-trace-when-the-recorded-script-exits-non-zero`;
+/// spec `CLI/recorders/shell.md` "Rules": "The recorded script's exit status
+/// is preserved", and `Recording-Backends/Shell-Recorder.md` "Invocation
+/// Flow" steps 10 and 11, which finalize the trace on any exit).
+///
+/// The control records `simple`, which ends with status 0 at line 5, through
+/// the same assertions, so a failure of the non-zero case cannot come from
+/// a launcher or writer that records nothing at all.
+pub fn check_nonzero_exit_keeps_trace(shell: &Shell, stem: &str, status: i32, exit_line: u64) {
+    assert_ne!(status, 0, "{stem}: this check is for non-zero statuses");
+    assert_launcher_records(shell, "simple", 0, 5);
+    assert_launcher_records(shell, stem, status, exit_line);
 }

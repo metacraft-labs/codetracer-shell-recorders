@@ -243,8 +243,20 @@ _ct_events_file=$(mktemp "${TMPDIR:-/tmp}/ct-events-XXXXXX")
 trap 'rm -f "$_ct_events_file"' EXIT
 
 # Run the recorder with FD 3 connected to the event file.
-"$_ct_zsh" "$_ct_script_dir/recorder.zsh" "$_ct_script" "${_ct_script_args[@]}" 3>"$_ct_events_file"
-_ct_exit_code=$?
+#
+# The recorder exits with the recorded script's status, and that status is
+# saved here to be returned by the launcher's last line, after the trace is
+# written: spec `Recorder-CLI-Conventions.md` §6 "Exit Codes" makes the
+# recorder's exit code a pass-through of the target's, and the trace must be
+# written however the script ends (`Recording-Backends/Shell-Recorder.md`,
+# "Invocation Flow" steps 10 and 11). The status is captured with `||`
+# rather than read from `$?` on the next line, because this launcher runs
+# under `set -eo pipefail`: a non-zero status from a plain command would end the
+# launcher right here, before the trace writer runs, and the `EXIT` trap
+# would delete the event file. A command on the left of `||` is exempt
+# from `errexit`.
+_ct_exit_code=0
+"$_ct_zsh" "$_ct_script_dir/recorder.zsh" "$_ct_script" "${_ct_script_args[@]}" 3>"$_ct_events_file" || _ct_exit_code=$?
 
 # Feed the recorded event stream to the trace writer, passing the program
 # name and its positional argv for metadata + top-level call-arg staging.
