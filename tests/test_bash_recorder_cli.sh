@@ -19,6 +19,10 @@
 #     (the cairo / cardano / ... / js / python / ruby `--full` upgrade)
 #     so a recorder regression that silently drops or corrupts a value
 #     is caught loudly rather than passing a substring-presence check.
+#   * A script with no arguments records (and runs under `_DISABLED=1`) on
+#     the installed Bash and on Bash 4.0, the specification's floor, named
+#     by CT_TEST_BASH_4_0; a Bash 3.2 (CT_TEST_BASH_3_2) is refused by name.
+#     Both variables are exported by the Linux dev shell (flake.nix).
 #
 # Usage: bash tests/test_bash_recorder_cli.sh
 #
@@ -460,6 +464,206 @@ RETURN_I="$(jq -r '
 [[ "${RETURN_I}" == "0" ]] \
   || fail "T7: call_exit return_value should be 0 (success), got ${RETURN_I}"
 pass "T7 exact return: call_exit → Int(0)"
+
+# ---------------------------------------------------------------------------
+# T8. A script recorded with no arguments, under the oldest supported Bash.
+#
+# The Shell Recorder specification (`Recording-Backends/Shell-Recorder.md`,
+# "Supported Shells") supports Bash 4.0 and newer. The launcher runs under
+# `set -u`, and before Bash 4.4 expanding an array with no elements under
+# `nounset` is an "unbound variable" error (Bash CHANGES, bash-4.4-rc2, "New
+# Features in Bash"); on 4.0 `"$@"` with no positional parameters is one too.
+# The dev shell's own Bash 5 cannot fail for that reason, so the floor
+# release is named by CT_TEST_BASH_4_0, which the Linux dev shell exports
+# (see `oldBashEnv` in flake.nix). CT_TEST_BASH_3_2 names a Bash below the
+# floor, which the launcher must refuse by name before it runs anything.
+#
+# Each Bash under test is selected through PATH: a directory holding only a
+# `bash` symlink is put first, so the entry point's `#!/usr/bin/env bash`,
+# the launcher's own shebang, and its `bash recorder.sh` all resolve to it.
+# ---------------------------------------------------------------------------
+
+NOARG_FIXTURE="${WORK_DIR}/noarg.sh"
+# Prints its argument count and each argument in brackets, so an empty
+# argument, or one with spaces, that the launcher drops or splits shows up.
+cat > "${NOARG_FIXTURE}" <<'EOF'
+_seen=""
+for _a in "$@"; do _seen="${_seen}[${_a}]"; done
+echo "noarg-marker argc=$# args=${_seen}"
+EOF
+
+[[ -x "${BIN}" ]] || fail "T8: entry point ${BIN} is not executable"
+
+# bash_path_dir <label> <bash-binary> -- prints a fresh directory that holds
+# only a `bash` symlink to <bash-binary>.
+bash_path_dir() {
+  local dir="${WORK_DIR}/path-$1"
+  mkdir -p "${dir}"
+  ln -sfn "$2" "${dir}/bash"
+  printf '%s\n' "${dir}"
+}
+
+# run_entry <path-prefix> <out-dir> [env-assignments...] -- [launcher-args...]
+# Runs the `codetracer-bash-recorder` entry point as
+# `--out-dir <out-dir> <launcher-args...>` (the script and its arguments,
+# optionally after `--`) with <path-prefix> (may be empty) prepended to
+# PATH. Sets RUN_RC, RUN_STDOUT and RUN_STDERR; never aborts the test on a
+# non-zero exit.
+run_entry() {
+  local prefix="$1" out_dir="$2"
+  shift 2
+  local -a env_vars=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    env_vars+=("$1")
+    shift
+  done
+  [[ $# -gt 0 ]] && shift
+  local run_path="${PATH}"
+  [[ -n "${prefix}" ]] && run_path="${prefix}:${PATH}"
+  RUN_RC=0
+  env ${env_vars[@]+"${env_vars[@]}"} PATH="${run_path}" \
+    "${BIN}" --out-dir "${out_dir}" "$@" \
+    >"${WORK_DIR}/run.out" 2>"${WORK_DIR}/run.err" || RUN_RC=$?
+  RUN_STDOUT="$(cat "${WORK_DIR}/run.out")"
+  RUN_STDERR="$(cat "${WORK_DIR}/run.err")"
+}
+
+# expect_recorded <label> <out-dir> <expected-script-line> <expected-args-json>
+expect_recorded() {
+  local label="$1" out_dir="$2" line="$3" args_json="$4"
+  local -a cts=()
+  [[ "${RUN_RC}" == "0" ]] \
+    || fail "${label}: launcher exited ${RUN_RC}; stderr: ${RUN_STDERR}"
+  if grep -qF "unbound variable" <<< "${RUN_STDERR}"; then
+    fail "${label}: stderr reports an unbound variable: ${RUN_STDERR}"
+  fi
+  grep -qxF "${line}" <<< "${RUN_STDOUT}" \
+    || fail "${label}: script output '${line}' missing; stdout: ${RUN_STDOUT}"
+  shopt -s nullglob
+  cts=("${out_dir}"/*.ct)
+  shopt -u nullglob
+  [[ "${#cts[@]}" == "1" ]] \
+    || fail "${label}: expected exactly one *.ct in ${out_dir}, found ${#cts[@]}: $(ls -A "${out_dir}" 2>/dev/null)"
+  jq -e --argjson want "${args_json}" '.args == $want' \
+    "${out_dir}/trace_db_metadata.json" >/dev/null \
+    || fail "${label}: trace_db_metadata.json args is not ${args_json} (or the file is not valid JSON): $(cat "${out_dir}/trace_db_metadata.json" 2>&1)"
+  pass "${label}: exit 0, one .ct, script ran, args ${args_json}"
+}
+
+# expect_ran_unrecorded <label> -- the _DISABLED short-circuit with no argument.
+expect_ran_unrecorded() {
+  local label="$1"
+  [[ "${RUN_RC}" == "0" ]] \
+    || fail "${label}: launcher exited ${RUN_RC}; stderr: ${RUN_STDERR}"
+  if grep -qF "unbound variable" <<< "${RUN_STDERR}"; then
+    fail "${label}: stderr reports an unbound variable: ${RUN_STDERR}"
+  fi
+  grep -qxF "noarg-marker argc=0 args=" <<< "${RUN_STDOUT}" \
+    || fail "${label}: the script did not run; stdout: ${RUN_STDOUT}; stderr: ${RUN_STDERR}"
+  pass "${label}: script ran, exit 0"
+}
+
+# check_no_arg_cases <label> <path-prefix> -- the no-argument recording
+# (with the script given plainly and after `--`, the two places the launcher
+# reads `"$@"`), the no-argument _DISABLED run, the one-argument control, and
+# an empty argument plus arguments with spaces, which the guarded array
+# expansions must pass through unchanged.
+check_no_arg_cases() {
+  local label="$1" prefix="$2"
+  local out="${WORK_DIR}/t8-${label}"
+  run_entry "${prefix}" "${out}-noarg" -- "${NOARG_FIXTURE}"
+  expect_recorded "T8 ${label} no argument" "${out}-noarg" \
+    "noarg-marker argc=0 args=" '[]'
+  run_entry "${prefix}" "${out}-dashdash" -- -- "${NOARG_FIXTURE}"
+  expect_recorded "T8 ${label} no argument after --" "${out}-dashdash" \
+    "noarg-marker argc=0 args=" '[]'
+  run_entry "${prefix}" "${out}-disabled" CODETRACER_BASH_RECORDER_DISABLED=1 \
+    -- "${NOARG_FIXTURE}"
+  expect_ran_unrecorded "T8 ${label} _DISABLED=1, no argument"
+  run_entry "${prefix}" "${out}-onearg" -- "${NOARG_FIXTURE}" one
+  expect_recorded "T8 ${label} one argument (control)" "${out}-onearg" \
+    "noarg-marker argc=1 args=[one]" '["one"]'
+  run_entry "${prefix}" "${out}-quoted" -- "${NOARG_FIXTURE}" "" "a b" "  c  "
+  expect_recorded "T8 ${label} empty and spaced arguments" "${out}-quoted" \
+    "noarg-marker argc=3 args=[][a b][  c  ]" '["","a b","  c  "]'
+}
+
+# The Bash the dev shell installs (5.x): the same cases must pass there too.
+check_no_arg_cases "installed-bash-$(bash -c 'echo "${BASH_VERSION}"')" ""
+
+if [[ -n "${CT_TEST_BASH_4_0:-}" ]]; then
+  [[ -x "${CT_TEST_BASH_4_0}" ]] \
+    || fail "T8: CT_TEST_BASH_4_0=${CT_TEST_BASH_4_0} is not executable"
+  BASH40_DIR="$(bash_path_dir bash40 "${CT_TEST_BASH_4_0}")"
+  # Positive control: through this PATH, `bash` really is 4.0. Without it a
+  # misconfigured fixture would silently test the installed Bash 5 instead.
+  BASH40_SEEN="$(PATH="${BASH40_DIR}:${PATH}" bash -c 'echo "${BASH_VERSION}"')"
+  [[ "${BASH40_SEEN}" == 4.0.* ]] \
+    || fail "T8: bash through ${BASH40_DIR} reports ${BASH40_SEEN}, expected 4.0.*"
+  # shellcheck disable=SC2016 # expanded by the Bash under test, not here
+  BASH40_ENV_SEEN="$(PATH="${BASH40_DIR}:${PATH}" env bash -c 'echo "${BASH_VERSION}"')"
+  [[ "${BASH40_ENV_SEEN}" == 4.0.* ]] \
+    || fail "T8: 'env bash' through ${BASH40_DIR} reports ${BASH40_ENV_SEEN}, expected 4.0.*"
+  pass "T8 control: PATH selects Bash ${BASH40_SEEN}"
+  check_no_arg_cases "bash-4.0" "${BASH40_DIR}"
+  # The launcher records the `bash --version` it ran with; it must be 4.0.
+  jq -e '.bash_version | startswith("4.0.")' \
+    "${WORK_DIR}/t8-bash-4.0-noarg/trace_db_metadata.json" >/dev/null \
+    || fail "T8: the Bash 4.0 recording names another Bash: $(cat "${WORK_DIR}/t8-bash-4.0-noarg/trace_db_metadata.json")"
+  pass "T8 bash-4.0: the recording's bash_version is 4.0"
+elif [[ "$(uname -s)" == Linux ]]; then
+  fail "T8: CT_TEST_BASH_4_0 is unset; run this test in the dev shell (nix develop), which exports it on Linux — it must not silently skip"
+else
+  echo "skipped: T8 under Bash 4.0 — CT_TEST_BASH_4_0 is unset (Linux dev shell only)"
+fi
+
+# T9. A Bash older than 4.0 is refused by name, before the script runs.
+if [[ -n "${CT_TEST_BASH_3_2:-}" ]]; then
+  [[ -x "${CT_TEST_BASH_3_2}" ]] \
+    || fail "T9: CT_TEST_BASH_3_2=${CT_TEST_BASH_3_2} is not executable"
+  BASH32_DIR="$(bash_path_dir bash32 "${CT_TEST_BASH_3_2}")"
+  BASH32_SEEN="$(PATH="${BASH32_DIR}:${PATH}" bash -c 'echo "${BASH_VERSION}"')"
+  [[ "${BASH32_SEEN}" == 3.2.* ]] \
+    || fail "T9: bash through ${BASH32_DIR} reports ${BASH32_SEEN}, expected 3.2.*"
+  OUT_DIR_T9="${WORK_DIR}/t9-bash32"
+  run_entry "${BASH32_DIR}" "${OUT_DIR_T9}" -- "${NOARG_FIXTURE}" one
+  [[ "${RUN_RC}" == "1" ]] \
+    || fail "T9: launcher under Bash ${BASH32_SEEN} must exit 1, got ${RUN_RC}; stdout: ${RUN_STDOUT}"
+  grep -qF "Bash ${BASH32_SEEN} (${BASH32_DIR}/bash)" <<< "${RUN_STDERR}" \
+    || fail "T9: error must name the Bash found (${BASH32_SEEN}, ${BASH32_DIR}/bash); stderr: ${RUN_STDERR}"
+  grep -qF "4.0 or newer" <<< "${RUN_STDERR}" \
+    || fail "T9: error must say Bash 4.0 or newer is required; stderr: ${RUN_STDERR}"
+  if grep -qF "noarg-marker" <<< "${RUN_STDOUT}"; then
+    fail "T9: the script must not run under an unsupported Bash; stdout: ${RUN_STDOUT}"
+  fi
+  [[ ! -e "${OUT_DIR_T9}" ]] \
+    || fail "T9: an unsupported Bash must not create ${OUT_DIR_T9}"
+  pass "T9 Bash ${BASH32_SEEN} refused (exit ${RUN_RC}), script not run"
+
+  # Started as `<bash-3.2> launcher.sh` with the installed Bash first on
+  # PATH, the error must name the interpreter running the launcher, not the
+  # `bash` on PATH.
+  OUT_DIR_T9_DIRECT="${WORK_DIR}/t9-bash32-direct"
+  RUN_RC=0
+  "${CT_TEST_BASH_3_2}" "${LAUNCHER}" --out-dir "${OUT_DIR_T9_DIRECT}" \
+    "${NOARG_FIXTURE}" >"${WORK_DIR}/run.out" 2>"${WORK_DIR}/run.err" || RUN_RC=$?
+  RUN_STDOUT="$(cat "${WORK_DIR}/run.out")"
+  RUN_STDERR="$(cat "${WORK_DIR}/run.err")"
+  [[ "${RUN_RC}" == "1" ]] \
+    || fail "T9: '${CT_TEST_BASH_3_2} launcher.sh' must exit 1, got ${RUN_RC}; stdout: ${RUN_STDOUT}"
+  grep -qF "Bash ${BASH32_SEEN} (${CT_TEST_BASH_3_2})" <<< "${RUN_STDERR}" \
+    || fail "T9: error must name the interpreter running the launcher (${CT_TEST_BASH_3_2}); stderr: ${RUN_STDERR}"
+  if grep -qF "noarg-marker" <<< "${RUN_STDOUT}"; then
+    fail "T9: the script must not run under an unsupported Bash; stdout: ${RUN_STDOUT}"
+  fi
+  [[ ! -e "${OUT_DIR_T9_DIRECT}" ]] \
+    || fail "T9: an unsupported Bash must not create ${OUT_DIR_T9_DIRECT}"
+  pass "T9 '<bash-3.2> launcher.sh' refused, naming ${CT_TEST_BASH_3_2}"
+elif [[ "$(uname -s)" == Linux ]]; then
+  fail "T9: CT_TEST_BASH_3_2 is unset; run this test in the dev shell (nix develop), which exports it on Linux — it must not silently skip"
+else
+  echo "skipped: T9 under Bash 3.2 — CT_TEST_BASH_3_2 is unset (Linux dev shell only)"
+fi
 
 echo ""
 echo "test_bash_recorder_cli: ${PASS_COUNT} assertions passed"

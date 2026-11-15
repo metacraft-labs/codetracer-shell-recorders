@@ -21,7 +21,43 @@
 #       recording — useful for short-circuiting the recorder in CI when
 #       the binary is on PATH but tracing is undesired.
 
+# ---------------------------------------------------------------------------
+# Bash version floor.
+#
+# The Shell Recorder specification (`Recording-Backends/Shell-Recorder.md`,
+# "Supported Shells") supports Bash 4.0 and newer; the recorder needs
+# associative arrays and `shopt -s extdebug`. On an older Bash the launcher
+# would otherwise fail somewhere in the middle (Bash 3.2 rejects
+# `declare -A` in recorder.sh), so refuse it here, by name, before anything
+# else runs. This block must stay parseable by Bash 3.x: no 4.x-only syntax
+# above or in it.
+#
+# The message names `$BASH`, the interpreter running this script, rather
+# than the `bash` on PATH: the two differ when the launcher is started as
+# `/some/bash launcher.sh`. Through the `codetracer-bash-recorder` entry
+# point (and this script's own `#!/usr/bin/env bash`) both are the `bash`
+# found on PATH, which is also what runs `bash recorder.sh` below. Started
+# any other way, the recording itself still runs under the `bash` on PATH.
+# ---------------------------------------------------------------------------
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    echo "Error: codetracer-bash-recorder requires Bash 4.0 or newer; found Bash ${BASH_VERSION:-unknown} (${BASH:-unknown path})" >&2
+    exit 1
+fi
+
 set -euo pipefail
+
+# A note on `set -u` and arrays, for every expansion of `_ct_script_args`
+# below. Before Bash 4.4, expanding an array with no elements under
+# `nounset` is an "unbound variable" error, and Bash 4.0 also treats `"$@"`
+# with no positional parameters as unbound. Bash's CHANGES file, under
+# bash-4.4-rc2, "New Features in Bash": "Using ${a[@]} or ${a[*]} with an
+# array without any assigned elements when the nounset option is enabled
+# no longer throws an unbound variable error."
+# https://git.savannah.gnu.org/cgit/bash.git/tree/CHANGES
+# So `"$@"` is only read when `$# > 0`, and the array is always expanded as
+# `${_ct_script_args[@]+"${_ct_script_args[@]}"}`, which yields nothing for
+# an empty array and the quoted elements otherwise. A script recorded with
+# no arguments must work on every supported Bash (4.0+).
 
 _ct_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _ct_repo_root="$(cd "$_ct_script_dir/.." && pwd)"
@@ -124,7 +160,10 @@ while [[ $# -gt 0 ]]; do
             fi
             _ct_script="$1"
             shift
-            _ct_script_args=("$@")
+            # `"$@"` is unbound on Bash 4.0 when empty; see the note above.
+            if [[ $# -gt 0 ]]; then
+                _ct_script_args=("$@")
+            fi
             break
             ;;
         -*)
@@ -135,7 +174,10 @@ while [[ $# -gt 0 ]]; do
         *)
             _ct_script="$1"
             shift
-            _ct_script_args=("$@")
+            # `"$@"` is unbound on Bash 4.0 when empty; see the note above.
+            if [[ $# -gt 0 ]]; then
+                _ct_script_args=("$@")
+            fi
             break
             ;;
     esac
@@ -162,7 +204,7 @@ fi
 _ct_disabled="${CODETRACER_BASH_RECORDER_DISABLED:-}"
 case "$_ct_disabled" in
     1 | true | TRUE | yes | YES)
-        exec bash "$_ct_script" "${_ct_script_args[@]}"
+        exec bash "$_ct_script" ${_ct_script_args[@]+"${_ct_script_args[@]}"}
         ;;
 esac
 
@@ -219,7 +261,7 @@ _ct_events_file=$(mktemp "${TMPDIR:-/tmp}/ct-events-XXXXXX")
 trap 'rm -f "$_ct_events_file"' EXIT
 
 # Run the recorder with FD 3 connected to the event file.
-bash "$_ct_script_dir/recorder.sh" "$_ct_script" "${_ct_script_args[@]}" 3>"$_ct_events_file"
+bash "$_ct_script_dir/recorder.sh" "$_ct_script" ${_ct_script_args[@]+"${_ct_script_args[@]}"} 3>"$_ct_events_file"
 _ct_exit_code=$?
 
 # Feed the recorded event stream to the trace writer, passing the program
@@ -234,7 +276,7 @@ if (( ${#_ct_script_args[@]} > 0 )); then
     "$_ct_trace_writer" \
         --out-dir "$_ct_output_dir" \
         --program "$_ct_script" \
-        --args "${_ct_script_args[@]}" \
+        --args ${_ct_script_args[@]+"${_ct_script_args[@]}"} \
         < "$_ct_events_file"
 else
     "$_ct_trace_writer" \
@@ -257,7 +299,7 @@ fi
 _ct_write_enhanced_metadata() {
     local _ct_args_json="["
     local _ct_first=true
-    for _ct_arg in "${_ct_script_args[@]}"; do
+    for _ct_arg in ${_ct_script_args[@]+"${_ct_script_args[@]}"}; do
         if [[ "$_ct_first" == true ]]; then
             _ct_first=false
         else

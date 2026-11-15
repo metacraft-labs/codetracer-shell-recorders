@@ -92,6 +92,20 @@
           preCommit = self.checks.${system}.pre-commit-check;
           isLinux = pkgs.stdenv.isLinux;
           isDarwin = pkgs.stdenv.isDarwin;
+          # Old GNU Bash releases for tests/test_bash_recorder_cli.sh. The
+          # Shell Recorder specification (`Recording-Backends/Shell-Recorder.md`,
+          # "Supported Shells") sets the Bash floor at 4.0, and this shell's own
+          # Bash 5 cannot fail for a pre-4.4 reason (such as `set -u` treating an
+          # empty array as unbound), so the test needs the floor release itself,
+          # plus a 3.2 to check that an unsupported Bash is refused by name.
+          # They are exported by path only, never added to `packages`: they must
+          # not shadow this shell's `bash`. Linux only: building these releases
+          # with Darwin's clang is untested.
+          oldBash = version: hash: pkgs.callPackage ./nix/old-bash.nix { inherit version hash; };
+          oldBashEnv = pkgs.lib.optionalAttrs isLinux {
+            CT_TEST_BASH_4_0 = "${oldBash "4.0" "sha256-l5PTlPZAqVAwx31ayYlySv4ZaSGVbbdBvK8UGAHFBRg="}/bin/bash";
+            CT_TEST_BASH_3_2 = "${oldBash "3.2" "sha256-JsmQJbWeMHeTALaK23ZPgkl00mek18wbNH0Uojk/n7Q="}/bin/bash";
+          };
           # The committed `.pre-commit-config.yaml` is what the pre-commit hook
           # runs, with the flake's pre-commit: the flake provides the tools, the
           # committed config provides the rules. git-hooks.nix's own installer
@@ -182,6 +196,9 @@
               ++ pkgs.lib.optionals isLinux [ glibc.dev ]
               ++ pkgs.lib.optionals isDarwin [ libiconv ]
               ++ preCommit.enabledPackages;
+
+            # CT_TEST_BASH_4_0 / CT_TEST_BASH_3_2 (Linux): see `oldBashEnv` above.
+            env = oldBashEnv;
 
             # `cargo <subcommand>` looks for `cargo-<subcommand>` in
             # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with

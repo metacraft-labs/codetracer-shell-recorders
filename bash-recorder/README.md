@@ -15,6 +15,14 @@ canonical CodeTracer CTFS `.ct` container.
   Emits the line-oriented wire protocol consumed by
   `crates/ct-shell-trace-writer/`.
 
+## Requirements
+
+Bash 4.0 or newer, both for the launcher and for the recorded script (the
+`bash` found on `PATH` runs both). On an older Bash the launcher exits with
+an error that names the version it found. `tests/test_bash_recorder_cli.sh`
+runs the recorder under Bash 4.0, the oldest supported release, which the
+Linux dev shell provides as `CT_TEST_BASH_4_0`.
+
 ## Usage
 
 ```bash
