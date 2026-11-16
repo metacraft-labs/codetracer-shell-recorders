@@ -56,17 +56,48 @@ fi
 typeset -i _ct_events_fd
 exec {_ct_events_fd}>&3 3>&-
 
+# Quote a value for the wire protocol: sets `_ct_qv` to the quoted form of
+# $1. Avoids subshell $() which interacts badly with the DEBUG trap.
+#
+# The writer ends an unquoted value at the first whitespace and reads a
+# double-quoted value with `\"` and `\\` escapes (`parse_key_values` in
+# crates/ct-shell-trace-writer/src/wire_protocol.rs). Every free-form value
+# an event carries goes through here: variable and argument values, command
+# texts, and every path and function name, which may hold a space, a tab, a
+# `"` or a `\` like any other string (zsh accepts any function name, and
+# names a sourced file's frame after its path). A newline cannot be carried
+# by this line protocol at all, quoted or not.
+#
+# A path or a function name, which every STEP and CALL repeats, is quoted
+# once, when it is registered, and read back from `_ct_registered_paths` /
+# `_ct_registered_funcs`. A glob rather than `=~`, which the script's
+# RE_MATCH_PCRE would change. Kept the same as `_ct_inline_quote` in
+# recorder.sh.
+_ct_inline_quote() {
+    _ct_qv="$1"
+    if [[ "$_ct_qv" == *[[:space:]\"\\]* ]]; then
+        _ct_qv="${_ct_qv//\\/\\\\}"
+        _ct_qv="${_ct_qv//\"/\\\"}"
+        _ct_qv="\"$_ct_qv\""
+    fi
+}
+
 # Emit START event
-printf 'START program=%s shell=zsh shell_version=%s\n' "$_ct_target_script" "$ZSH_VERSION" >&$_ct_events_fd
+_ct_inline_quote "$_ct_target_script"
+_ct_target_script_q=$_ct_qv
+_ct_inline_quote "$ZSH_VERSION"
+printf 'START program=%s shell=zsh shell_version=%s\n' "$_ct_target_script_q" "$_ct_qv" >&$_ct_events_fd
 
 # Register the main script path
-printf 'PATH file=%s\n' "$_ct_target_script" >&$_ct_events_fd
+printf 'PATH file=%s\n' "$_ct_target_script_q" >&$_ct_events_fd
 
-# Track which files we've already registered
+# The source files already registered, each mapped to its quoted form for
+# the PATH, FUNC and STEP events
 typeset -A _ct_registered_paths
-_ct_registered_paths[$_ct_target_script]=1
+_ct_registered_paths[$_ct_target_script]=$_ct_target_script_q
 
-# Track which functions we've already registered
+# The functions already registered, each mapped to its quoted name for the
+# FUNC and CALL events
 typeset -A _ct_registered_funcs
 
 # Previous funcstack depth, or the caller's depth after a function's EXIT
@@ -344,17 +375,6 @@ typeset -A _ct_baseline_vars
             _ct_baseline_vars[${match[4]}]=1
         fi
     done
-}
-
-# Inline quoting: sets _ct_qv to the quoted version of $1.
-# Avoids subshell $() which interacts badly with the DEBUG trap.
-_ct_inline_quote() {
-    _ct_qv="$1"
-    if [[ "$_ct_qv" =~ [\ \"\\\n] ]]; then
-        _ct_qv="${_ct_qv//\\/\\\\}"
-        _ct_qv="${_ct_qv//\"/\\\"}"
-        _ct_qv="\"$_ct_qv\""
-    fi
 }
 
 # Capture all user-visible variables and emit VAR events.
@@ -1049,10 +1069,15 @@ _ct_debug_action='
             _ct_last_cmd="$_ct_cmd"
 
             # Register new source files
+            # (and keep the quoted path for the events below; see
+            # `_ct_inline_quote`; `-` keeps an unknown, empty file from
+            # failing when the script sets NO_UNSET)
             if [[ -n "$_ct_file" ]] && (( ! ${+_ct_registered_paths[$_ct_file]} )); then
-                printf '\''PATH file=%s\n'\'' "$_ct_file" >&$_ct_events_fd
-                _ct_registered_paths[$_ct_file]=1
+                _ct_inline_quote "$_ct_file"
+                _ct_registered_paths[$_ct_file]=$_ct_qv
+                printf '\''PATH file=%s\n'\'' "$_ct_qv" >&$_ct_events_fd
             fi
+            _ct_file_q="${_ct_registered_paths[$_ct_file]-}"
 
             # The shell went on, so nothing held for a pending `exit` exits.
             if (( ${#_ct_held_returns} > 0 || _ct_exit_suspect )); then
@@ -1094,8 +1119,9 @@ _ct_debug_action='
                 # Register function if first time seen
                 # Use the definition line from funcsourcetrace
                 if (( ! ${+_ct_registered_funcs[$_ct_func_name]} )); then
-                    printf '\''FUNC name=%s file=%s line=%d\n'\'' "$_ct_func_name" "$_ct_file" "$_ct_func_def_line" >&$_ct_events_fd
-                    _ct_registered_funcs[$_ct_func_name]=1
+                    _ct_inline_quote "$_ct_func_name"
+                    _ct_registered_funcs[$_ct_func_name]=$_ct_qv
+                    printf '\''FUNC name=%s file=%s line=%d\n'\'' "$_ct_qv" "$_ct_file_q" "$_ct_func_def_line" >&$_ct_events_fd
                 fi
 
                 # Stage positional parameters as ARG events BEFORE the CALL
@@ -1113,7 +1139,7 @@ _ct_debug_action='
                 done
 
                 # Emit CALL event (drains the ARG events staged above)
-                printf '\''CALL name=%s\n'\'' "$_ct_func_name" >&$_ct_events_fd
+                printf '\''CALL name=%s\n'\'' "${_ct_registered_funcs[$_ct_func_name]}" >&$_ct_events_fd
 
                 # Open the frame. A function frame gets the EXIT trap that
                 # closes it (see "Open frames"); set here, before the
@@ -1150,7 +1176,7 @@ _ct_debug_action='
             fi
 
             # Emit step event
-            printf '\''STEP file=%s line=%d\n'\'' "$_ct_file" "$_ct_line" >&$_ct_events_fd
+            printf '\''STEP file=%s line=%d\n'\'' "$_ct_file_q" "$_ct_line" >&$_ct_events_fd
 
             # Capture variables at this step
             _ct_capture_variables

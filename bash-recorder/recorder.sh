@@ -52,17 +52,54 @@ while { : >&"$_ct_events_fd"; } 2>/dev/null; do
 done
 eval "exec $_ct_events_fd>&3 3>&-"
 
+# Quote a value for the wire protocol, without a subshell: sets `_ct_qv`.
+#
+# The writer ends an unquoted value at the first whitespace and reads a
+# double-quoted value with `\"` and `\\` escapes (`parse_key_values` in
+# crates/ct-shell-trace-writer/src/wire_protocol.rs). Every free-form value
+# an event carries goes through here: variable and argument values, command
+# texts, and every path and function name, which may hold a space, a tab, a
+# `"` or a `\` like any other string. A newline cannot be carried by this
+# line protocol at all, quoted or not.
+#
+# It runs inside the DEBUG trap, so it sets a variable instead of printing
+# into a `$(...)` that would fork each time; and a path or a function name,
+# which every STEP and CALL repeats, is quoted once, when it is registered,
+# and read back from `_ct_registered_paths` / `_ct_registered_funcs`. A
+# glob rather than `=~`, so that quoting never touches the script's
+# BASH_REMATCH. Kept the same as `_ct_inline_quote` in recorder.zsh.
+_ct_inline_quote() {
+    _ct_qv="$1"
+    if [[ "$_ct_qv" == *[[:space:]\"\\]* ]]; then
+        _ct_qv="${_ct_qv//\\/\\\\}"
+        _ct_qv="${_ct_qv//\"/\\\"}"
+        _ct_qv="\"$_ct_qv\""
+    fi
+}
+
+# Print the quoted form of a value (see `_ct_inline_quote`).
+_ct_quote_value() {
+    local _ct_qv
+    _ct_inline_quote "$1"
+    printf '%s' "$_ct_qv"
+}
+
 # Emit START event
-printf 'START program=%s shell=bash shell_version=%s\n' "$_ct_target_script" "$BASH_VERSION" >&"$_ct_events_fd"
+_ct_inline_quote "$_ct_target_script"
+_ct_target_script_q=$_ct_qv
+_ct_inline_quote "$BASH_VERSION"
+printf 'START program=%s shell=bash shell_version=%s\n' "$_ct_target_script_q" "$_ct_qv" >&"$_ct_events_fd"
 
 # Register the main script path
-printf 'PATH file=%s\n' "$_ct_target_script" >&"$_ct_events_fd"
+printf 'PATH file=%s\n' "$_ct_target_script_q" >&"$_ct_events_fd"
 
-# Track which files we've already registered
+# The source files already registered, each mapped to its quoted form for
+# the PATH, FUNC and STEP events
 declare -A _ct_registered_paths
-_ct_registered_paths["$_ct_target_script"]=1
+_ct_registered_paths["$_ct_target_script"]=$_ct_target_script_q
 
-# Track which functions we've already registered
+# The functions already registered, each mapped to its quoted name for the
+# FUNC and CALL events
 declare -A _ct_registered_funcs
 
 # FUNCNAME stack depth at the previous DEBUG trap, or the caller's depth after
@@ -152,18 +189,6 @@ while IFS= read -r _ct_baseline_line; do
 done <<< "$(declare -p 2>/dev/null)"
 # Also add BASH_REMATCH itself to baseline since the regex above created/modified it
 _ct_baseline_vars["BASH_REMATCH"]=1
-
-# Quote a value for the wire protocol: if it contains spaces or special chars, wrap in quotes
-_ct_quote_value() {
-    local val="$1"
-    if [[ "$val" =~ [\ \"\\\n] ]]; then
-        val="${val//\\/\\\\}"
-        val="${val//\"/\\\"}"
-        printf '"%s"' "$val"
-    else
-        printf '%s' "$val"
-    fi
-}
 
 # Capture all user-visible variables and emit VAR events.
 # Called after each STEP event to record variable state.
@@ -443,11 +468,15 @@ _ct_debug_trap() {
     [[ "$_ct_file" == "" ]] && return 0
     (( _ct_in_return_trap )) && return 0
 
-    # Register new source files
+    # Register new source files, and keep the quoted path for the events
+    # below (see `_ct_inline_quote`)
+    local _ct_qv
     if [[ -z "${_ct_registered_paths[$_ct_file]+x}" ]]; then
-        printf 'PATH file=%s\n' "$_ct_file" >&"$_ct_events_fd"
-        _ct_registered_paths["$_ct_file"]=1
+        _ct_inline_quote "$_ct_file"
+        _ct_registered_paths["$_ct_file"]=$_ct_qv
+        printf 'PATH file=%s\n' "$_ct_qv" >&"$_ct_events_fd"
     fi
+    local _ct_file_q="${_ct_registered_paths[$_ct_file]}"
 
     # The first DEBUG trap of a subshell: the frames already open belong to
     # the parent, which closes them; this subshell closes those it opens.
@@ -517,8 +546,9 @@ _ct_debug_trap() {
         # still appear in the function table (FUNC event), it just must not
         # surface as a counted CALL below.
         if [[ -z "${_ct_registered_funcs[$_ct_func_name]+x}" ]]; then
-            printf 'FUNC name=%s file=%s line=%d\n' "$_ct_func_name" "$_ct_file" "$_ct_line" >&"$_ct_events_fd"
-            _ct_registered_funcs["$_ct_func_name"]=1
+            _ct_inline_quote "$_ct_func_name"
+            _ct_registered_funcs["$_ct_func_name"]=$_ct_qv
+            printf 'FUNC name=%s file=%s line=%d\n' "$_ct_qv" "$_ct_file_q" "$_ct_line" >&"$_ct_events_fd"
         fi
 
         # The synthetic script-load `source` wrapper (_ct_depth == 3) is
@@ -572,7 +602,7 @@ _ct_debug_trap() {
             fi
 
             # Emit CALL event (drains the ARG events staged above)
-            printf 'CALL name=%s\n' "$_ct_func_name" >&"$_ct_events_fd"
+            printf 'CALL name=%s\n' "${_ct_registered_funcs[$_ct_func_name]}" >&"$_ct_events_fd"
             if [[ "$_ct_func_name" == source ]]; then
                 _ct_push_frame "$_ct_depth" "$_ct_func_name" s
             else
@@ -593,7 +623,7 @@ _ct_debug_trap() {
     fi
 
     # Emit step event
-    printf 'STEP file=%s line=%d\n' "$_ct_file" "$_ct_line" >&"$_ct_events_fd"
+    printf 'STEP file=%s line=%d\n' "$_ct_file_q" "$_ct_line" >&"$_ct_events_fd"
 
     # Capture variables at this step
     _ct_capture_variables

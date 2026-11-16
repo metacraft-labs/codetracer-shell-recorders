@@ -1288,3 +1288,66 @@ fn test_zsh_script_closing_fd3_keeps_the_trace_channel() {
     require_zsh!();
     common::check_script_fd3_does_not_touch_the_trace_channel(&common::ZSH, "fd3_closed");
 }
+
+// ============================================================================
+// Paths and function names that need quoting on the wire
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-cannot-record-a-script-whose-path-contains-a-space`.
+// The claims are shared with the other shell; see "Paths and function names
+// that need quoting on the wire" in `common/mod.rs`.
+
+/// Control: the same recording from a directory with no special character.
+#[test]
+fn test_zsh_records_script_in_plain_directory() {
+    require_zsh!();
+    common::check_records_script_in_dir(&common::ZSH, "plain_dir");
+}
+
+/// A path with a space must reach the writer quoted, so that the trace is
+/// written and carries the exact path.
+#[test]
+fn test_zsh_records_script_path_containing_a_space() {
+    require_zsh!();
+    common::check_records_script_in_dir(&common::ZSH, "my scripts");
+}
+
+/// A tab ends an unquoted value too.
+#[test]
+fn test_zsh_records_script_path_containing_a_tab() {
+    require_zsh!();
+    common::check_records_script_in_dir(&common::ZSH, "tab\tdir");
+}
+
+/// `"` and `\` are the characters the quoted form escapes.
+#[test]
+fn test_zsh_records_script_path_containing_a_quote_and_a_backslash() {
+    require_zsh!();
+    common::check_records_script_in_dir(&common::ZSH, "we\"ird\\dir");
+}
+
+#[test]
+fn test_zsh_records_sourced_file_whose_path_contains_a_space() {
+    require_zsh!();
+    common::check_records_sourced_file_with_space(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_records_function_in_script_whose_path_contains_a_space() {
+    require_zsh!();
+    common::check_records_function_in_dir_with_space(&common::ZSH, "greet", "greet() {", "greet");
+}
+
+/// Zsh, unlike Bash, accepts any function name: one with a space, a `"`
+/// and a `\` must reach the writer whole in `FUNC` and `CALL`.
+#[test]
+fn test_zsh_records_function_whose_name_needs_quoting() {
+    require_zsh!();
+    common::check_records_function_in_dir_with_space(
+        &common::ZSH,
+        r#"my "odd\ func"#,
+        r#"function 'my "odd\ func' {"#,
+        r#"'my "odd\ func'"#,
+    );
+}

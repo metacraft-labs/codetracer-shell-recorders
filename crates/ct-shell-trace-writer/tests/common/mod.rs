@@ -18,6 +18,7 @@ use std::process::{Command, Output};
 
 use codetracer_trace_types::ValueRecord;
 use codetracer_trace_writer_nim::{decode_cbor_value_record, NimTraceReaderHandle};
+use ct_shell_trace_writer::wire_protocol::{parse_line, WireEvent};
 use tempfile::TempDir;
 
 /// The warning the writer prints when the event stream ends without the
@@ -1217,5 +1218,336 @@ pub fn check_script_fd3_does_not_touch_the_trace_channel(shell: &Shell, stem: &s
         var(&vars, "x"),
         "1",
         &format!("{} {stem}: `x` at the last step", shell.interpreter),
+    );
+}
+
+// ============================================================================
+// Paths and function names that need quoting on the wire
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-cannot-record-a-script-whose-path-contains-a-space`.
+// The wire protocol ends an unquoted value at the first whitespace and
+// carries a value with whitespace, `"` or `\` double-quoted, with `\"` and
+// `\\` escapes (module comment of `src/wire_protocol.rs`; spec
+// `Recording-Backends/Shell-Recorder.md`, "Wire Protocol (FD 3)"). A path
+// or a function name is a value like any other: the recorders must quote
+// it, or `START`, `PATH`, `FUNC`, `STEP` and `CALL` fail to parse and no
+// trace is written.
+//
+// Each check writes its scripts into a fresh temporary directory, under a
+// directory whose name carries the characters under test, and records them
+// through the real launcher and the writer built for this test run.
+
+/// A temporary directory holding scripts written by a test, and the
+/// canonical path of its root (the launcher resolves the script's path, so
+/// the expectations must use the resolved form: `/tmp` is a symlink on
+/// macOS).
+pub struct ScriptDir {
+    _dir: TempDir,
+    pub root: PathBuf,
+}
+
+impl ScriptDir {
+    pub fn new() -> Self {
+        let dir = TempDir::new().expect("failed to create temp dir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical temp dir");
+        ScriptDir { _dir: dir, root }
+    }
+
+    /// Write `body` to `<root>/<rel>`, creating its directories, and return
+    /// the file's path.
+    pub fn write(&self, rel: &str, body: &str) -> PathBuf {
+        let path = self.root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create script dir");
+        std::fs::write(&path, body).expect("write script");
+        path
+    }
+}
+
+/// The path of `p` as the wire protocol and the trace carry it.
+fn path_str(p: &Path) -> String {
+    p.to_str().expect("UTF-8 path").to_string()
+}
+
+/// Parse every line of a recorder run's raw event stream with the writer's
+/// own parser, failing on the first line it rejects.
+pub fn parse_stream(shell: &Shell, run: &RecorderRun) -> Vec<WireEvent> {
+    run.events
+        .iter()
+        .enumerate()
+        .map(|(n, line)| {
+            parse_line(line).unwrap_or_else(|e| {
+                panic!(
+                    "{}: event {} does not parse ({e}): {line}\nstream:\n{}",
+                    shell.interpreter,
+                    n + 1,
+                    run.events.join("\n")
+                )
+            })
+        })
+        .collect()
+}
+
+/// Assert that every path in the parsed stream (`START program=`, `PATH`,
+/// `FUNC` and `STEP` `file=`) is one of `expected`, and that `PATH`
+/// registers each of `expected`: a path cut at a special character shows up
+/// as a fragment that is none of them.
+pub fn assert_stream_paths(shell: &Shell, events: &[WireEvent], expected: &[&Path]) {
+    let expected: Vec<String> = expected.iter().map(|p| path_str(p)).collect();
+    let mut registered = Vec::new();
+    for event in events {
+        let path = match event {
+            WireEvent::Start { program, .. } => program,
+            WireEvent::Path { file } => {
+                registered.push(file.clone());
+                file
+            }
+            WireEvent::Func { file, .. } | WireEvent::Step { file, .. } => file,
+            _ => continue,
+        };
+        assert!(
+            expected.contains(path),
+            "{}: {event:?} carries a path that is not one of {expected:?}",
+            shell.interpreter
+        );
+    }
+    for path in &expected {
+        assert!(
+            registered.contains(path),
+            "{}: no PATH event registers {path:?}; registered: {registered:?}",
+            shell.interpreter
+        );
+    }
+}
+
+/// Record `main` through the launcher and assert the recording carries
+/// every path in `sources` (with `main` first) exactly:
+///
+/// - the launcher succeeds, the script prints `expect_stdout`, and the
+///   writer reports no parse error;
+/// - the output directory holds exactly one `.ct`;
+/// - the trace's program is `main`, its path table is exactly `sources`
+///   with `main` first, and every step is in one of them;
+/// - each source is copied to `files/<absolute path>` (`copy_source_files`
+///   in `src/trace_bridge.rs`).
+///
+/// Returns the output directory for further checks.
+pub fn assert_records_exact_paths(
+    shell: &Shell,
+    main: &Path,
+    sources: &[&Path],
+    expect_stdout: &str,
+) -> TempDir {
+    assert_eq!(
+        sources.first(),
+        Some(&main),
+        "main must be the first source"
+    );
+    let main_str = path_str(main);
+    let (out, output) = run_launcher_with_built_writer(shell, main);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{} {main_str:?}: launcher failed: stderr={stderr}",
+        shell.interpreter
+    );
+    assert!(
+        !stderr.contains("parse error"),
+        "writer reported parse errors for {main_str:?}:\n{stderr}"
+    );
+    assert!(
+        stdout.contains(expect_stdout),
+        "{} {main_str:?}: stdout should contain {expect_stdout:?}, got {stdout:?}",
+        shell.interpreter
+    );
+
+    let cts: Vec<PathBuf> = std::fs::read_dir(out.path())
+        .expect("failed to read the output dir")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "ct"))
+        .collect();
+    assert_eq!(
+        cts.len(),
+        1,
+        "{} {main_str:?}: expected exactly one .ct in the output dir, found {cts:?}; stderr={stderr}",
+        shell.interpreter
+    );
+
+    let reader = open_trace(out.path());
+    assert_eq!(reader.program(), main_str, "program differs");
+    let paths: Vec<String> = (0..reader.path_count())
+        .map(|i| reader.path(i).expect("path entry"))
+        .collect();
+    let expected: Vec<String> = sources.iter().map(|p| path_str(p)).collect();
+    assert_eq!(paths, expected, "the trace's path table differs");
+    let steps = reader.step_count();
+    assert!(steps > 0, "{} {main_str:?}: no steps", shell.interpreter);
+    for n in 0..steps {
+        let (path_id, line) = reader.step_location(n).expect("step_location");
+        let path = reader.path(path_id).expect("step path");
+        assert!(
+            expected.contains(&path),
+            "step {n} at {path:?}:{line} is in none of {expected:?}"
+        );
+    }
+    drop(reader);
+
+    for source in sources {
+        let copy = out
+            .path()
+            .join("files")
+            .join(source.strip_prefix("/").unwrap_or(source));
+        assert!(copy.is_file(), "no copy of {source:?} at {copy:?}");
+    }
+    out
+}
+
+/// The shebang line of a script for `shell`.
+fn shebang(shell: &Shell) -> String {
+    format!("#!/usr/bin/env {}\n", shell.interpreter)
+}
+
+/// The issue's reproduction: a three-line script in a directory named
+/// `dir_name` is recorded with its exact path, and the raw stream parses
+/// line by line and names no other path.
+pub fn check_records_script_in_dir(shell: &Shell, dir_name: &str) {
+    let dir = ScriptDir::new();
+    let script = dir.write(
+        &format!("{dir_name}/deploy.{}", shell.fixture_ext),
+        &format!("{}x=1\necho \"ran\"\n", shebang(shell)),
+    );
+    let out = assert_records_exact_paths(shell, &script, &[&script], "ran");
+    let run = run_recorder(shell, &script);
+    let events = parse_stream(shell, &run);
+    assert_stream_paths(shell, &events, &[&script]);
+    let lines: Vec<u64> = step_lines_and_depths(out.path())
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    assert!(
+        lines.contains(&2) && lines.contains(&3),
+        "{}: steps at lines 2 and 3 expected, got {lines:?}",
+        shell.interpreter
+    );
+}
+
+/// A sourced file whose path has a space, from a main script whose path has
+/// none: the sourced file is registered whole, its steps and its function's
+/// `FUNC` event name it, and its function is recorded.
+pub fn check_records_sourced_file_with_space(shell: &Shell) {
+    let dir = ScriptDir::new();
+    let ext = shell.fixture_ext;
+    let lib = dir.write(
+        &format!("lib dir/my lib.{ext}"),
+        &format!(
+            "{}lib_func() {{\n    echo \"from lib\"\n}}\n",
+            shebang(shell)
+        ),
+    );
+    let main = dir.write(
+        &format!("plain_dir/main.{ext}"),
+        &format!(
+            "{}source \"{}\"\nlib_func\necho \"done\"\n",
+            shebang(shell),
+            path_str(&lib)
+        ),
+    );
+
+    let out = assert_records_exact_paths(shell, &main, &[&main, &lib], "from lib");
+    let calls = recorded_calls(out.path());
+    assert_eq!(
+        calls_of(&calls, "lib_func").len(),
+        1,
+        "{}: lib_func should be called once; calls: {calls:?}",
+        shell.interpreter
+    );
+
+    let run = run_recorder(shell, &main);
+    let events = parse_stream(shell, &run);
+    assert_stream_paths(shell, &events, &[&main, &lib]);
+    let lib_str = path_str(&lib);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            WireEvent::Func { name, file, .. } if name == "lib_func" && *file == lib_str
+        )),
+        "{}: no FUNC event for lib_func in {lib_str:?}; stream:\n{}",
+        shell.interpreter,
+        run.events.join("\n")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WireEvent::Step { file, .. } if *file == lib_str)),
+        "{}: no STEP in the sourced file; stream:\n{}",
+        shell.interpreter,
+        run.events.join("\n")
+    );
+}
+
+/// A function defined and called in a script whose path has a space: its
+/// `FUNC` event carries the script's exact path, the `CALL` names it, the
+/// argument with a space arrives whole, and the trace holds the call.
+/// `define` is the definition line, `call` the call, `name` the function's
+/// name as the shell reports it.
+pub fn check_records_function_in_dir_with_space(
+    shell: &Shell,
+    name: &str,
+    define: &str,
+    call: &str,
+) {
+    let dir = ScriptDir::new();
+    let script = dir.write(
+        &format!("my scripts/funcs.{}", shell.fixture_ext),
+        &format!(
+            "{}{define}\n    echo \"hello $1\"\n}}\n{call} \"a b\"\necho \"done\"\n",
+            shebang(shell)
+        ),
+    );
+    let script_str = path_str(&script);
+
+    let out = assert_records_exact_paths(shell, &script, &[&script], "hello a b");
+    let calls = recorded_calls(out.path());
+    assert_calls(&calls, name, 2, &[0]);
+    let lines: Vec<u64> = step_lines_and_depths(out.path())
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    assert!(
+        lines.contains(&3),
+        "{}: the function body (line 3) has no step; steps: {lines:?}",
+        shell.interpreter
+    );
+
+    let run = run_recorder(shell, &script);
+    let events = parse_stream(shell, &run);
+    assert_stream_paths(shell, &events, &[&script]);
+    let funcs: Vec<&WireEvent> = events
+        .iter()
+        .filter(|e| matches!(e, WireEvent::Func { name: n, .. } if n == name))
+        .collect();
+    assert!(
+        matches!(funcs.as_slice(), [WireEvent::Func { file, .. }] if *file == script_str),
+        "{}: expected one FUNC event for {name:?} in {script_str:?}, got {funcs:?}",
+        shell.interpreter
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WireEvent::Call { name: n } if n == name)),
+        "{}: no CALL of {name:?}; stream:\n{}",
+        shell.interpreter,
+        run.events.join("\n")
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            WireEvent::Arg { name: n, value, .. } if n == "$1" && value == "a b"
+        )),
+        "{}: no ARG $1=\"a b\"; stream:\n{}",
+        shell.interpreter,
+        run.events.join("\n")
     );
 }

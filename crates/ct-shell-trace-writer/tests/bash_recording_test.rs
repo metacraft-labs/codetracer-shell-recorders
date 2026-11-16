@@ -957,3 +957,47 @@ fn test_bash_script_redirecting_fd3_keeps_the_trace_channel() {
 fn test_bash_script_closing_fd3_keeps_the_trace_channel() {
     common::check_script_fd3_does_not_touch_the_trace_channel(&common::BASH, "fd3_closed");
 }
+
+// ============================================================================
+// Paths and function names that need quoting on the wire
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-cannot-record-a-script-whose-path-contains-a-space`.
+// The claims are shared with the other shell; see "Paths and function names
+// that need quoting on the wire" in `common/mod.rs`.
+
+/// Control: the same recording from a directory with no special character.
+#[test]
+fn test_bash_records_script_in_plain_directory() {
+    common::check_records_script_in_dir(&common::BASH, "plain_dir");
+}
+
+/// A path with a space must reach the writer quoted, so that the trace is
+/// written and carries the exact path.
+#[test]
+fn test_bash_records_script_path_containing_a_space() {
+    common::check_records_script_in_dir(&common::BASH, "my scripts");
+}
+
+/// A tab ends an unquoted value too.
+#[test]
+fn test_bash_records_script_path_containing_a_tab() {
+    common::check_records_script_in_dir(&common::BASH, "tab\tdir");
+}
+
+/// `"` and `\` are the characters the quoted form escapes.
+#[test]
+fn test_bash_records_script_path_containing_a_quote_and_a_backslash() {
+    common::check_records_script_in_dir(&common::BASH, "we\"ird\\dir");
+}
+
+#[test]
+fn test_bash_records_sourced_file_whose_path_contains_a_space() {
+    common::check_records_sourced_file_with_space(&common::BASH);
+}
+
+#[test]
+fn test_bash_records_function_in_script_whose_path_contains_a_space() {
+    common::check_records_function_in_dir_with_space(&common::BASH, "greet", "greet() {", "greet");
+}
