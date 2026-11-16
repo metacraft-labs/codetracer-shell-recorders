@@ -1064,3 +1064,79 @@ fn e2e_cross_shell_exported_variables() {
     assert_no_inherited_vars(&bash_vars, "bash exported.sh");
     assert_no_inherited_vars(&zsh_vars, "zsh exported.zsh");
 }
+
+// ============================================================================
+// Function return recording
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-never-close-a-function-called-in-command-substitution`.
+// The claims are shared with the other shell; see "Function return
+// recording" in `common/mod.rs`.
+
+#[test]
+fn test_zsh_every_call_in_event_stream_has_a_return() {
+    require_zsh!();
+    // `cmdsubst_loop` calls a function in `$(...)`; the raw stream must close it.
+    common::assert_stream_balanced(&common::ZSH, "cmdsubst_loop");
+}
+
+#[test]
+fn test_zsh_function_in_command_substitution_is_closed() {
+    require_zsh!();
+    common::check_function_in_command_substitution_is_closed(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_function_used_as_condition_records_its_status() {
+    require_zsh!();
+    common::check_function_used_as_condition_records_its_status(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_directly_called_function_return_is_recorded() {
+    require_zsh!();
+    common::check_directly_called_function_return_is_recorded(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_explicit_return_values_are_recorded() {
+    require_zsh!();
+    common::check_explicit_return_values(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_outer_function_returns_inner_status() {
+    require_zsh!();
+    common::check_nested_returns(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_recursion_in_command_substitution_is_closed() {
+    require_zsh!();
+    common::check_recursion_in_command_substitution(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_exit_in_command_substitution_closes_subshell_frames() {
+    require_zsh!();
+    common::check_exit_in_command_substitution(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_main_shell_exit_in_function_writes_no_return() {
+    require_zsh!();
+    common::check_main_shell_exit_in_function_writes_no_return(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_sourced_file_frames_are_closed_once() {
+    require_zsh!();
+    common::check_sourced_file_returns(&common::ZSH, 8);
+}
+
+#[test]
+fn test_zsh_and_list_calls_are_closed() {
+    require_zsh!();
+    common::check_and_list_calls(&common::ZSH);
+}

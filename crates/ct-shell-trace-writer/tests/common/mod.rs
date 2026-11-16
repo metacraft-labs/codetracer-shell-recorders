@@ -526,3 +526,374 @@ pub fn check_nonzero_exit_keeps_trace(shell: &Shell, stem: &str, status: i32, ex
     assert_launcher_records(shell, "simple", 0, 5);
     assert_launcher_records(shell, stem, status, exit_line);
 }
+
+// ============================================================================
+// Function return recording
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-never-close-a-function-called-in-command-substitution`.
+// Spec `Recording-Backends/Shell-Recorder.md`, "Event Mapping": a function
+// that returns produces a `Return` carrying its exit status as an `Int`, and
+// "Subshells and Child Scripts": `$(...)` and `( ... )` are traced. The
+// claims are the same for both shells, so they live here once and each
+// shell's test file calls them.
+
+/// One recorded call: function name, call depth, and the integer return
+/// value (`None` when the frame was closed without an `Int`, which is what
+/// finalisation does to a frame no `RETURN` or `EXIT` event reached).
+#[derive(Debug, Clone)]
+pub struct RecordedCall {
+    pub name: String,
+    pub depth: u64,
+    pub status: Option<i64>,
+}
+
+/// Every call in the trace in `out_dir`, in call-key order.
+pub fn recorded_calls(out_dir: &Path) -> Vec<RecordedCall> {
+    let reader = open_trace(out_dir);
+    (0..reader.call_count())
+        .map(|key| {
+            let json: serde_json::Value =
+                serde_json::from_str(&reader.call_json(key).expect("call_json"))
+                    .expect("call JSON");
+            let bytes: Vec<u8> = json["return_value"]
+                .as_array()
+                .map(|a| a.iter().map(|b| b.as_u64().expect("byte") as u8).collect())
+                .unwrap_or_default();
+            let status = if bytes.is_empty() {
+                None
+            } else {
+                match decode_cbor_value_record(&bytes) {
+                    ValueRecord::Int { i, .. } => Some(i),
+                    _ => None,
+                }
+            };
+            RecordedCall {
+                name: reader
+                    .function(json["function_id"].as_u64().expect("function_id"))
+                    .expect("function name"),
+                depth: json["depth"].as_u64().expect("depth"),
+                status,
+            }
+        })
+        .collect()
+}
+
+/// The calls of `function` among `calls`, in call-key order.
+pub fn calls_of<'a>(calls: &'a [RecordedCall], function: &str) -> Vec<&'a RecordedCall> {
+    calls.iter().filter(|c| c.name == function).collect()
+}
+
+/// Every step of the trace as (line, depth of the call that owns it).
+pub fn step_lines_and_depths(out_dir: &Path) -> Vec<(u64, u64)> {
+    let reader = open_trace(out_dir);
+    (0..reader.step_count())
+        .map(|n| {
+            let (_path, line) = reader.step_location(n).expect("step_location");
+            let call: serde_json::Value =
+                serde_json::from_str(&reader.call_for_step_json(n).expect("call_for_step_json"))
+                    .expect("call JSON");
+            (line, call["depth"].as_u64().expect("depth"))
+        })
+        .collect()
+}
+
+/// Depth of the call that owns the last recorded step.
+pub fn last_step_depth(out_dir: &Path) -> u64 {
+    step_lines_and_depths(out_dir)
+        .last()
+        .expect("the trace has no steps")
+        .1
+}
+
+/// Record `stem` through the launcher, assert it succeeded and that its
+/// output contains `expect_stdout`, and return the output directory.
+pub fn record_ok(shell: &Shell, stem: &str, expect_stdout: &str) -> TempDir {
+    let (out, output) = run_launcher_with_built_writer(shell, &shell.fixture(stem));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{} {stem}: launcher failed: stderr={stderr}",
+        shell.interpreter
+    );
+    assert!(
+        stdout.contains(expect_stdout),
+        "{} {stem}: stdout should contain {expect_stdout:?}, got {stdout:?}",
+        shell.interpreter
+    );
+    assert!(
+        !stderr.contains(MISSING_EXIT_WARNING),
+        "{} {stem}: writer warned of a missing EXIT event: {stderr}",
+        shell.interpreter
+    );
+    out
+}
+
+/// Assert the recorder's raw event stream for `stem` has exactly one
+/// `RETURN` for every `CALL`, and that no `RETURN` closes more than was
+/// opened at any point (each prefix has at least as many CALLs). Returns
+/// the run for further checks.
+pub fn assert_stream_balanced(shell: &Shell, stem: &str) -> RecorderRun {
+    let run = run_recorder(shell, &shell.fixture(stem));
+    let mut open: i64 = 0;
+    for (n, line) in run.events.iter().enumerate() {
+        if line.starts_with("CALL ") {
+            open += 1;
+        } else if line.starts_with("RETURN ") {
+            open -= 1;
+            assert!(
+                open >= 0,
+                "{} {stem}: event {n} ({line}) returns from no open call; stream:\n{}",
+                shell.interpreter,
+                run.events.join("\n")
+            );
+        }
+    }
+    assert_eq!(
+        open,
+        0,
+        "{} {stem}: every function CALL needs exactly one RETURN; stream:\n{}",
+        shell.interpreter,
+        run.events.join("\n")
+    );
+    run
+}
+
+/// Assert every call of `function` sits at `depth` and returns `Int` with
+/// the statuses `statuses`, in order.
+pub fn assert_calls(calls: &[RecordedCall], function: &str, depth: u64, statuses: &[i64]) {
+    let found = calls_of(calls, function);
+    assert_eq!(
+        found.len(),
+        statuses.len(),
+        "expected {} calls of {function}; calls: {calls:?}",
+        statuses.len()
+    );
+    for (n, (call, status)) in found.iter().zip(statuses).enumerate() {
+        assert_eq!(
+            call.depth,
+            depth,
+            "call {} of {function} should be at depth {depth} (a lower frame left open nests it deeper); calls: {calls:?}",
+            n + 1
+        );
+        assert_eq!(
+            call.status,
+            Some(*status),
+            "call {} of {function} should return Int {status}; calls: {calls:?}",
+            n + 1
+        );
+    }
+}
+
+/// The issue's own reproduction: `functions.sh` / `functions.zsh` style
+/// script calling a function in `$(...)` three times in a loop.
+pub fn check_function_in_command_substitution_is_closed(shell: &Shell) {
+    assert_stream_balanced(shell, "cmdsubst_loop");
+    let out = record_ok(shell, "cmdsubst_loop", "last: 6");
+    let calls = recorded_calls(out.path());
+    assert_calls(&calls, "double", 2, &[0, 0, 0]);
+    assert_eq!(
+        last_step_depth(out.path()),
+        1,
+        "the top-level `echo \"last: $r\"` must be recorded at script depth 1, not inside a leaked double frame"
+    );
+    assert_int(
+        &return_of(&call_returns(out.path()), "<script>"),
+        0,
+        "<script> should return the script's exit code",
+    );
+}
+
+/// A function used as a condition records its own status, not the status
+/// of the finished `if` statement.
+pub fn check_function_used_as_condition_records_its_status(shell: &Shell) {
+    assert_stream_balanced(shell, "condition_status");
+    let out = record_ok(shell, "condition_status", "ok");
+    let calls = recorded_calls(out.path());
+    // `check no` returns 1 and is read only by `if`; `check yes` returns 0.
+    assert_calls(&calls, "check", 2, &[1, 0]);
+}
+
+/// Control: the same functions called directly, status read by the next
+/// command. This shape was recorded correctly before the fix too.
+pub fn check_directly_called_function_return_is_recorded(shell: &Shell) {
+    assert_stream_balanced(shell, "direct_calls");
+    let out = record_ok(shell, "direct_calls", "last: 7");
+    let calls = recorded_calls(out.path());
+    assert_calls(&calls, "double", 2, &[0, 0, 0]);
+    assert_calls(&calls, "seven", 2, &[7]);
+    assert_eq!(last_step_depth(out.path()), 1);
+}
+
+/// `return $rc` and `return "$((x + 1))"`: the status is the value of the
+/// argument, whether the call is in `$(...)` or used as a condition, and
+/// statuses above 23 (CBOR's one-byte integers) are read correctly.
+pub fn check_explicit_return_values(shell: &Shell) {
+    assert_stream_balanced(shell, "return_values");
+    let out = record_ok(shell, "return_values", "done");
+    let calls = recorded_calls(out.path());
+    assert_calls(&calls, "rc_of", 2, &[42, 3]);
+    assert_calls(&calls, "plus_one", 2, &[200, 7]);
+    assert_eq!(last_step_depth(out.path()), 1);
+}
+
+/// `outer() { local x=9; inner "$1"; }` with `inner` doing `return $x` on
+/// its own local `x`: `outer` returns `inner`'s status, not the value of
+/// its own `x`, directly, in `$(...)` and as a condition.
+pub fn check_nested_returns(shell: &Shell) {
+    assert_stream_balanced(shell, "nested_returns");
+    let out = record_ok(shell, "nested_returns", "end");
+    let calls = recorded_calls(out.path());
+    assert_calls(&calls, "inner", 3, &[5, 6, 7, 8]);
+    assert_calls(&calls, "outer", 2, &[5, 6, 7]);
+    assert_calls(&calls, "outer1", 2, &[8]);
+    assert_eq!(last_step_depth(out.path()), 1);
+}
+
+/// Recursion through `$(...)`: every level is closed, so each call sits one
+/// level below its caller.
+pub fn check_recursion_in_command_substitution(shell: &Shell) {
+    assert_stream_balanced(shell, "recursion_cmdsubst");
+    let out = record_ok(shell, "recursion_cmdsubst", "fact: 24");
+    let calls = recorded_calls(out.path());
+    let facts = calls_of(&calls, "fact");
+    let depths: Vec<u64> = facts.iter().map(|c| c.depth).collect();
+    assert_eq!(depths, vec![2, 3, 4, 5], "calls: {calls:?}");
+    for c in &facts {
+        assert_eq!(c.status, Some(0), "calls: {calls:?}");
+    }
+    assert_eq!(last_step_depth(out.path()), 1);
+}
+
+/// `exit` inside a function in `$(...)` ends only the subshell: the frames
+/// the subshell opened are closed with the exit status, the parent goes on
+/// at script depth, and the script's own exit is unaffected. The same for a
+/// subshell that `set -e` ends inside a function.
+pub fn check_exit_in_command_substitution(shell: &Shell) {
+    let run = assert_stream_balanced(shell, "exit_in_cmdsubst");
+    let exits: Vec<&String> = run
+        .events
+        .iter()
+        .filter(|l| l.starts_with("EXIT "))
+        .collect();
+    assert_eq!(
+        exits,
+        vec!["EXIT code=0"],
+        "stream:\n{}",
+        run.events.join("\n")
+    );
+    let out = record_ok(shell, "exit_in_cmdsubst", "after: bailing bailing");
+    let calls = recorded_calls(out.path());
+    let bails = calls_of(&calls, "bail");
+    assert_eq!(bails.len(), 2, "calls: {calls:?}");
+    assert_eq!(
+        (bails[0].depth, bails[0].status),
+        (2, Some(3)),
+        "calls: {calls:?}"
+    );
+    assert_eq!(
+        (bails[1].depth, bails[1].status),
+        (3, Some(3)),
+        "calls: {calls:?}"
+    );
+    assert_calls(&calls, "wrap", 2, &[3]);
+    assert_calls(&calls, "fails", 2, &[1]);
+    // `quick() { builtin exit 5; }`: the `exit` is the first command the
+    // function runs, so it is seen together with the CALL.
+    assert_calls(&calls, "quick", 2, &[5]);
+    assert_eq!(last_step_depth(out.path()), 1);
+    assert_int(
+        &return_of(&call_returns(out.path()), "<script>"),
+        0,
+        "<script> of exit_in_cmdsubst",
+    );
+}
+
+/// `exit` inside a function in the recorder's own shell writes no `RETURN`
+/// for that function: the `EXIT` event closes it, with the exit status
+/// (spec "Script Exit"). Both after another command of the function and as
+/// its first command.
+pub fn check_main_shell_exit_in_function_writes_no_return(shell: &Shell) {
+    for stem in ["exit_in_function", "exit_first_in_function"] {
+        assert_main_shell_exit_writes_no_return(shell, stem);
+    }
+}
+
+fn assert_main_shell_exit_writes_no_return(shell: &Shell, stem: &str) {
+    let run = run_recorder(shell, &shell.fixture(stem));
+    assert!(
+        run.events.iter().any(|l| l == "CALL name=die"),
+        "stream:\n{}",
+        run.events.join("\n")
+    );
+    let returns: Vec<&String> = run
+        .events
+        .iter()
+        .filter(|l| l.starts_with("RETURN "))
+        .collect();
+    assert!(
+        returns.is_empty(),
+        "{} {stem}: `exit` in the main shell must leave `die` to the EXIT event; stream:\n{}",
+        shell.interpreter,
+        run.events.join("\n")
+    );
+    assert_eq!(
+        run.events.last().map(String::as_str),
+        Some("EXIT code=4"),
+        "{} {stem}",
+        shell.interpreter
+    );
+}
+
+/// Sourced files: a sourced file with commands that ends with `return 5`,
+/// and a file holding only a function definition, sourced from inside a
+/// function. Every opened frame is closed exactly once, the enclosing
+/// function at its real end: its last step is still inside it.
+pub fn check_sourced_file_returns(shell: &Shell, main_end_line: u64) {
+    assert_stream_balanced(shell, "source_returns");
+    let out = record_ok(shell, "source_returns", "top end");
+    let calls = recorded_calls(out.path());
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.status.is_some() || c.name == "<toplevel>"),
+        "every frame must be closed with an Int; calls: {calls:?}"
+    );
+    // The sourced file's own frame: bash names it `source`, zsh by its path.
+    let lib = format!("source_returns_lib.{}", shell.fixture_ext);
+    let lib_frames: Vec<&RecordedCall> = calls
+        .iter()
+        .filter(|c| c.depth == 2 && (c.name == "source" || c.name.ends_with(&lib)))
+        .collect();
+    assert_eq!(lib_frames.len(), 1, "calls: {calls:?}");
+    assert_eq!(
+        lib_frames[0].status,
+        Some(5),
+        "the sourced file ends with `return 5`; calls: {calls:?}"
+    );
+    assert_calls(&calls, "helper", 3, &[0]);
+    assert_calls(&calls, "main", 2, &[0]);
+    assert_calls(&calls, "libf", 3, &[0]);
+    let steps = step_lines_and_depths(out.path());
+    // The fixtures are the script plus two libraries, so a line number alone
+    // is ambiguous; the `echo "main end"` line is one only the script has.
+    let main_end: Vec<&(u64, u64)> = steps.iter().filter(|(l, _)| *l == main_end_line).collect();
+    assert!(
+        !main_end.is_empty() && main_end.iter().all(|(_, d)| *d == 2),
+        "`echo \"main end\"` (line {main_end_line}) must be recorded inside main (depth 2); steps: {steps:?}"
+    );
+    assert_eq!(last_step_depth(out.path()), 1, "steps: {steps:?}");
+}
+
+/// `g && h`: both functions of an AND list are recorded and closed (zsh
+/// runs one `DEBUG` trap for the whole list, so no trap follows `g`).
+pub fn check_and_list_calls(shell: &Shell) {
+    assert_stream_balanced(shell, "and_list");
+    let out = record_ok(shell, "and_list", "end");
+    let calls = recorded_calls(out.path());
+    assert_calls(&calls, "g", 2, &[0]);
+    assert_calls(&calls, "h", 2, &[0]);
+    assert_eq!(last_step_depth(out.path()), 1);
+}

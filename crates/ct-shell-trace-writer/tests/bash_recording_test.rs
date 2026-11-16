@@ -808,3 +808,68 @@ fn e2e_bash_metadata() {
         meta_program
     );
 }
+
+// ============================================================================
+// Function return recording
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-never-close-a-function-called-in-command-substitution`.
+// The claims are shared with the other shell; see "Function return
+// recording" in `common/mod.rs`.
+
+#[test]
+fn test_bash_every_call_in_event_stream_has_a_return() {
+    // `functions` calls a function in `$(...)`; the raw stream must close it.
+    common::assert_stream_balanced(&common::BASH, "functions");
+}
+
+#[test]
+fn test_bash_function_in_command_substitution_is_closed() {
+    common::check_function_in_command_substitution_is_closed(&common::BASH);
+}
+
+#[test]
+fn test_bash_function_used_as_condition_records_its_status() {
+    common::check_function_used_as_condition_records_its_status(&common::BASH);
+}
+
+#[test]
+fn test_bash_directly_called_function_return_is_recorded() {
+    common::check_directly_called_function_return_is_recorded(&common::BASH);
+}
+
+#[test]
+fn test_bash_explicit_return_values_are_recorded() {
+    common::check_explicit_return_values(&common::BASH);
+}
+
+#[test]
+fn test_bash_outer_function_returns_inner_status() {
+    common::check_nested_returns(&common::BASH);
+}
+
+#[test]
+fn test_bash_recursion_in_command_substitution_is_closed() {
+    common::check_recursion_in_command_substitution(&common::BASH);
+}
+
+#[test]
+fn test_bash_exit_in_command_substitution_closes_subshell_frames() {
+    common::check_exit_in_command_substitution(&common::BASH);
+}
+
+#[test]
+fn test_bash_main_shell_exit_in_function_writes_no_return() {
+    common::check_main_shell_exit_in_function_writes_no_return(&common::BASH);
+}
+
+#[test]
+fn test_bash_sourced_file_frames_are_closed_once() {
+    common::check_sourced_file_returns(&common::BASH, 8);
+}
+
+#[test]
+fn test_bash_and_list_calls_are_closed() {
+    common::check_and_list_calls(&common::BASH);
+}

@@ -33,10 +33,157 @@ _ct_registered_paths[$_ct_target_script]=1
 # Track which functions we've already registered
 typeset -A _ct_registered_funcs
 
-# Previous funcstack depth.
+# Previous funcstack depth, or the caller's depth after a function's EXIT
+# trap closed its frame. A DEBUG trap deeper than this is the first command
+# of a new frame: a CALL.
 # When we source the target script, funcstack will have the script as depth 1.
 # At top-level (before source), depth is 0.
 _ct_prev_depth=0
+
+# ---------------------------------------------------------------------------
+# Open frames
+# ---------------------------------------------------------------------------
+# One entry per frame the recorder wrote a CALL for and has not yet written
+# the RETURN for, innermost last: its funcstack depth, and its kind, `f` for
+# a function and `s` for a sourced file. Every RETURN pops one entry, so the
+# event stream holds exactly one RETURN per CALL.
+#
+# Zsh has no RETURN trap. A function's frame is closed by an EXIT trap the
+# DEBUG trap sets inside the function when it writes the CALL: "If sig is 0
+# or EXIT and the trap statement is executed inside the body of a function,
+# then the command arg is executed after the function completes", with `$?`
+# the function's return status, in the function's own shell, subshell or
+# not. So a function called in `$(...)` or used as a condition is closed
+# with its own status. A sourced file's frame, and a function whose EXIT trap
+# the script replaced, is closed by the first DEBUG trap shallower than it.
+# See: https://zsh.sourceforge.io/Doc/Release/Shell-Builtin-Commands.html#index-trap
+#      https://zsh.sourceforge.io/Doc/Release/Functions.html#Trap-Functions
+typeset -a _ct_frame_depths _ct_frame_kinds
+
+# A function's EXIT trap also runs when `exit` unwinds the function, with `$?`
+# not yet the exit status. When the DEBUG trap saw an `exit` in the command
+# it ran (`_ct_exit_suspect`), the trap's RETURN is held here, as
+# "<frame position>:<status>", until it is known whether the shell exits:
+# the next DEBUG or ZERR trap writes the held RETURNs (the shell went on),
+# and the zshexit hook decides for an exit. `_ct_exit_suspect_size` is the
+# number of frames open when the `exit` was seen: frames at or below that
+# position are the ones `exit` unwinds.
+typeset -a _ct_held_returns
+_ct_exit_suspect=0
+_ct_exit_suspect_size=0
+
+# An `exit` among the commands of a list: at its start or after `;`, `&`,
+# `|`, `(`, `{`, `then`, `else` or `do`, optionally spelled `builtin exit`
+# or `command exit`. Zsh runs the DEBUG trap once for a whole list
+# (`[[ $x ]] || exit 3`), so ZSH_DEBUG_CMD is the list.
+_ct_exit_re='(^|[;&|({]|then|else|do)[[:space:]]*((builtin|command)[[:space:]]+)?exit([[:space:];)}]|$)'
+
+# Whether the command $1 may run `exit`: it matches `_ct_exit_re` once its
+# quoted strings are removed (`echo "done; exit"` runs no `exit`). Returns 0
+# when it may.
+_ct_mentions_exit() {
+    setopt localoptions extendedglob
+    local _ct_text="$1"
+    _ct_text="${_ct_text//\'[^\']#\'/}"
+    _ct_text="${_ct_text//\"[^\"]#\"/}"
+    [[ "$_ct_text" =~ $_ct_exit_re ]]
+}
+
+# The subshell level the frame arrays belong to, and how many of their
+# entries it inherited from its parent. Updated by the first DEBUG trap of a
+# subshell. `_ct_subshell_closed` is set once a subshell that exits has
+# closed its frames.
+_ct_frames_subshell=0
+_ct_subshell_base=0
+_ct_subshell_closed=0
+
+# Write a RETURN for the innermost open frame with status $1 and pop it.
+_ct_pop_frame() {
+    _ct_frame_depths[-1]=()
+    _ct_frame_kinds[-1]=()
+    printf 'RETURN status=%d\n' "$1" >&3
+}
+
+# Close every open frame deeper than funcstack depth $1 with status $2: the
+# stack is shallower than they are, so they are gone.
+_ct_close_frames_deeper_than() {
+    while (( ${#_ct_frame_depths} > 0 && _ct_frame_depths[-1] > $1 )); do
+        _ct_pop_frame "$2"
+    done
+}
+
+# Write every held RETURN with its own status: the shell did not exit.
+_ct_flush_held_returns() {
+    local _ct_entry
+    for _ct_entry in "${_ct_held_returns[@]}"; do
+        printf 'RETURN status=%d\n' "${_ct_entry#*:}" >&3
+    done
+    _ct_held_returns=()
+    _ct_exit_suspect=0
+}
+
+# The EXIT trap of a function frame: the function completed with status $1,
+# and the caller is at funcstack depth $2. Set by the DEBUG trap with the
+# CALL; runs in the function's own shell, after the function's frame left
+# funcstack.
+_ct_function_returned() {
+    (( _ct_exit_emitted || _ct_subshell_closed )) && return 0
+    local _ct_n=${#_ct_frame_depths}
+    (( _ct_n > 0 )) || return 0
+    [[ "${_ct_frame_kinds[-1]}" == f ]] || return 0
+    (( _ct_frame_depths[-1] == $2 + 1 )) || return 0
+    _ct_frame_depths[-1]=()
+    _ct_frame_kinds[-1]=()
+    _ct_prev_depth=$2
+    # The status is the function's own: a ZERR status saved for the
+    # depth-decrease fallback does not apply to it.
+    _ct_had_error=0
+    # Only a frame that was open when the `exit` was seen can be unwound by
+    # it; one opened since has returned.
+    if (( _ct_exit_suspect && _ct_n <= _ct_exit_suspect_size )); then
+        _ct_held_returns+=("$_ct_n:$1")
+    else
+        printf 'RETURN status=%d\n' "$1" >&3
+    fi
+}
+
+# Close, in a subshell that exits with status $1, the frames it opened: the
+# RETURNs held while an `exit` was pending (the frames `exit` unwound get
+# the exit status, frames that returned before it their own), then every
+# frame still open above the subshell's base. The parent then goes on at
+# the depth it had. Only a subshell whose DEBUG trap recorded its base owns
+# the frames above it.
+_ct_close_subshell_frames() {
+    (( _ct_subshell_closed )) && return 0
+    (( _ct_frames_subshell == ZSH_SUBSHELL )) || return 0
+    _ct_subshell_closed=1
+    local _ct_entry _ct_code=$(( $1 & 255 ))
+    for _ct_entry in "${_ct_held_returns[@]}"; do
+        if (( ${_ct_entry%%:*} <= _ct_exit_suspect_size )); then
+            printf 'RETURN status=%d\n' "$_ct_code" >&3
+        else
+            printf 'RETURN status=%d\n' "${_ct_entry#*:}" >&3
+        fi
+    done
+    _ct_held_returns=()
+    while (( ${#_ct_frame_depths} > _ct_subshell_base )); do
+        _ct_pop_frame "$_ct_code"
+    done
+}
+
+# Before the EXIT event of the recorder's own shell: the held RETURNs of
+# frames that returned before the `exit` are written; the frames `exit`
+# unwound are left to the EXIT event, which closes every open frame with
+# the exit status (spec "Script Exit").
+_ct_flush_held_returns_before_exit() {
+    local _ct_entry
+    for _ct_entry in "${_ct_held_returns[@]}"; do
+        if (( ${_ct_entry%%:*} > _ct_exit_suspect_size )); then
+            printf 'RETURN status=%d\n' "${_ct_entry#*:}" >&3
+        fi
+    done
+    _ct_held_returns=()
+}
 
 # Store the recorder script path so we can filter it out. funcsourcetrace
 # names this file by the path it was run as, which is relative when the
@@ -109,7 +256,15 @@ _ct_emit_exit() {
 # free for the script's own use.
 # See: https://zsh.sourceforge.io/Doc/Release/Functions.html#Hook-Functions
 _ct_zshexit_hook() {
-    _ct_emit_exit "$?"
+    local _ct_code=$?
+    if (( ZSH_SUBSHELL > 0 )); then
+        # `exit` in a subshell ends only the subshell, inside whatever
+        # functions it was in.
+        _ct_close_subshell_frames "$_ct_code"
+    elif (( ! _ct_exit_emitted )); then
+        _ct_flush_held_returns_before_exit
+    fi
+    _ct_emit_exit "$_ct_code"
 }
 # Registered before the variable baseline below, so that the recorder's own
 # `zshexit_functions` entry is not reported as a variable of the script.
@@ -304,15 +459,30 @@ trap '
                 _ct_registered_paths[$_ct_file]=1
             fi
 
-            # Detect function return: depth decreased compared to previous trap invocation.
-            # If the ZERR trap fired (for non-zero return), use its saved status
-            # since $? may have been clobbered by ZERR trap commands.
-            if (( _ct_depth < _ct_prev_depth )); then
+            # The shell went on, so nothing held for a pending `exit` exits.
+            if (( ${#_ct_held_returns} > 0 || _ct_exit_suspect )); then
+                _ct_flush_held_returns
+            fi
+
+            # The first DEBUG trap of a subshell: the frames already open
+            # belong to the parent, which closes them; this subshell closes
+            # those it opens.
+            if (( ZSH_SUBSHELL != _ct_frames_subshell )); then
+                _ct_frames_subshell=$ZSH_SUBSHELL
+                _ct_subshell_base=${#_ct_frame_depths}
+                _ct_subshell_closed=0
+            fi
+
+            # Frames deeper than this command are gone: a sourced file that
+            # finished, or a function whose EXIT trap the script replaced.
+            # If the ZERR trap fired (for a non-zero return), use its saved
+            # status since $? may have been clobbered by ZERR trap commands.
+            if (( ${#_ct_frame_depths} > 0 && _ct_frame_depths[-1] > _ct_depth )); then
                 if (( _ct_had_error )); then
-                    printf '\''RETURN status=%d\n'\'' "$_ct_last_error_status" >&3
+                    _ct_close_frames_deeper_than "$_ct_depth" "$_ct_last_error_status"
                     _ct_had_error=0
                 else
-                    printf '\''RETURN status=%d\n'\'' "$_ct_trap_status" >&3
+                    _ct_close_frames_deeper_than "$_ct_depth" "$_ct_trap_status"
                 fi
             fi
 
@@ -320,6 +490,11 @@ trap '
             # At depth >= 2, funcstack[1] is a function name
             if (( _ct_depth > _ct_prev_depth && _ct_depth >= 2 )); then
                 _ct_func_name="${funcstack[1]}"
+
+                # A frame still open at this depth or deeper is gone: its
+                # EXIT trap never ran. Closed before the ARG events, which
+                # belong to the CALL below.
+                _ct_close_frames_deeper_than $(( _ct_depth - 1 )) "$_ct_trap_status"
 
                 # Register function if first time seen
                 # Use the definition line from funcsourcetrace
@@ -344,6 +519,31 @@ trap '
 
                 # Emit CALL event (drains the ARG events staged above)
                 printf '\''CALL name=%s\n'\'' "$_ct_func_name" >&3
+
+                # Open the frame. A function frame gets the EXIT trap that
+                # closes it (see "Open frames"); set here, before the
+                # function runs its first command, and so before any EXIT
+                # trap of the function itself, which replaces it. A sourced
+                # file is not a function: an EXIT trap set there would be
+                # the EXIT trap of the shell itself.
+                if [[ "${zsh_eval_context[-2]}" == shfunc ]]; then
+                    _ct_frame_depths+=($_ct_depth)
+                    _ct_frame_kinds+=(f)
+                    trap '\''_ct_function_returned $? ${#funcstack}'\'' EXIT
+                else
+                    _ct_frame_depths+=($_ct_depth)
+                    _ct_frame_kinds+=(s)
+                fi
+            fi
+
+            # An `exit` in this command may unwind functions: hold the
+            # RETURNs their EXIT traps write until it is known whether the
+            # shell exits. Counted after the CALL above, so that a function
+            # whose first command is the `exit` (`f() { exit 3 }`) is among
+            # the frames it unwinds.
+            if _ct_mentions_exit "$_ct_cmd"; then
+                _ct_exit_suspect=1
+                _ct_exit_suspect_size=${#_ct_frame_depths}
             fi
 
             _ct_prev_depth=$_ct_depth
@@ -374,6 +574,10 @@ trap '
 
         # Skip errors at depth 0 (recorder level)
         if (( _ct_zerr_depth >= 1 )); then
+            # The shell went on, so nothing held for a pending `exit` exits.
+            if (( ${#_ct_held_returns} > 0 || _ct_exit_suspect )); then
+                _ct_flush_held_returns
+            fi
             _ct_zerr_cmd="$_ct_last_cmd"
             _ct_inline_quote "$_ct_zerr_cmd"
             printf '\''ERROR cmd=%s status=%d\n'\'' "$_ct_qv" "$_ct_zerr_status" >&3
@@ -385,7 +589,12 @@ trap '
             # "normal" exit), so this is the last point to write EXIT. ZERR
             # runs only where ERR_EXIT applies, so the exit is certain.
             # See: https://zsh.sourceforge.io/Doc/Release/Options.html#index-ERREXIT
+            # A subshell ends there inside whatever functions it is in, and
+            # runs no zshexit hook either: close the frames it opened.
             if [[ -o errexit ]]; then
+                if (( ZSH_SUBSHELL > 0 )); then
+                    _ct_close_subshell_frames "$_ct_zerr_status"
+                fi
                 _ct_emit_exit "$_ct_zerr_status"
             fi
         fi
