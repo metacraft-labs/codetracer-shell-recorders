@@ -82,6 +82,46 @@ _ct_inline_quote() {
     fi
 }
 
+# Make a source file's path absolute: sets `_ct_ap`.
+#
+# zsh reports a sourced file in funcsourcetrace by the path it was opened
+# by: `./helpers.zsh` for `source ./helpers.zsh`, `../bin/h.zsh` for
+# `source h.zsh` found through a `path` entry `../bin`. Such a path names
+# the file only in the working directory the script had at that moment,
+# and the trace writer copies sources after the script has ended, from its
+# own directory. So the DEBUG trap calls this for a file the first time it
+# sees it, while `$PWD` is still the directory the path is relative to,
+# and every event carries the result (spec
+# `Recording-Backends/Shell-Recorder.md`, "Wire Protocol (FD 3)";
+# codetracer-pm issue
+# `2026-11-15-shell-recorders-record-a-relatively-sourced-file-by-its-relative-path-and-may-not-copy-it`).
+#
+# The same form as the main script's above: joined to the logical `$PWD`,
+# then normalised lexically by `:a`, which drops empty and `.` components
+# and lets `..` remove the component before it. `:a` leaves a `..` above
+# `/` as a leading `//` (`/a/../../x` becomes `//x`), which a second `:a`
+# folds, so the result matches the bash recorder's `_ct_absolute_path`.
+# See: https://zsh.sourceforge.io/Doc/Release/Expansion.html#Modifiers
+#
+# The system resolves a `..` that follows a symlinked directory from the
+# link's target instead, so there the folded path names another file than
+# the one zsh opened, or none (`${0:h}/../lib/x.zsh` for a script in a
+# symlinked `bin`). When the joined path names an existing file that the
+# folded one is not (`-ef`), the joined path is kept as it is, as the bash
+# recorder does.
+_ct_absolute_path() {
+    local _ct_joined="$1"
+    [[ "$_ct_joined" == /* ]] || _ct_joined="${PWD-}/$_ct_joined"
+    _ct_ap="${${_ct_joined:a}:a}"
+    if [[ -e "$_ct_joined" && ! "$_ct_ap" -ef "$_ct_joined" ]]; then
+        _ct_ap="$_ct_joined"
+    fi
+}
+# Declared here, global, so that setting it in the DEBUG trap, which runs in
+# the scope of whatever function the script is in, creates no global there
+# (and draws no warning under WARN_CREATE_GLOBAL).
+_ct_ap=""
+
 # Emit START event
 _ct_inline_quote "$_ct_target_script"
 _ct_target_script_q=$_ct_qv
@@ -91,10 +131,22 @@ printf 'START program=%s shell=zsh shell_version=%s\n' "$_ct_target_script_q" "$
 # Register the main script path
 printf 'PATH file=%s\n' "$_ct_target_script_q" >&$_ct_events_fd
 
-# The source files already registered, each mapped to its quoted form for
-# the PATH, FUNC and STEP events
+# The source files already registered, by the path funcsourcetrace
+# reports, each mapped to the quoted form of its absolute path for the
+# PATH, FUNC and STEP events (see `_ct_absolute_path`). Keyed by the
+# reported string because that is all a later step offers: a function
+# keeps the funcsourcetrace entry it was defined with, and a step in it
+# after another `cd` must map to the path fixed when the file was first
+# seen. The same key makes one limit inherent: two different files
+# reported by the same relative string from different directories cannot
+# be told apart, and both are recorded as the first one.
 typeset -A _ct_registered_paths
 _ct_registered_paths[$_ct_target_script]=$_ct_target_script_q
+
+# The absolute paths a PATH event has registered: two reported strings for
+# one file (`./h.zsh`, and `h.zsh` after a `cd`) register it once.
+typeset -A _ct_emitted_paths
+_ct_emitted_paths[$_ct_target_script]=1
 
 # The functions already registered, each mapped to its quoted name for the
 # FUNC and CALL events
@@ -1068,14 +1120,21 @@ _ct_debug_action='
             # of the script, never one of the recorder or the shim.
             _ct_last_cmd="$_ct_cmd"
 
-            # Register new source files
-            # (and keep the quoted path for the events below; see
-            # `_ct_inline_quote`; `-` keeps an unknown, empty file from
-            # failing when the script sets NO_UNSET)
+            # Register new source files by their absolute path, resolved
+            # now, while the working directory is the one a relative path
+            # is relative to (and keep the quoted path for the events
+            # below; see `_ct_absolute_path` and `_ct_inline_quote`; `-`
+            # keeps an unknown, empty file from failing when the script
+            # sets NO_UNSET). The recorder-file filter above compares the
+            # raw string.
             if [[ -n "$_ct_file" ]] && (( ! ${+_ct_registered_paths[$_ct_file]} )); then
-                _ct_inline_quote "$_ct_file"
+                _ct_absolute_path "$_ct_file"
+                _ct_inline_quote "$_ct_ap"
                 _ct_registered_paths[$_ct_file]=$_ct_qv
-                printf '\''PATH file=%s\n'\'' "$_ct_qv" >&$_ct_events_fd
+                if (( ! ${+_ct_emitted_paths[$_ct_ap]} )); then
+                    _ct_emitted_paths[$_ct_ap]=1
+                    printf '\''PATH file=%s\n'\'' "$_ct_qv" >&$_ct_events_fd
+                fi
             fi
             _ct_file_q="${_ct_registered_paths[$_ct_file]-}"
 

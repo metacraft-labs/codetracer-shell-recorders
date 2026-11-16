@@ -84,6 +84,125 @@ _ct_quote_value() {
     printf '%s' "$_ct_qv"
 }
 
+# Make a source file's path absolute, without a subshell: sets `_ct_ap`.
+#
+# Bash reports a sourced file in BASH_SOURCE by the path it was opened by:
+# `./helpers.sh` for `source ./helpers.sh`, `../bin/h.sh` for `source h.sh`
+# found through a `PATH` entry `../bin`. Such a path names the file only in
+# the working directory the script had at that moment, and the trace writer
+# copies sources after the script has ended, from its own directory. So
+# the DEBUG trap resolves a file the first time it sees it, against the
+# directory the path is relative to (`_ct_resolve_source_file`), and every
+# event carries the result (spec `Recording-Backends/Shell-Recorder.md`, "Wire
+# Protocol (FD 3)"; codetracer-pm issue
+# `2026-11-15-shell-recorders-record-a-relatively-sourced-file-by-its-relative-path-and-may-not-copy-it`).
+#
+# The path is joined to the logical `$PWD` and normalised lexically: empty
+# and `.` components are dropped and `..` removes the component before it
+# (and nothing at `/`). That is the form the main script gets from the
+# logical `cd "$(dirname ...)" && pwd` above, so the same file reached both
+# ways is one path; it is also what `cd` does to `..`.
+# See: https://www.gnu.org/software/bash/manual/html_node/Bourne-Shell-Builtins.html#index-cd
+#
+# The system resolves a `..` that follows a symlinked directory from the
+# link's target instead, so there the folded path names another file than
+# the one Bash opened, or none (`$(dirname "$0")/../lib/x.sh` for a script
+# in a symlinked `bin`). When the joined path names an existing file that
+# the folded one is not (`-ef`, a stat of each, no fork), the joined path
+# is kept as it is: absolute, and naming the file Bash opened.
+#
+# It runs inside the DEBUG trap, so it forks nothing (no `$(...)`, which
+# `functrace` would also trace), uses only quoted parameter expansions and
+# `case` (unaffected by the script's IFS, `noglob`, `extglob` or
+# `nocasematch`), and reads `$PWD` with a default for a script under
+# `set -u` that unset it; without a working directory a relative path is
+# left as it is.
+_ct_absolute_path() {
+    local _ct_rest="$1" _ct_comp="" _ct_out="" _ct_joined
+    if [[ "$_ct_rest" != /* ]]; then
+        if [[ -z "${PWD:-}" ]]; then
+            _ct_ap="$_ct_rest"
+            return 0
+        fi
+        _ct_rest="$PWD/$_ct_rest"
+    fi
+    _ct_joined="$_ct_rest"
+    while [[ -n "$_ct_rest" ]]; do
+        _ct_comp="${_ct_rest%%/*}"
+        if [[ "$_ct_rest" == */* ]]; then
+            _ct_rest="${_ct_rest#*/}"
+        else
+            _ct_rest=""
+        fi
+        case "$_ct_comp" in
+            "" | .) ;;
+            ..) _ct_out="${_ct_out%/*}" ;;
+            *) _ct_out="$_ct_out/$_ct_comp" ;;
+        esac
+    done
+    _ct_ap="${_ct_out:-/}"
+    if [[ -e "$_ct_joined" && ! "$_ct_ap" -ef "$_ct_joined" ]]; then
+        _ct_ap="$_ct_joined"
+    fi
+}
+
+# The working directories `source` and `.` commands ran in, newest last,
+# each once: `_ct_source_dirs` holds them by the order they were last used
+# (a sparse array; `_ct_source_dir_index` maps a directory to its index,
+# and `_ct_source_dir_next` is the next index to use).
+#
+# Bash runs no DEBUG trap for a function definition, so a sourced file that
+# only defines functions is first seen when one of them is called, and by
+# then the script may have changed directory again. Its relative path is
+# then resolved against the directory of the newest `source` command it
+# names a file from (`_ct_resolve_source_file`).
+_ct_source_dirs=()
+declare -A _ct_source_dir_index
+_ct_source_dir_next=0
+
+# Remember `$PWD` as the directory of a `source` or `.` command the DEBUG
+# trap is about to run. A glob, not `=~`, which would change the script's
+# BASH_REMATCH; one that also matches a command that only starts with one
+# of these words just adds a directory to try.
+_ct_note_source_dir() {
+    case "$1" in
+        source[[:space:]]* | .[[:space:]]* | builtin[[:space:]]* | command[[:space:]]*) ;;
+        *) return 0 ;;
+    esac
+    local _ct_dir="${PWD:-}"
+    [[ -n "$_ct_dir" ]] || return 0
+    local _ct_old="${_ct_source_dir_index[$_ct_dir]:-}"
+    if [[ -n "$_ct_old" ]]; then
+        (( _ct_old == _ct_source_dir_next - 1 )) && return 0
+        unset "_ct_source_dirs[$_ct_old]"
+    fi
+    _ct_source_dirs[_ct_source_dir_next]=$_ct_dir
+    _ct_source_dir_index["$_ct_dir"]=$_ct_source_dir_next
+    _ct_source_dir_next=$(( _ct_source_dir_next + 1 ))
+}
+
+# The absolute path of the source file BASH_SOURCE reports as $1, seen for
+# the first time in a frame named $2: sets `_ct_ap`.
+#
+# In the file's own `source` frame its first command has not run yet, so
+# `$PWD` is the directory `source` opened it in. Anywhere else (a function
+# of a file that only defines functions) the file was opened by an earlier
+# `source`, and the newest directory of one in which the path names a
+# regular file is taken; when there is none, `$PWD`.
+_ct_resolve_source_file() {
+    if [[ "$1" != /* && "$2" != source ]]; then
+        local _ct_i
+        for (( _ct_i = _ct_source_dir_next - 1; _ct_i >= 0; _ct_i-- )); do
+            [[ -n "${_ct_source_dirs[_ct_i]+x}" ]] || continue
+            if [[ -f "${_ct_source_dirs[_ct_i]}/$1" ]]; then
+                _ct_absolute_path "${_ct_source_dirs[_ct_i]}/$1"
+                return 0
+            fi
+        done
+    fi
+    _ct_absolute_path "$1"
+}
+
 # Emit START event
 _ct_inline_quote "$_ct_target_script"
 _ct_target_script_q=$_ct_qv
@@ -93,10 +212,25 @@ printf 'START program=%s shell=bash shell_version=%s\n' "$_ct_target_script_q" "
 # Register the main script path
 printf 'PATH file=%s\n' "$_ct_target_script_q" >&"$_ct_events_fd"
 
-# The source files already registered, each mapped to its quoted form for
-# the PATH, FUNC and STEP events
+# The source files already registered, by the path BASH_SOURCE reports,
+# each mapped to the quoted form of its absolute path for the PATH, FUNC
+# and STEP events (see `_ct_resolve_source_file`). Keyed by the reported
+# string because that is all a later step offers: a function keeps the
+# BASH_SOURCE it was defined with, and a step in it after another `cd`
+# must map to the path fixed when the file was first seen. The same key
+# makes one limit inherent: two different files reported by the same
+# relative string from different directories cannot be told apart, and
+# both are recorded as the first one resolved. A file that only defines
+# functions has a second, narrower one: it is resolved against the newest
+# `source` directory that has a file by that relative path, which is
+# another file when a newer `source` ran where one by that name exists.
 declare -A _ct_registered_paths
 _ct_registered_paths["$_ct_target_script"]=$_ct_target_script_q
+
+# The absolute paths a PATH event has registered: two reported strings for
+# one file (`./h.sh`, and `h.sh` after a `cd`) register it once.
+declare -A _ct_emitted_paths
+_ct_emitted_paths["$_ct_target_script"]=1
 
 # The functions already registered, each mapped to its quoted name for the
 # FUNC and CALL events
@@ -468,13 +602,21 @@ _ct_debug_trap() {
     [[ "$_ct_file" == "" ]] && return 0
     (( _ct_in_return_trap )) && return 0
 
-    # Register new source files, and keep the quoted path for the events
-    # below (see `_ct_inline_quote`)
-    local _ct_qv
+    # Register new source files by their absolute path, resolved against
+    # the working directory the file was opened in (see
+    # `_ct_resolve_source_file`), and keep the quoted path for the events
+    # below (see `_ct_inline_quote`). The filters above compare the raw
+    # string.
+    _ct_note_source_dir "$BASH_COMMAND"
+    local _ct_qv _ct_ap
     if [[ -z "${_ct_registered_paths[$_ct_file]+x}" ]]; then
-        _ct_inline_quote "$_ct_file"
+        _ct_resolve_source_file "$_ct_file" "${FUNCNAME[1]}"
+        _ct_inline_quote "$_ct_ap"
         _ct_registered_paths["$_ct_file"]=$_ct_qv
-        printf 'PATH file=%s\n' "$_ct_qv" >&"$_ct_events_fd"
+        if [[ -z "${_ct_emitted_paths[$_ct_ap]+x}" ]]; then
+            _ct_emitted_paths["$_ct_ap"]=1
+            printf 'PATH file=%s\n' "$_ct_qv" >&"$_ct_events_fd"
+        fi
     fi
     local _ct_file_q="${_ct_registered_paths[$_ct_file]}"
 

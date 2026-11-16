@@ -1333,6 +1333,41 @@ fn test_zsh_records_sourced_file_whose_path_contains_a_space() {
     common::check_records_sourced_file_with_space(&common::ZSH);
 }
 
+/// A file sourced by `./name` after a `cd` is recorded by its absolute path
+/// and copied (codetracer-pm issue
+/// `2026-11-15-shell-recorders-record-a-relatively-sourced-file-by-its-relative-path-and-may-not-copy-it`).
+#[test]
+fn test_zsh_records_file_sourced_by_a_relative_path_after_cd() {
+    require_zsh!();
+    common::check_records_relatively_sourced_file(&common::ZSH, common::RelativeSource::DotSlash);
+}
+
+/// The `.` and `..` components of a relative source path are folded.
+#[test]
+fn test_zsh_records_file_sourced_by_a_relative_path_with_dot_components() {
+    require_zsh!();
+    common::check_records_relatively_sourced_file(&common::ZSH, common::RelativeSource::DotDot);
+}
+
+/// A file found through a relative `PATH` entry is recorded by its absolute
+/// path.
+#[test]
+fn test_zsh_records_file_sourced_through_a_relative_path_entry() {
+    require_zsh!();
+    common::check_records_relatively_sourced_file(&common::ZSH, common::RelativeSource::PathSearch);
+}
+
+/// A `..` after a symlinked directory names the file the shell opened, not
+/// the one folding it lexically would name.
+#[test]
+fn test_zsh_records_file_sourced_by_a_relative_path_through_a_symlinked_dir() {
+    require_zsh!();
+    common::check_records_relatively_sourced_file(
+        &common::ZSH,
+        common::RelativeSource::DotDotThroughSymlink,
+    );
+}
+
 #[test]
 fn test_zsh_records_function_in_script_whose_path_contains_a_space() {
     require_zsh!();

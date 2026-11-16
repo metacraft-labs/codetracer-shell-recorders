@@ -1329,8 +1329,9 @@ pub fn assert_stream_paths(shell: &Shell, events: &[WireEvent], expected: &[&Pat
 /// - the output directory holds exactly one `.ct`;
 /// - the trace's program is `main`, its path table is exactly `sources`
 ///   with `main` first, and every step is in one of them;
+/// - every entry of the path table is absolute;
 /// - each source is copied to `files/<absolute path>` (`copy_source_files`
-///   in `src/trace_bridge.rs`).
+///   in `src/trace_bridge.rs`), and the copy's bytes equal the original's.
 ///
 /// Returns the output directory for further checks.
 pub fn assert_records_exact_paths(
@@ -1380,6 +1381,16 @@ pub fn assert_records_exact_paths(
     let paths: Vec<String> = (0..reader.path_count())
         .map(|i| reader.path(i).expect("path entry"))
         .collect();
+    // A path the recorder left relative means something only in the
+    // directory the script was in when it was recorded (codetracer-pm issue
+    // `2026-11-15-shell-recorders-record-a-relatively-sourced-file-by-its-relative-path-and-may-not-copy-it`).
+    for path in &paths {
+        assert!(
+            path.starts_with('/'),
+            "{} {main_str:?}: the path table holds a path that is not absolute: {path:?}; table: {paths:?}",
+            shell.interpreter
+        );
+    }
     let expected: Vec<String> = sources.iter().map(|p| path_str(p)).collect();
     assert_eq!(paths, expected, "the trace's path table differs");
     let steps = reader.step_count();
@@ -1400,6 +1411,11 @@ pub fn assert_records_exact_paths(
             .join("files")
             .join(source.strip_prefix("/").unwrap_or(source));
         assert!(copy.is_file(), "no copy of {source:?} at {copy:?}");
+        assert_eq!(
+            std::fs::read(&copy).expect("read the copy"),
+            std::fs::read(source).expect("read the original"),
+            "the copy of {source:?} at {copy:?} differs from the original"
+        );
     }
     out
 }
@@ -1547,6 +1563,130 @@ pub fn check_records_function_in_dir_with_space(
             WireEvent::Arg { name: n, value, .. } if n == "$1" && value == "a b"
         )),
         "{}: no ARG $1=\"a b\"; stream:\n{}",
+        shell.interpreter,
+        run.events.join("\n")
+    );
+}
+
+// A file sourced by a relative path is recorded by its absolute path, the
+// one the relative path named in the working directory the script had when
+// it sourced the file (codetracer-pm issue
+// `2026-11-15-shell-recorders-record-a-relatively-sourced-file-by-its-relative-path-and-may-not-copy-it`;
+// spec `Recording-Backends/Shell-Recorder.md`, "Wire Protocol (FD 3)" and
+// "Trace Folder Structure"). Each script changes into an absolute directory
+// before it sources, so the working directory differs from the launcher's,
+// and changes to `/` before it calls the sourced function, so a path
+// resolved at any later step than the file's first would be wrong.
+
+/// How a relative-source check's main script reaches the sourced file.
+pub enum RelativeSource {
+    /// The issue's reproduction: `cd <proj>/lib; source ./helpers.<ext>`.
+    DotSlash,
+    /// A path with `..` and `.` components to fold:
+    /// `cd <proj>/sub; source ../lib/./helpers.<ext>`.
+    DotDot,
+    /// A name without a slash, found through a relative `PATH` entry:
+    /// `cd <proj>/w; PATH="../lib:$PATH"; source helpers.<ext>`. Both shells
+    /// report the path they found the file at, `../lib/helpers.<ext>`.
+    PathSearch,
+    /// A `..` that follows a symlinked directory, which the system resolves
+    /// from the link's target, not from the directory the link is in:
+    /// `cd <proj>/a/link; source ../lib/helpers.<ext>` with `<proj>/a/link`
+    /// a link to `<proj>/w`, so the file opened is `<proj>/lib/helpers.<ext>`.
+    /// Folding the `..` lexically names `<proj>/a/lib/helpers.<ext>`, a
+    /// decoy with other contents. The path that names the opened file
+    /// without resolving the link is the joined `<proj>/a/link/../lib/...`,
+    /// as the system resolves it.
+    DotDotThroughSymlink,
+}
+
+/// Record a main script `<proj>/main.<ext>` that sources
+/// `<proj>/lib/helpers.<ext>` the way `how` says and then calls its
+/// function, and assert that the recording names the sourced file by its
+/// absolute path everywhere and carries a byte-identical copy of it.
+pub fn check_records_relatively_sourced_file(shell: &Shell, how: RelativeSource) {
+    let dir = ScriptDir::new();
+    let ext = shell.fixture_ext;
+    let proj = dir.root.join("proj");
+    // A file that only defines functions, except in `DotDot`, where it
+    // starts with a command: Bash runs no DEBUG trap for a definition, so
+    // the recorder first sees the definitions-only file in `helper`, after
+    // the `cd /`, and sees the other one while it is being sourced.
+    let top_level = match how {
+        RelativeSource::DotDot => "helpers_loaded=1\n",
+        _ => "",
+    };
+    let helpers = dir.write(
+        &format!("proj/lib/helpers.{ext}"),
+        &format!("{top_level}helper() {{\n    echo \"helper ran\"\n}}\n"),
+    );
+    let body_line: i64 = if top_level.is_empty() { 2 } else { 3 };
+    // The path the recording must name the sourced file by.
+    let recorded = match how {
+        RelativeSource::DotDotThroughSymlink => {
+            std::fs::create_dir_all(proj.join("w")).expect("create the link target");
+            std::fs::create_dir_all(proj.join("a")).expect("create the link's directory");
+            std::os::unix::fs::symlink("../w", proj.join("a/link")).expect("create the link");
+            dir.write(
+                &format!("proj/a/lib/helpers.{ext}"),
+                "helper() {\n    echo \"decoy ran\"\n}\n",
+            );
+            proj.join(format!("a/link/../lib/helpers.{ext}"))
+        }
+        _ => helpers.clone(),
+    };
+    let (cwd, prelude) = match how {
+        RelativeSource::DotSlash => ("lib", format!("source ./helpers.{ext}\n")),
+        RelativeSource::DotDot => ("sub", format!("source ../lib/./helpers.{ext}\n")),
+        RelativeSource::PathSearch => (
+            "w",
+            format!("PATH=\"../lib:$PATH\"\nsource helpers.{ext}\n"),
+        ),
+        RelativeSource::DotDotThroughSymlink => {
+            ("a/link", format!("source ../lib/helpers.{ext}\n"))
+        }
+    };
+    std::fs::create_dir_all(proj.join(cwd)).expect("create the working directory");
+    let main = dir.write(
+        &format!("proj/main.{ext}"),
+        &format!(
+            "{}cd \"{}\"\n{prelude}cd /\nhelper\necho \"done\"\n",
+            shebang(shell),
+            path_str(&proj.join(cwd))
+        ),
+    );
+
+    // The trace: every path absolute, the path table exactly the two files,
+    // and a byte-identical copy of each under `files/<absolute path>`.
+    let out = assert_records_exact_paths(shell, &main, &[&main, &recorded], "helper ran");
+    let calls = recorded_calls(out.path());
+    assert_eq!(
+        calls_of(&calls, "helper").len(),
+        1,
+        "{}: helper should be called once; calls: {calls:?}",
+        shell.interpreter
+    );
+
+    // The raw stream: no event names a path but the two absolute ones, and
+    // the function's `FUNC` event and its steps name the sourced file.
+    let run = run_recorder(shell, &main);
+    let events = parse_stream(shell, &run);
+    assert_stream_paths(shell, &events, &[&main, &recorded]);
+    let helpers_str = path_str(&recorded);
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            WireEvent::Func { name, file, .. } if name == "helper" && *file == helpers_str
+        )),
+        "{}: no FUNC event for helper in {helpers_str:?}; stream:\n{}",
+        shell.interpreter,
+        run.events.join("\n")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, WireEvent::Step { file, line, .. } if *file == helpers_str && *line == body_line)),
+        "{}: no STEP at the body of helper ({helpers_str:?}:{body_line}); stream:\n{}",
         shell.interpreter,
         run.events.join("\n")
     );

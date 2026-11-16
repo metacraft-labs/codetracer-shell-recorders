@@ -997,6 +997,40 @@ fn test_bash_records_sourced_file_whose_path_contains_a_space() {
     common::check_records_sourced_file_with_space(&common::BASH);
 }
 
+/// A file sourced by `./name` after a `cd` is recorded by its absolute path
+/// and copied (codetracer-pm issue
+/// `2026-11-15-shell-recorders-record-a-relatively-sourced-file-by-its-relative-path-and-may-not-copy-it`).
+#[test]
+fn test_bash_records_file_sourced_by_a_relative_path_after_cd() {
+    common::check_records_relatively_sourced_file(&common::BASH, common::RelativeSource::DotSlash);
+}
+
+/// The `.` and `..` components of a relative source path are folded.
+#[test]
+fn test_bash_records_file_sourced_by_a_relative_path_with_dot_components() {
+    common::check_records_relatively_sourced_file(&common::BASH, common::RelativeSource::DotDot);
+}
+
+/// A file found through a relative `PATH` entry is recorded by its absolute
+/// path.
+#[test]
+fn test_bash_records_file_sourced_through_a_relative_path_entry() {
+    common::check_records_relatively_sourced_file(
+        &common::BASH,
+        common::RelativeSource::PathSearch,
+    );
+}
+
+/// A `..` after a symlinked directory names the file the shell opened, not
+/// the one folding it lexically would name.
+#[test]
+fn test_bash_records_file_sourced_by_a_relative_path_through_a_symlinked_dir() {
+    common::check_records_relatively_sourced_file(
+        &common::BASH,
+        common::RelativeSource::DotDotThroughSymlink,
+    );
+}
+
 #[test]
 fn test_bash_records_function_in_script_whose_path_contains_a_space() {
     common::check_records_function_in_dir_with_space(&common::BASH, "greet", "greet() {", "greet");
