@@ -897,3 +897,282 @@ pub fn check_and_list_calls(shell: &Shell) {
     assert_calls(&calls, "h", 2, &[0]);
     assert_eq!(last_step_depth(out.path()), 1);
 }
+
+// ============================================================================
+// Traps set by the recorded script
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-lose-events-when-the-script-sets-its-own-err-or-debug-trap`.
+// Spec `Recording-Backends/Shell-Recorder.md`, "Limitations", "Signal
+// Handler Conflicts": "If the script sets its own `DEBUG`, `RETURN`/`EXIT`,
+// or `ERR`/`ZERR` traps ..., the recorder must chain them carefully to
+// preserve script behavior while still capturing events."
+//
+// Two claims per fixture: the recorder keeps capturing (the events the
+// recorder's own traps produce are all there), and the script behaves as it
+// does without the recorder (its standard output is the same). The
+// behaviour without the recorder is measured, not written down: each
+// fixture is also run natively, in the environment the recorder gives a
+// script (see `native_stdout`), and the two outputs are compared.
+
+/// The text the recorders print to standard error, and record as an
+/// `Error` event, when a trap of theirs was replaced behind their back.
+pub const REPLACED_TRAP_WARNING: &str = "replaced the recorder's";
+
+/// Run the fixture `stem` without the recorder, in the shell environment
+/// the recorder gives the script, and return its standard output.
+///
+/// The bash recorder sources the script with `functrace`, `errtrace` and
+/// `extdebug` on (`recorder.sh`), and those options change when Bash runs a
+/// `DEBUG`, `RETURN` or `ERR` trap (they are inherited by functions and
+/// subshells). The baseline sets the same options and sources the script
+/// the same way, so that the comparison isolates the trap chaining. Zsh
+/// options are left as they are: the zsh recorder only sets
+/// `DEBUG_BEFORE_CMD`, which is on by default.
+/// See: https://www.gnu.org/software/bash/manual/html_node/The-Shopt-Builtin.html (extdebug)
+pub fn native_stdout(shell: &Shell, stem: &str) -> String {
+    let fixture = shell.fixture(stem);
+    let prelude = match shell.interpreter {
+        "bash" => "set -o functrace -o errtrace; shopt -s extdebug; ",
+        _ => "",
+    };
+    let output = Command::new(shell.interpreter)
+        .current_dir(repo_root())
+        .args([
+            "-c",
+            &format!(r#"{prelude}source "$1""#),
+            shell.interpreter,
+            fixture.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run the fixture natively");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// The text of every `Error` IO event of the trace in `out_dir`, in order.
+/// The reader gives an event as `{"kind": "Error", "data": [bytes...]}`,
+/// the text as its UTF-8 bytes.
+pub fn recorded_error_texts(out_dir: &Path) -> Vec<String> {
+    let reader = open_trace(out_dir);
+    (0..reader.event_count())
+        .filter_map(|n| {
+            let json: serde_json::Value =
+                serde_json::from_str(&reader.event_json(n).expect("event_json"))
+                    .expect("event JSON");
+            (json["kind"] == "Error").then(|| {
+                let bytes: Vec<u8> = json["data"]
+                    .as_array()
+                    .map(|a| a.iter().map(|b| b.as_u64().expect("byte") as u8).collect())
+                    .unwrap_or_default();
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+        })
+        .collect()
+}
+
+/// The `ERROR` lines of a recorder run's raw event stream.
+pub fn wire_errors(run: &RecorderRun) -> Vec<&String> {
+    run.events
+        .iter()
+        .filter(|l| l.starts_with("ERROR "))
+        .collect()
+}
+
+/// For each `ERROR` line of a recorder run's raw event stream, the line of
+/// the `STEP` before it: the command that failed.
+pub fn error_step_lines(run: &RecorderRun) -> Vec<u64> {
+    let mut last_step = 0;
+    let mut lines = Vec::new();
+    for event in &run.events {
+        if event.starts_with("STEP ") {
+            last_step = event
+                .rsplit_once(" line=")
+                .and_then(|(_, line)| line.parse().ok())
+                .expect("STEP line");
+        } else if event.starts_with("ERROR ") {
+            lines.push(last_step);
+        }
+    }
+    lines
+}
+
+/// Record `stem` through the launcher, assert that the script printed
+/// exactly what it prints without the recorder (`native_stdout`) and that
+/// the writer saw a complete stream, and return the output directory.
+pub fn record_like_native(shell: &Shell, stem: &str) -> TempDir {
+    let native = native_stdout(shell, stem);
+    let (out, output) = run_launcher_with_built_writer(shell, &shell.fixture(stem));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{} {stem}: launcher failed: stderr={stderr}",
+        shell.interpreter
+    );
+    assert_eq!(
+        stdout, native,
+        "{} {stem}: the recorded script must print what it prints without the recorder; stderr={stderr}",
+        shell.interpreter
+    );
+    for unexpected in [MISSING_EXIT_WARNING, REPLACED_TRAP_WARNING] {
+        assert!(
+            !stderr.contains(unexpected),
+            "{} {stem}: unexpected warning {unexpected:?}: {stderr}",
+            shell.interpreter
+        );
+    }
+    out
+}
+
+/// The issue's first reproduction: two failing commands with the script's
+/// own `ERR` / `ZERR` trap set between them. Both failures are recorded,
+/// once each, in the raw stream and in the trace, and the script's handler
+/// still runs (`handled`).
+pub fn check_script_err_trap_keeps_capturing(shell: &Shell) {
+    let run = assert_stream_balanced(shell, "trap_err");
+    let errors = wire_errors(&run);
+    assert_eq!(
+        errors.len(),
+        2,
+        "{}: one ERROR per failing `false`; stream:\n{}",
+        shell.interpreter,
+        run.events.join("\n")
+    );
+    // The script's own handler still runs. `record_like_native` compares
+    // with the native run; this names the issue's assertion directly.
+    assert!(
+        native_stdout(shell, "trap_err").contains("handled"),
+        "{}: the fixture's own handler must print `handled` natively",
+        shell.interpreter
+    );
+    let out = record_like_native(shell, "trap_err");
+    let texts = recorded_error_texts(out.path());
+    assert_eq!(
+        texts.len(),
+        2,
+        "{}: the trace must hold two Error events; got {texts:?}",
+        shell.interpreter
+    );
+}
+
+/// The issue's second reproduction: a script that sets a `DEBUG` trap at
+/// line 3 still has a step for each of lines 4, 5 and 6, in the raw stream
+/// and in the trace.
+pub fn check_script_debug_trap_keeps_capturing(shell: &Shell) {
+    let run = assert_stream_balanced(shell, "trap_debug");
+    for line in [4, 5, 6] {
+        assert!(
+            run.events
+                .iter()
+                .any(|l| l.starts_with("STEP ") && l.ends_with(&format!(" line={line}"))),
+            "{}: no STEP for line {line}; stream:\n{}",
+            shell.interpreter,
+            run.events.join("\n")
+        );
+    }
+    let out = record_like_native(shell, "trap_debug");
+    let lines: Vec<u64> = step_lines_and_depths(out.path())
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    for line in [4, 5, 6] {
+        assert!(
+            lines.contains(&line),
+            "{}: the trace has no step at line {line}; steps: {lines:?}",
+            shell.interpreter
+        );
+    }
+}
+
+/// The script's own `DEBUG` action keeps running, before each command, with
+/// the command's text and the status before it, exactly as without the
+/// recorder; the recorder records the commands it runs before.
+pub fn check_script_debug_action_runs(shell: &Shell) {
+    let out = record_like_native(shell, "trap_debug_handler");
+    let lines: Vec<u64> = step_lines_and_depths(out.path())
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    for line in [6, 7, 8, 9] {
+        assert!(
+            lines.contains(&line),
+            "{}: the trace has no step at line {line}; steps: {lines:?}",
+            shell.interpreter
+        );
+    }
+}
+
+/// `trap -` and `trap ''` on the error trap reset and ignore the script's
+/// action only: the recorder still records all three failures, and the
+/// script's handler runs for the first only.
+pub fn check_script_trap_reset_and_ignore(shell: &Shell) {
+    let run = assert_stream_balanced(shell, "trap_reset");
+    assert_eq!(
+        wire_errors(&run).len(),
+        3,
+        "{}: one ERROR per failing `false`; stream:\n{}",
+        shell.interpreter,
+        run.events.join("\n")
+    );
+    let out = record_like_native(shell, "trap_reset");
+    assert_eq!(recorded_error_texts(out.path()).len(), 3);
+}
+
+/// Listing traps (`trap`, `trap -p` in Bash) shows the script its own
+/// actions, never the recorder's, so a script that saves and restores a
+/// trap (`saved=$(trap -p ERR)`, `eval "$saved"`) behaves as without it.
+pub fn check_script_trap_listing(shell: &Shell) {
+    assert_stream_balanced(shell, "trap_listing");
+    record_like_native(shell, "trap_listing");
+}
+
+/// A trap of the recorder replaced behind its back (`builtin trap`, which
+/// the recorder cannot intercept) must not leave a recording that looks
+/// complete: the recorder warns on standard error and records an `Error`
+/// event saying so. The script itself is unaffected.
+pub fn check_replaced_trap_is_reported(shell: &Shell) {
+    let (out, output) =
+        run_launcher_with_built_writer(shell, &shell.fixture("trap_builtin_replaced"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{}: launcher failed: stderr={stderr}",
+        shell.interpreter
+    );
+    assert_eq!(stdout, "end\n", "{}: stdout", shell.interpreter);
+    assert!(
+        stderr.contains(REPLACED_TRAP_WARNING) && stderr.contains("DEBUG"),
+        "{}: the replaced DEBUG trap must be reported on stderr, got: {stderr}",
+        shell.interpreter
+    );
+    let texts = recorded_error_texts(out.path());
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains(REPLACED_TRAP_WARNING) && t.contains("DEBUG")),
+        "{}: the trace must carry an Error event naming the replaced trap; errors: {texts:?}",
+        shell.interpreter
+    );
+}
+
+/// The script's own `EXIT` trap: in the recorder's shell it runs after the
+/// recorder's, so a script that sets one and calls `exit` still ends its
+/// event stream with the `EXIT` event, and the script's action still runs
+/// with the exit status. A subshell runs its own `EXIT` trap, never the
+/// parent's (which Bash shows a subshell but does not run there).
+pub fn check_script_exit_trap(shell: &Shell) {
+    assert_stream_balanced(shell, "trap_exit");
+    assert_recorder_exit(shell, "trap_exit", 0);
+    // The fixture is meaningful only if its EXIT action runs natively, once,
+    // in the script's own shell.
+    let native = native_stdout(shell, "trap_exit");
+    assert_eq!(
+        native.lines().filter(|l| *l == "bye 0").count(),
+        1,
+        "{}: natively, the script's EXIT action runs once, with status 0: {native:?}",
+        shell.interpreter
+    );
+    record_like_native(shell, "trap_exit");
+}

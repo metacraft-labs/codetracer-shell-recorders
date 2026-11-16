@@ -4,6 +4,16 @@
 
 setopt DEBUG_BEFORE_CMD    # DEBUG trap fires BEFORE each command
 
+# Two builtins the trap listing needs (see `_ct_trap_listing_open`): only
+# those features of their modules, so that no parameter of theirs appears
+# among the script's variables. Without them, the listing falls back.
+zmodload -F zsh/system b:sysopen 2>/dev/null
+zmodload -F zsh/files b:zf_rm 2>/dev/null
+# The DEBUG trap reads $functions (zsh/parameter), which zsh creates the
+# first time it is used: create it now, before the variable baseline below,
+# so that it is not reported as a variable of the script.
+: ${+functions}
+
 _ct_target_script="$1"
 shift  # remaining args are the script's arguments
 
@@ -127,6 +137,17 @@ _ct_flush_held_returns() {
 # CALL; runs in the function's own shell, after the function's frame left
 # funcstack.
 _ct_function_returned() {
+    # The script's own EXIT trap for this function, if it set one, runs
+    # after this (see "Traps set by the script"), with the function's status.
+    _ct_run_script_EXIT=1
+    _ct_script_status_EXIT=$1
+    # zsh runs the ZERR trap once more, in the caller, for a function that
+    # returns non-zero and has an EXIT trap; every function has the
+    # recorder's. Without a script EXIT action for it (whose part of the
+    # trap resets this), that ZERR would not happen without the recorder.
+    if (( $1 != 0 )); then
+        _ct_zerr_echo_depth=$2
+    fi
     (( _ct_exit_emitted || _ct_subshell_closed )) && return 0
     local _ct_n=${#_ct_frame_depths}
     (( _ct_n > 0 )) || return 0
@@ -231,10 +252,17 @@ _ct_emit_exit() {
     (( _ct_exit_emitted )) && return 0
     _ct_exit_emitted=1
 
+    # Before the traps are removed: a trap of the recorder's that the script
+    # replaced behind its back leaves a partial recording, which is said here.
+    _ct_report_replaced_traps
+
     # Nothing after this point belongs to the script: stop recording before
-    # writing the event, so it is the last one in the stream.
-    trap - DEBUG
-    trap - ZERR
+    # writing the event, so it is the last one in the stream. `builtin`
+    # bypasses the script's `trap` alias, and without LOCAL_TRAPS the reset
+    # is not undone when this function returns.
+    setopt localoptions nolocaltraps
+    builtin trap - DEBUG
+    builtin trap - ZERR
 
     printf 'EXIT code=%d\n' "$_ct_code" >&3
 }
@@ -402,6 +430,525 @@ _ct_capture_variables() {
     done <<< "$_ct_decl_output"
 }
 
+# ---------------------------------------------------------------------------
+# Traps set by the script
+# ---------------------------------------------------------------------------
+# The recorder works through its DEBUG and ZERR traps and the EXIT trap it
+# sets in every function it records, and zsh has one trap per condition (and
+# per function, for EXIT): a `trap` command of the script would replace the
+# recorder's, and the recording would go on silently without the events it
+# produces (spec "Limitations", "Signal Handler Conflicts").
+#
+# So `trap` is an alias, defined just before the script is sourced, for
+# `source trap-shim.zsh --ct-trap`. Sourcing, unlike calling a function,
+# does not open a function scope, so the shim's `builtin trap` commands set
+# their traps exactly where the script's `trap` would: an EXIT trap in a
+# function is that function's, and LOCAL_TRAPS restores a trap set in a
+# function when it returns, natively. (A shell function cannot do this:
+# the EXIT trap it set would be its own.)
+# See: https://zsh.sourceforge.io/Doc/Release/Shell-Builtin-Commands.html#index-trap
+#      https://zsh.sourceforge.io/Doc/Release/Options.html#index-LOCALTRAPS
+#
+# For DEBUG, ZERR (and its alias ERR) and the EXIT trap of a function the
+# recorder records, the shim does not replace the recorder's trap: it
+# installs the recorder's action followed by the script's
+# (`_ct_compose_trap`). The script's action is part of the trap's list
+# itself, so it runs in the environment of the interrupted command, as a
+# list trap does: LINENO, the positional parameters, `return` and the
+# DEBUG trap's `setopt errexit` (skip the command) all mean what they mean
+# without the recorder. Every other trap goes to the builtin unchanged.
+#
+# A function-form trap (`TRAPZERR() { ... }`) replaces a trap by being
+# defined, which no alias can see. A TRAPZERR or TRAPERR is adopted by the
+# next DEBUG trap: moved to another name, which the recorder's ZERR trap
+# then calls (`_ct_adopt_defined_trap_function`). A TRAPDEBUG would replace
+# the DEBUG trap itself, and a TRAPEXIT the function's EXIT trap, before
+# that: the DEBUG trap sees the definition coming in ZSH_DEBUG_CMD, skips it
+# (`setopt errexit` in a DEBUG trap skips the command) and defines the same
+# function under another name instead (`_ct_adopt_trap_function`).
+#
+# Listing (`trap`) shows the script its own actions and functions, and
+# hides the recorder's. Each composed action carries the line
+# `: ct-script-trap <id>`, which names the script's action in
+# `_ct_script_trap_src` (or its function in `_ct_script_trap_fn`), so the
+# listing works from what zsh really has, even after LOCAL_TRAPS restored
+# an older trap.
+#
+# What the script can still tell apart:
+#
+# - `builtin trap`, `command trap`, a quoted `\trap`, `unalias trap`, or a
+#   function or alias of its own named `trap` bypass the alias, as does a
+#   function-form trap defined in a way the DEBUG trap does not see
+#   (`eval 'TRAPZERR() { ... }'`). A trap of the recorder's replaced that
+#   way is reported at exit (`_ct_report_replaced_traps`).
+# - `alias` lists the `trap` alias. The script's function-form traps have
+#   other names, so `functions TRAPZERR` finds nothing; `unfunction` of
+#   such names only (`unfunction TRAPZERR`) is recognised and resets the
+#   script's trap, any other form removes the recorder's and is reported.
+# - Skipping a definition (TRAPDEBUG, TRAPEXIT) or an `unfunction` leaves
+#   `$?` at the status before it, where zsh would give 0.
+# - A function-form trap that returns non-zero no longer makes zsh "behave
+#   as interrupted": the recorder's list trap calls it, and its status is
+#   only a status.
+# - zsh lists a trap's action as it reconstructs it from the parsed code;
+#   the shim lists the script's action reconstructed the same way.
+# See: https://zsh.sourceforge.io/Doc/Release/Functions.html#Trap-Functions
+
+# The result of the helper functions below that return a string.
+#
+# The helpers run in the script's shell, outside any trap when the shim
+# calls them, so under the script's ERR_EXIT a failing command in one of
+# them would end the script: they test with conditions and `||` / `&&`
+# lists, count with `x=$(( x + 1 ))` (an `(( ))` that evaluates to 0
+# fails), and end with a command that succeeds.
+_ct_reply=""
+
+# The `trap` shim, beside this file, and the alias text that runs it.
+_ct_shim_path="${_ct_recorder_path:h}/trap-shim.zsh"
+_ct_trap_alias_text="source ${(q)_ct_shim_path} --ct-trap"
+
+# The script's trap actions, by the id their composed action carries: the
+# action as zsh reconstructs it (`_ct_script_trap_src`) or, for a
+# function-form trap, the name the script defined (`_ct_script_trap_fn`;
+# the function itself is `_ct_script_trapfn_<id>`).
+typeset -A _ct_script_trap_src _ct_script_trap_fn
+_ct_script_trap_next=0
+
+# The number zsh passes a function-form trap as `$1`, by condition. For
+# ZERR and DEBUG it is zsh's own numbering past the real signals, not their
+# position in $signals (zsh 5.9 on Linux passes 32 and 33), so it is
+# measured here, by two trap functions run once before the recorder installs
+# its own traps: no subshell, and no trap runs inside another.
+typeset -A _ct_trap_signal_numbers
+_ct_trap_signal_numbers[EXIT]=0
+TRAPZERR() { _ct_trap_signal_numbers[ZERR]=$1; }
+false
+unfunction TRAPZERR
+TRAPDEBUG() { _ct_trap_signal_numbers[DEBUG]=$1; unfunction TRAPDEBUG; }
+:
+
+# Set by the recorder's part of each trap: whether the script's action runs
+# this time (1) or not (0), and the `$?` it runs with.
+_ct_run_script_DEBUG=0
+_ct_run_script_ZERR=0
+_ct_run_script_EXIT=0
+_ct_script_status_DEBUG=0
+_ct_script_status_ZERR=0
+_ct_script_status_EXIT=0
+_ct_debug_entry_status=0
+
+# Set by the DEBUG trap when it adopted a function-form trap: the end of the
+# DEBUG action skips the definition, and the condition it was for.
+_ct_skip_next_command=0
+_ct_adopted_condition=""
+
+# The ZERR trap found the shell about to exit under ERR_EXIT.
+_ct_zerr_exits=0
+
+# Set by the DEBUG trap when the definition it skips will make zsh run the
+# ZERR trap.
+_ct_ignore_next_zerr=0
+_ct_unfunction_name=""
+
+# The funcstack depth of a caller whose next ZERR is caused only by the
+# recorder's per-function EXIT trap (see `_ct_function_returned`), or -1.
+_ct_zerr_echo_depth=-1
+_ct_zerr_echo=0
+
+# State of the shim and of the trap listing. Declared here, global, so that
+# the shim's assignments, which run in the scope of whatever function the
+# script called `trap` from, neither create nor warn about globals
+# (WARN_CREATE_GLOBAL).
+typeset -ga _ct_trap_ops _ct_trap_listing
+_ct_trap_mode=""
+_ct_shim_i=0
+_ct_shim_n=0
+_ct_shim_rc=0
+_ct_trap_tmp=""
+_ct_trap_tmp_count=0
+_ct_trap_fd=""
+
+# The per-function EXIT trap the DEBUG trap sets with each CALL (see "Open
+# frames"). Its first word is how the recorder recognises it as its own.
+_ct_fn_exit_action='_ct_function_returned $? ${#funcstack}'
+
+# Whether file $1 is the recorder's own, the shim, or no file at all: no
+# command there is a script command.
+_ct_is_recorder_file() {
+    [[ -z "$1" || "$1" == "$_ct_recorder_path" ||
+       "$1" == "$_ct_recorder_path_as_run" || "$1" == "$_ct_shim_path" ]]
+}
+
+# Set `$?` to $1 for the next command. Called as `_ct_set_status N && :`:
+# a failing command that is not the last of an AND list neither runs the
+# ZERR trap nor ends an ERR_EXIT shell, and the list leaves `$?` at N.
+# See: https://zsh.sourceforge.io/Doc/Release/Options.html#index-ERREXIT
+_ct_set_status() {
+    return "$1"
+}
+
+# Whether the innermost frame the recorder has open is a function at
+# funcstack depth $1 opened in this shell: one that has the recorder's
+# per-function EXIT trap. A subshell inherits the frame but not the trap
+# (zsh resets EXIT in subshells).
+_ct_in_tracked_function() {
+    (( _ct_frames_subshell == ZSH_SUBSHELL &&
+       ${#_ct_frame_depths} > _ct_subshell_base &&
+       _ct_frame_depths[-1] == $1 )) && [[ "${_ct_frame_kinds[-1]}" == f ]]
+}
+
+# The condition name the recorder keeps for itself that spec $1 names
+# (DEBUG, ZERR, ERR or EXIT, with or without SIG, or 0 for EXIT), in _ct_reply;
+# returns 1 for any other. Whether EXIT is the recorder's depends on where
+# the trap is set (`_ct_in_tracked_function`).
+_ct_trap_condition() {
+    local _ct_t_name="${1#SIG}"
+    [[ "$1" == 0 ]] && _ct_t_name=EXIT
+    case "$_ct_t_name" in
+        DEBUG | ZERR | ERR | EXIT) _ct_reply="$_ct_t_name"; return 0 ;;
+    esac
+    return 1
+}
+
+# Whether $1 is a signal spec zsh accepts: a number, or a name in $signals
+# (or ERR, or one of the alternative names `kill` lists), with or without SIG.
+_ct_is_signal_spec() {
+    [[ "$1" == <-> ]] && (( $1 < ${#signals} )) && return 0
+    local _ct_t_name="${1#SIG}"
+    (( ${signals[(Ie)$_ct_t_name]} )) && return 0
+    [[ "$_ct_t_name" == (ERR|CLD|POLL|IOT) ]]
+}
+
+# The recorder's own part of the trap for condition $1, in _ct_reply: the
+# action that runs before the script's (`_ct_recorder_trap_prefix`) and the
+# commands that end every composed action (`_ct_recorder_trap_suffix`).
+_ct_recorder_trap_prefix() {
+    case "$1" in
+        DEBUG) _ct_reply="$_ct_debug_action" ;;
+        ZERR | ERR) _ct_reply="$_ct_zerr_action" ;;
+        EXIT) _ct_reply="$_ct_fn_exit_action" ;;
+    esac
+}
+_ct_recorder_trap_suffix() {
+    case "$1" in
+        # Skip a function-form trap definition the DEBUG trap adopted. In
+        # the list itself: `setopt` in a function would be undone by a
+        # script that runs with LOCAL_OPTIONS.
+        DEBUG) _ct_reply=$'\n(( _ct_skip_next_command )) && { _ct_skip_next_command=0; setopt errexit; }' ;;
+        ZERR | ERR) _ct_reply=$'\n_ct_zerr_finish' ;;
+        *) _ct_reply="" ;;
+    esac
+}
+
+# Whether action $2, as zsh lists it for condition $1, is one the recorder
+# installed: its first command is the recorder's (see `_ct_debug_action`).
+_ct_is_recorder_action() {
+    case "$1" in
+        DEBUG) [[ "$2" == '_ct_debug_entry_status=$?'* ]] ;;
+        ZERR | ERR) [[ "$2" == '_ct_zerr_status=$?'* ]] ;;
+        EXIT) [[ "$2" == '_ct_function_returned '* ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# The trap action to install for condition $1, in _ct_reply: the recorder's
+# part and, when $2 names a script action (an id), that action, run only
+# when the recorder's part says so (`_ct_run_script_<cond>`), with `$?` set
+# back to the status the trap was entered with.
+_ct_compose_trap() {
+    local _ct_t_cond="$1" _ct_t_id="${2:-}" _ct_t_key="$1" _ct_t_body _ct_t_prefix
+    [[ "$_ct_t_key" == ERR ]] && _ct_t_key=ZERR
+    _ct_recorder_trap_prefix "$_ct_t_cond"
+    _ct_t_prefix="$_ct_reply"
+    _ct_recorder_trap_suffix "$_ct_t_cond"
+    if [[ -z "$_ct_t_id" ]]; then
+        _ct_reply="${_ct_t_prefix}${_ct_reply}"
+        return 0
+    fi
+    if (( ${+_ct_script_trap_fn[$_ct_t_id]} )); then
+        _ct_trap_signal_number "$_ct_t_key"
+        _ct_t_body="_ct_script_trapfn_${_ct_t_id} ${_ct_reply}"
+        _ct_recorder_trap_suffix "$_ct_t_cond"
+    else
+        _ct_t_body="${_ct_script_trap_src[$_ct_t_id]}"
+    fi
+    # A script EXIT action makes the extra ZERR in the caller genuine.
+    [[ "$_ct_t_key" == EXIT ]] && _ct_t_prefix+=$'\n_ct_zerr_echo_depth=-1'
+    _ct_reply="${_ct_t_prefix}
+: ct-script-trap ${_ct_t_id}
+case \$_ct_run_script_${_ct_t_key} in
+(1) _ct_set_status \"\$_ct_script_status_${_ct_t_key}\" && :
+${_ct_t_body}
+;;
+esac${_ct_reply}"
+}
+
+# Register the script's list action $1, as zsh reconstructs it, and set
+# _ct_reply to its id. The reconstruction is the body of a function defined
+# with it, less the one tab zsh indents a body with (the same text `trap`
+# lists). An action that does not parse is kept as it is: the builtin then
+# refuses the composed action with zsh's own message.
+_ct_register_script_trap() {
+    local _ct_t_text="$1"
+    if { functions[_ct_trap_reconstruct]="$1" } 2>/dev/null; then
+        local -a _ct_t_lines
+        _ct_t_lines=("${(@f)functions[_ct_trap_reconstruct]}")
+        _ct_t_text="${(F)${(@)_ct_t_lines#$'\t'}}"
+        unfunction _ct_trap_reconstruct
+    fi
+    _ct_script_trap_next=$(( _ct_script_trap_next + 1 ))
+    _ct_script_trap_src[$_ct_script_trap_next]="$_ct_t_text"
+    _ct_reply=$_ct_script_trap_next
+}
+
+# Adopt the function-form trap TRAP$1 whose definition, as zsh reconstructs
+# it, is $2: define it as `_ct_script_trapfn_<id>` and set _ct_reply to the
+# composed action for its condition, and `_ct_adopted_condition` to that
+# condition. TRAPERR is TRAPZERR's alias.
+_ct_adopt_trap_function() {
+    local _ct_t_name="TRAP$1" _ct_t_cond="$1"
+    [[ "$_ct_t_cond" == ERR ]] && _ct_t_cond=ZERR
+    local _ct_t_id=$(( _ct_script_trap_next + 1 ))
+    eval "_ct_script_trapfn_${_ct_t_id}${2#$_ct_t_name}" 2>/dev/null || return 1
+    _ct_script_trap_next=$_ct_t_id
+    _ct_script_trap_fn[$_ct_t_id]="$_ct_t_name"
+    _ct_adopted_condition="$_ct_t_cond"
+    _ct_compose_trap "$_ct_t_cond" "$_ct_t_id"
+}
+
+# Adopt the TRAPZERR or TRAPERR the script has defined: move it to
+# `_ct_script_trapfn_<id>` (removing the function removes the trap it set)
+# and set `_ct_reply` to the composed ZERR action that calls it.
+_ct_adopt_defined_trap_function() {
+    local _ct_t_name
+    for _ct_t_name in TRAPZERR TRAPERR; do
+        (( ${+functions[$_ct_t_name]} )) || continue
+        _ct_script_trap_next=$(( _ct_script_trap_next + 1 ))
+        functions[_ct_script_trapfn_${_ct_script_trap_next}]="${functions[$_ct_t_name]}"
+        unfunction "$_ct_t_name"
+        _ct_script_trap_fn[$_ct_script_trap_next]="$_ct_t_name"
+        _ct_compose_trap ZERR "$_ct_script_trap_next"
+        return 0
+    done
+    return 1
+}
+
+# The number zsh passes a function-form trap for condition $1 as `$1`, in
+# `_ct_reply` (see `_ct_trap_signal_numbers`).
+_ct_trap_signal_number() {
+    _ct_reply="${_ct_trap_signal_numbers[$1]:-0}"
+}
+
+
+# Open a temporary file for `builtin trap`'s listing, which must be written
+# by the shell itself: a command substitution is a subshell, where zsh
+# resets the traps. The file is created exclusively and readable only by
+# its owner, with `sysopen`, so no external command runs. Returns 1 when it
+# cannot be created.
+# See: https://zsh.sourceforge.io/Doc/Release/Zsh-Modules.html#The-zsh_002fsystem-Module
+_ct_trap_listing_open() {
+    (( ${+builtins[sysopen]} )) || return 1
+    local _ct_t_try
+    for _ct_t_try in 1 2 3 4 5 6 7 8; do
+        _ct_trap_tmp_count=$(( _ct_trap_tmp_count + 1 ))
+        _ct_trap_tmp="${TMPDIR:-/tmp}/ct-zsh-trap.$$.${_ct_trap_tmp_count}"
+        sysopen -w -o creat,excl -m 600 -u _ct_trap_fd "$_ct_trap_tmp" 2>/dev/null && return 0
+    done
+    _ct_trap_tmp=""
+    return 1
+}
+
+# Set `_ct_trap_listing` to the lines of listing $1: none for an empty one.
+_ct_trap_set_listing() {
+    _ct_trap_listing=()
+    [[ -z "$1" ]] || _ct_trap_listing=("${(@f)1}")
+}
+
+# Close the listing file and read it into `_ct_trap_listing`, one line per
+# element, and remove it.
+_ct_trap_listing_read() {
+    exec {_ct_trap_fd}>&-
+    _ct_trap_set_listing "$(<"$_ct_trap_tmp")"
+    if (( ${+builtins[zf_rm]} )); then
+        zf_rm -f -- "$_ct_trap_tmp"
+    else
+        command rm -f -- "$_ct_trap_tmp"
+    fi
+    _ct_trap_tmp=""
+}
+
+# Print `_ct_trap_listing`, zsh's own listing, as the script would see it
+# without the recorder: each trap of the recorder's is left out, or replaced
+# by the script's action it carries.
+_ct_trap_print_listing() {
+    local _ct_t_line _ct_t_action _ct_t_id
+    local -a _ct_t_words
+    local _ct_t_id_re=$'(^|\n)[[:space:]]*: ct-script-trap ([0-9]+)'
+    for _ct_t_line in "${_ct_trap_listing[@]}"; do
+        if [[ "$_ct_t_line" == "trap -- "*" "(DEBUG|ZERR|ERR|EXIT) ]]; then
+            _ct_t_words=(${(z)_ct_t_line})
+            _ct_t_action="${(Q)_ct_t_words[3]}"
+            if _ct_is_recorder_action "${_ct_t_words[-1]}" "$_ct_t_action"; then
+                if [[ "$_ct_t_action" =~ $_ct_t_id_re ]]; then
+                    _ct_print_script_trap "${match[2]}" "${_ct_t_words[-1]}"
+                fi
+                continue
+            fi
+        fi
+        print -r -- "$_ct_t_line"
+    done
+}
+
+# Print the script's trap with id $1 for condition $2 the way zsh lists it:
+# a list action as `trap -- <action> <cond>`, a function-form trap as its
+# definition under the name the script gave it.
+_ct_print_script_trap() {
+    if (( ${+_ct_script_trap_fn[$1]} )); then
+        print -r -- "${_ct_script_trap_fn[$1]} () {"
+        print -r -- "${functions[_ct_script_trapfn_$1]}"
+        print -r -- "}"
+    else
+        print -r -- "trap -- ${(q+)_ct_script_trap_src[$1]} $2"
+    fi
+}
+
+# Plan what the shim does for the script's `trap "$@"`: sets `_ct_trap_mode`
+# to `list`, `passthrough` (the builtin, as given: everything this does not
+# handle, so that the script sees the builtin's own messages) or `apply`,
+# and for `apply` fills `_ct_trap_ops` with the `builtin trap` calls to
+# make, each as its argument count followed by its arguments. Runs one
+# function level below the shim, so the script's scope is `$1` levels up.
+#
+# The builtin's rules: no argument lists; `-` with no condition resets all
+# traps; a first argument that is a signal means `-`; an empty action
+# ignores.
+# See: https://zsh.sourceforge.io/Doc/Release/Shell-Builtin-Commands.html#index-trap
+_ct_trap_plan() {
+    _ct_trap_ops=()
+    _ct_trap_mode=passthrough
+    # The script's funcstack depth: this function and the shim are above it.
+    local _ct_t_depth=$(( ${#funcstack} - 2 ))
+    [[ "${1-}" == -- ]] && shift
+    if (( $# == 0 )); then
+        _ct_trap_mode=list
+        return 0
+    fi
+
+    local _ct_t_mode _ct_t_action=""
+    local -a _ct_t_specs
+    if _ct_is_signal_spec "$1"; then
+        _ct_t_mode=reset
+        _ct_t_specs=("$@")
+    elif [[ "$1" == - ]]; then
+        _ct_t_mode=reset
+        _ct_t_specs=("${@[2,-1]}")
+        if (( ${#_ct_t_specs} == 0 )); then
+            # Reset every trap, then put the recorder's back.
+            _ct_trap_ops=(1 -)
+            _ct_t_specs=(DEBUG ZERR)
+            _ct_in_tracked_function "$_ct_t_depth" && _ct_t_specs+=(EXIT)
+        fi
+    else
+        _ct_t_mode=set
+        _ct_t_action="$1"
+        _ct_t_specs=("${@[2,-1]}")
+    fi
+    (( ${#_ct_t_specs} > 0 )) || return 0
+
+    local _ct_t_spec _ct_t_id
+    local -a _ct_t_others _ct_t_mine
+    for _ct_t_spec in "${_ct_t_specs[@]}"; do
+        if _ct_trap_condition "$_ct_t_spec" &&
+           { [[ "$_ct_reply" != EXIT ]] || _ct_in_tracked_function "$_ct_t_depth"; }; then
+            _ct_t_mine+=("$_ct_reply")
+        else
+            _ct_t_others+=("$_ct_t_spec")
+        fi
+    done
+    if (( ${#_ct_t_others} > 0 )); then
+        if [[ "$_ct_t_mode" == reset ]]; then
+            _ct_trap_ops+=($(( ${#_ct_t_others} + 1 )) - "${_ct_t_others[@]}")
+        else
+            _ct_trap_ops+=($(( ${#_ct_t_others} + 2 )) -- "$_ct_t_action" "${_ct_t_others[@]}")
+        fi
+    fi
+    if (( ${#_ct_t_mine} > 0 )) && [[ "$_ct_t_mode" == set ]]; then
+        _ct_register_script_trap "$_ct_t_action"
+        _ct_t_id="$_ct_reply"
+    fi
+    for _ct_t_spec in "${_ct_t_mine[@]}"; do
+        _ct_compose_trap "$_ct_t_spec" "${_ct_t_id:-}"
+        _ct_trap_ops+=(3 -- "$_ct_reply" "$_ct_t_spec")
+    done
+    _ct_trap_mode=apply
+}
+
+# A `builtin trap` call of the shim, with arguments "${@[2,-1]}", failed:
+# print the builtin's message as the builtin prints it for a command of the
+# script, at $1, the script's "<function or file>:<line>", rather than at
+# the shim's line, and return the builtin's status. The builtin runs again
+# in a subshell to capture the message (it has no effect there).
+_ct_trap_report_error() {
+    local _ct_t_caller="$1" _ct_t_messages _ct_t_message _ct_t_rc
+    shift
+    _ct_t_messages=$(builtin trap "$@" 2>&1 >/dev/null)
+    _ct_t_rc=$?
+    (( _ct_t_rc != 0 )) || _ct_t_rc=1
+    local _ct_t_re='^.*:trap:[0-9]+: (.*)$'
+    for _ct_t_message in "${(@f)_ct_t_messages}"; do
+        if [[ "$_ct_t_message" =~ $_ct_t_re ]]; then
+            _ct_t_message="${_ct_t_caller%:*}:trap:${_ct_t_caller##*:}: ${match[1]}"
+        fi
+        print -r -u2 -- "$_ct_t_message"
+    done
+    return $_ct_t_rc
+}
+
+# Defense in depth: the alias cannot see `builtin trap` and the other ways
+# around it listed above, and a trap of the recorder's replaced that way
+# stops the events it produces (every step, after DEBUG; every error, after
+# ZERR). Checked once, when the recording ends, in zsh's own listing.
+#
+# A recording known to be partial must not look complete, so the
+# replacement is reported in both places it can be seen: on standard error,
+# for whoever runs the recorder, and in the trace, as an `Error` event (the
+# one kind of event the trace writer already has for "something went
+# wrong"), for whoever reads it later. The event's status is 0: no command
+# of the script failed. Ending the recording without its EXIT event would
+# also make the writer warn, but would lose the script's exit code, and
+# changing the wire protocol for this would make the recorders and the
+# writer move together; neither is warranted.
+_ct_report_replaced_traps() {
+    # DEBUG and ZERR are the two traps zsh keeps in a subshell, so without
+    # a temporary file a command substitution can list them, for a fork.
+    if _ct_trap_listing_open; then
+        builtin trap >&$_ct_trap_fd
+        _ct_trap_listing_read
+    else
+        _ct_trap_set_listing "$(builtin trap)"
+    fi
+    local _ct_t_line _ct_t_cond _ct_t_replaced="" _ct_t_debug_ok=0 _ct_t_zerr_ok=0
+    local -a _ct_t_words
+    for _ct_t_line in "${_ct_trap_listing[@]}"; do
+        [[ "$_ct_t_line" == "trap -- "*" "(DEBUG|ZERR|ERR) ]] || continue
+        _ct_t_words=(${(z)_ct_t_line})
+        _ct_t_cond="${_ct_t_words[-1]}"
+        _ct_is_recorder_action "$_ct_t_cond" "${(Q)_ct_t_words[3]}" || continue
+        if [[ "$_ct_t_cond" == DEBUG ]]; then
+            _ct_t_debug_ok=1
+        else
+            _ct_t_zerr_ok=1
+        fi
+    done
+    (( _ct_t_debug_ok )) || _ct_t_replaced="DEBUG"
+    (( _ct_t_zerr_ok )) || _ct_t_replaced+="${_ct_t_replaced:+, }ZERR"
+    [[ -n "$_ct_t_replaced" ]] || return 0
+    local _ct_t_message="the script replaced the recorder's ${_ct_t_replaced} trap without going through \`trap\` (\`builtin trap\`, \`command trap\` or a function-form trap the recorder did not see defined); events recorded through it are missing after that point"
+    print -r -u2 -- "codetracer-zsh-recorder: warning: $_ct_t_message"
+    _ct_inline_quote "$_ct_t_message"
+    printf 'ERROR cmd=%s status=0\n' "$_ct_qv" >&3
+}
+
 # DEBUG trap (LIST FORM - critical for correct $LINENO)
 #
 # In Zsh's sourced-script context:
@@ -410,7 +957,16 @@ _ct_capture_variables() {
 # - funcfiletrace[N] = "file:line" of each call site
 # - funcsourcetrace[N] = "file:line" where each function/script was defined
 # - $LINENO = line number in current execution context
-trap '
+#
+# The action is kept in `_ct_debug_action` and installed by
+# the recorder's top-level code below (see "Traps set by the script"). Its first command
+# saves the `$?` the trap was entered with, for the script's own DEBUG
+# action, and is also how the recorder recognises the action as its own in
+# `trap`'s listing (zsh lists a trap's action as it reconstructs it from
+# the parsed code, and this command reconstructs as itself).
+_ct_debug_action='
+    _ct_debug_entry_status=$?
+    _ct_run_script_DEBUG=0
     # Guard against re-entry
     if (( _ct_in_trap )); then
         :
@@ -421,7 +977,17 @@ trap '
         _ct_depth=${#funcstack}
         _ct_line=$LINENO
         _ct_cmd="$ZSH_DEBUG_CMD"
-        _ct_last_cmd="$_ct_cmd"
+        _ct_ignore_next_zerr=0
+        # A ZERR at the call site that only the recorder'\''s per-function
+        # EXIT trap causes is the one right after the return, before this.
+        _ct_zerr_echo_depth=-1
+        # zsh reconstructs the script'\''s `trap` as the alias expanded it:
+        # show it as the `trap` the script wrote, here, in the ZERR trap'\''s
+        # report and to the script'\''s own DEBUG action.
+        if [[ "$_ct_cmd" == *"$_ct_trap_alias_text"* ]]; then
+            _ct_cmd="${_ct_cmd//"$_ct_trap_alias_text"/trap}"
+            ZSH_DEBUG_CMD="$_ct_cmd"
+        fi
 
         # Determine the current source file and adjust line numbers
         _ct_file=""
@@ -444,15 +1010,18 @@ trap '
                 _ct_line=$(( _ct_func_def_line + _ct_line ))
             fi
 
-            # Skip events from the recorder itself
-            if [[ "$_ct_file" == "$_ct_recorder_path" ]] ||
-               [[ "$_ct_file" == "$_ct_recorder_path_as_run" ]] ||
-               [[ -z "$_ct_file" ]]; then
+            # Skip events from the recorder itself, and from the `trap`
+            # shim, which runs as a sourced file
+            if _ct_is_recorder_file "$_ct_file"; then
                 _ct_in_trap=0
             fi
         fi
 
         if (( _ct_in_trap )); then
+            # The command the ZERR trap reports if it fails: only a command
+            # of the script, never one of the recorder or the shim.
+            _ct_last_cmd="$_ct_cmd"
+
             # Register new source files
             if [[ -n "$_ct_file" ]] && (( ! ${+_ct_registered_paths[$_ct_file]} )); then
                 printf '\''PATH file=%s\n'\'' "$_ct_file" >&3
@@ -529,7 +1098,7 @@ trap '
                 if [[ "${zsh_eval_context[-2]}" == shfunc ]]; then
                     _ct_frame_depths+=($_ct_depth)
                     _ct_frame_kinds+=(f)
-                    trap '\''_ct_function_returned $? ${#funcstack}'\'' EXIT
+                    builtin trap -- "$_ct_fn_exit_action" EXIT
                 else
                     _ct_frame_depths+=($_ct_depth)
                     _ct_frame_kinds+=(s)
@@ -560,20 +1129,93 @@ trap '
             # Capture variables at this step
             _ct_capture_variables
 
+            # Function-form traps (see "Traps set by the script"). The
+            # traps are set here, in the environment of the command, so
+            # that they are local to a function where zsh makes them local.
+            #
+            # A TRAPZERR (or TRAPERR) the script defined since the last
+            # command replaced the recorder'\''s ZERR trap, and no ZERR has
+            # run since (a definition does not fail): adopt it now.
+            if (( ${+functions[TRAPZERR]} || ${+functions[TRAPERR]} )) &&
+               _ct_adopt_defined_trap_function; then
+                builtin trap -- "$_ct_reply" ZERR
+            fi
+            # A TRAPDEBUG would replace this very trap, and a TRAPEXIT the
+            # function'\''s EXIT trap that closes its frame, before the
+            # recorder could see them: the definition about to run is
+            # skipped instead, by the `setopt errexit` the end of this action
+            # runs, and adopted under another name.
+            if [[ "$_ct_cmd" =~ "^TRAP(DEBUG|EXIT) \(\) \{" ]] &&
+               { [[ "${match[1]}" != EXIT ]] || _ct_in_tracked_function "$_ct_depth"; } &&
+               _ct_adopt_trap_function "${match[1]}" "$_ct_cmd"; then
+                builtin trap -- "$_ct_reply" "${_ct_adopted_condition}"
+                _ct_skip_next_command=1
+                # zsh runs the ZERR trap after a skipped function
+                # definition when `$?` was non-zero before it; that ZERR
+                # would not happen without the recorder.
+                if (( _ct_debug_entry_status != 0 )); then
+                    _ct_ignore_next_zerr=1
+                fi
+            fi
+
+            # `unfunction TRAPZERR` removes the ZERR trap whether or not
+            # the function exists, and the script'\''s function-form traps
+            # have other names here: `unfunction` of nothing but those
+            # names is skipped, and the script'\''s traps they name are
+            # reset instead, keeping the recorder'\''s.
+            if [[ "$_ct_cmd" =~ "^unfunction( +TRAP(DEBUG|ZERR|ERR|EXIT))+ *\$" ]]; then
+                for _ct_unfunction_name in ${=_ct_cmd#unfunction}; do
+                    _ct_unfunction_name="${_ct_unfunction_name#TRAP}"
+                    [[ "$_ct_unfunction_name" == ERR ]] && _ct_unfunction_name=ZERR
+                    if [[ "$_ct_unfunction_name" != EXIT ]] ||
+                       _ct_in_tracked_function "$_ct_depth"; then
+                        _ct_compose_trap "$_ct_unfunction_name"
+                        builtin trap -- "$_ct_reply" "$_ct_unfunction_name"
+                    fi
+                done
+                _ct_skip_next_command=1
+                if (( _ct_debug_entry_status != 0 )); then
+                    _ct_ignore_next_zerr=1
+                fi
+            fi
+
+            # A command the script'\''s own DEBUG action runs for too.
+            _ct_run_script_DEBUG=1
+            _ct_script_status_DEBUG=$_ct_debug_entry_status
+
             _ct_in_trap=0
         fi
     fi
-' DEBUG
+'
 
-# ZERR trap for errors — fires when a command returns non-zero exit status
-trap '
+# ZERR trap for errors — fires when a command returns non-zero exit status.
+# Installed like the DEBUG trap; its first command is
+# how the recorder recognises it as its own.
+_ct_zerr_action='
     _ct_zerr_status=$?
-    if (( ! _ct_in_trap )); then
+    _ct_run_script_ZERR=0
+    _ct_zerr_exits=0
+    # See `_ct_zerr_echo_depth`: this ZERR exists only because of the
+    # recorder, so the script'\''s ZERR action does not run for it.
+    _ct_zerr_echo=0
+    if (( _ct_zerr_echo_depth == ${#funcstack} )); then
+        _ct_zerr_echo=1
+    fi
+    _ct_zerr_echo_depth=-1
+    # The ZERR a skipped definition causes: neither recorded nor the
+    # script'\''s (see the DEBUG trap).
+    if (( _ct_ignore_next_zerr )); then
+        _ct_ignore_next_zerr=0
+        _ct_zerr_echo=2
+    fi
+    if (( ! _ct_in_trap && _ct_zerr_echo != 2 )); then
         _ct_in_trap=1
         _ct_zerr_depth=${#funcstack}
 
-        # Skip errors at depth 0 (recorder level)
-        if (( _ct_zerr_depth >= 1 )); then
+        # Skip errors at depth 0 (recorder level), and from the recorder'\''s
+        # functions and the `trap` shim at any depth
+        if (( _ct_zerr_depth >= 1 )) &&
+           ! _ct_is_recorder_file "${funcsourcetrace[1]%%:*}"; then
             # The shell went on, so nothing held for a pending `exit` exits.
             if (( ${#_ct_held_returns} > 0 || _ct_exit_suspect )); then
                 _ct_flush_held_returns
@@ -584,24 +1226,61 @@ trap '
             # Save the error status for the next DEBUG trap (for RETURN detection)
             _ct_last_error_status=$_ct_zerr_status
             _ct_had_error=1
+            # A failure of the script: its own ZERR action runs for it.
+            (( _ct_zerr_echo )) || _ct_run_script_ZERR=1
+            _ct_script_status_ZERR=$_ct_zerr_status
             # With ERR_EXIT set, the shell exits right after this trap, and
             # does not run the zshexit hooks (an errexit exit is not a
-            # "normal" exit), so this is the last point to write EXIT. ZERR
-            # runs only where ERR_EXIT applies, so the exit is certain.
+            # "normal" exit), so this trap is the last point to write EXIT.
+            # ZERR runs only where ERR_EXIT applies, so the exit is certain.
             # See: https://zsh.sourceforge.io/Doc/Release/Options.html#index-ERREXIT
-            # A subshell ends there inside whatever functions it is in, and
-            # runs no zshexit hook either: close the frames it opened.
+            # It is written by `_ct_zerr_finish`, the last command of the
+            # action, after the script'\''s own ZERR action: that action may
+            # `exit` with another status, which the zshexit hook then writes.
             if [[ -o errexit ]]; then
-                if (( ZSH_SUBSHELL > 0 )); then
-                    _ct_close_subshell_frames "$_ct_zerr_status"
-                fi
-                _ct_emit_exit "$_ct_zerr_status"
+                _ct_zerr_exits=1
             fi
         fi
 
         _ct_in_trap=0
     fi
-' ZERR
+'
+
+# The end of the ZERR action, after the script's own action: with ERR_EXIT
+# set the shell exits now, so write the EXIT event. A subshell ends there
+# inside whatever functions it is in, and runs no zshexit hook either:
+# close the frames it opened.
+#
+# Not reached when the script's action ends with `return`, after which zsh
+# still exits under ERR_EXIT: that recording then ends without its EXIT
+# event, and the writer says so ("EOF reached without EXIT event").
+_ct_zerr_finish() {
+    (( _ct_zerr_exits )) || return 0
+    _ct_zerr_exits=0
+    if (( ZSH_SUBSHELL > 0 )); then
+        _ct_close_subshell_frames "$_ct_zerr_status"
+    fi
+    _ct_emit_exit "$_ct_zerr_status"
+}
+
+# The recorder's own traps, without a script action, set here at the top
+# level and not from a function: zsh remembers the function depth a trap
+# was set at, and LOCAL_TRAPS saves (and restores when the function
+# returns) only a trap set at a shallower depth than the function changing
+# it. Set from a function, these would count as set at depth 1, and a
+# script function at that depth that sets its own DEBUG or ZERR trap with
+# LOCAL_TRAPS would keep it after it returns.
+# See: https://zsh.sourceforge.io/Doc/Release/Options.html#index-LOCALTRAPS
+_ct_compose_trap DEBUG
+builtin trap -- "$_ct_reply" DEBUG
+_ct_compose_trap ZERR
+builtin trap -- "$_ct_reply" ZERR
+
+# The script's `trap` (see "Traps set by the script"). Aliases are
+# expanded as the script is read, so this applies to all of it, its
+# functions and `eval`ed code included.
+# See: https://zsh.sourceforge.io/Doc/Release/Shell-Grammar.html#Aliasing
+alias trap="$_ct_trap_alias_text"
 
 # Execute the target script by sourcing it so traps apply
 source "$_ct_target_script" "$@"

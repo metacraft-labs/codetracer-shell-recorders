@@ -1140,3 +1140,136 @@ fn test_zsh_and_list_calls_are_closed() {
     require_zsh!();
     common::check_and_list_calls(&common::ZSH);
 }
+
+// ============================================================================
+// Traps set by the recorded script
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-lose-events-when-the-script-sets-its-own-err-or-debug-trap`.
+// The claims shared with the other shell are in "Traps set by the recorded
+// script" in `common/mod.rs`.
+
+#[test]
+fn test_zsh_script_zerr_trap_keeps_error_capture() {
+    require_zsh!();
+    common::check_script_err_trap_keeps_capturing(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_script_debug_trap_keeps_step_capture() {
+    require_zsh!();
+    common::check_script_debug_trap_keeps_capturing(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_script_debug_action_still_runs() {
+    require_zsh!();
+    common::check_script_debug_action_runs(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_script_trap_reset_and_ignore_keep_capture() {
+    require_zsh!();
+    common::check_script_trap_reset_and_ignore(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_script_trap_listing_shows_script_actions() {
+    require_zsh!();
+    common::check_script_trap_listing(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_replaced_recorder_trap_is_reported() {
+    require_zsh!();
+    common::check_replaced_trap_is_reported(&common::ZSH);
+}
+
+/// Function-form traps (`TRAPZERR() { ... }`, `TRAPDEBUG() { ... }`) keep
+/// working, and `unfunction TRAPZERR` removes the script's trap only: all
+/// three failures (lines 8, 16 and 19) and the steps after `TRAPDEBUG` is
+/// defined are still recorded, and the script's handler runs for the first
+/// two only.
+#[test]
+fn test_zsh_script_function_form_traps_are_chained() {
+    require_zsh!();
+    let shell = &common::ZSH;
+    let run = common::assert_stream_balanced(shell, "trap_fn_forms");
+    assert_eq!(
+        common::error_step_lines(&run),
+        vec![8, 16, 19],
+        "stream:\n{}",
+        run.events.join("\n")
+    );
+    let out = common::record_like_native(shell, "trap_fn_forms");
+    assert_eq!(common::recorded_error_texts(out.path()).len(), 3);
+    let lines: Vec<u64> = common::step_lines_and_depths(out.path())
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    for line in [12, 13, 14, 15, 16, 17, 18, 19, 20] {
+        assert!(lines.contains(&line), "no step at line {line}: {lines:?}");
+    }
+}
+
+/// An `EXIT` trap set inside a function runs when that function returns,
+/// with `$?` its status, and does not replace the recorder's own per-function
+/// `EXIT` trap: every frame is closed with the function's status.
+#[test]
+fn test_zsh_script_function_exit_trap_is_chained() {
+    require_zsh!();
+    let shell = &common::ZSH;
+    common::assert_stream_balanced(shell, "trap_fn_exit");
+    let out = common::record_like_native(shell, "trap_fn_exit");
+    let calls = common::recorded_calls(out.path());
+    common::assert_calls(&calls, "f", 2, &[2]);
+    common::assert_calls(&calls, "g", 2, &[3]);
+}
+
+/// `setopt localtraps` in a function: the `ZERR` trap it sets there is the
+/// script's until the function returns, then the outer one is back, and
+/// both failures (lines 8 and 11) are recorded.
+///
+/// The `ERROR` lines are matched to the step before them rather than
+/// counted: zsh runs the ZERR trap once more in the caller of a function
+/// that returns non-zero when the function has an `EXIT` trap, and the
+/// recorder gives every function one, so the raw stream also has an
+/// `ERROR` for the call of `f` (which the script's own handler does not
+/// see; the standard-output comparison checks that).
+#[test]
+fn test_zsh_script_local_traps_are_restored() {
+    require_zsh!();
+    let shell = &common::ZSH;
+    let run = common::assert_stream_balanced(shell, "trap_local");
+    let mut lines = common::error_step_lines(&run);
+    lines.dedup();
+    assert_eq!(lines, vec![8, 11], "stream:\n{}", run.events.join("\n"));
+    common::record_like_native(shell, "trap_local");
+}
+
+#[test]
+fn test_zsh_script_exit_trap_is_chained() {
+    require_zsh!();
+    common::check_script_exit_trap(&common::ZSH);
+}
+
+/// `setopt localtraps` in a function when the script has no `DEBUG` or
+/// `ZERR` trap outside it: the function's traps are restored away when it
+/// returns (the script's handlers do not run for the commands after it),
+/// and both failures (lines 10 and 14) are recorded.
+#[test]
+fn test_zsh_script_local_traps_without_outer_trap_are_restored() {
+    require_zsh!();
+    let shell = &common::ZSH;
+    let run = common::assert_stream_balanced(shell, "trap_local_first");
+    let mut lines = common::error_step_lines(&run);
+    lines.dedup();
+    assert_eq!(lines, vec![10, 14], "stream:\n{}", run.events.join("\n"));
+    let native = common::native_stdout(shell, "trap_local_first");
+    assert!(
+        native.ends_with("h zerr\nend\n"),
+        "natively, no handler runs after `h` returns: {native:?}"
+    );
+    common::record_like_native(shell, "trap_local_first");
+}

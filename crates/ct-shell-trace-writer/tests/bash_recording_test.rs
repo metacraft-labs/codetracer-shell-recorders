@@ -873,3 +873,74 @@ fn test_bash_sourced_file_frames_are_closed_once() {
 fn test_bash_and_list_calls_are_closed() {
     common::check_and_list_calls(&common::BASH);
 }
+
+// ============================================================================
+// Traps set by the recorded script
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-lose-events-when-the-script-sets-its-own-err-or-debug-trap`.
+// The claims shared with the other shell are in "Traps set by the recorded
+// script" in `common/mod.rs`.
+
+#[test]
+fn test_bash_script_err_trap_keeps_error_capture() {
+    common::check_script_err_trap_keeps_capturing(&common::BASH);
+}
+
+#[test]
+fn test_bash_script_debug_trap_keeps_step_capture() {
+    common::check_script_debug_trap_keeps_capturing(&common::BASH);
+}
+
+#[test]
+fn test_bash_script_debug_action_still_runs() {
+    common::check_script_debug_action_runs(&common::BASH);
+}
+
+#[test]
+fn test_bash_script_trap_reset_and_ignore_keep_capture() {
+    common::check_script_trap_reset_and_ignore(&common::BASH);
+}
+
+#[test]
+fn test_bash_script_trap_listing_shows_script_actions() {
+    common::check_script_trap_listing(&common::BASH);
+}
+
+#[test]
+fn test_bash_replaced_recorder_trap_is_reported() {
+    common::check_replaced_trap_is_reported(&common::BASH);
+}
+
+/// A `RETURN` action of the script runs in the returning function's context
+/// (its FUNCNAME and positional parameters), and every frame is still
+/// closed with the function's own status.
+#[test]
+fn test_bash_script_return_trap_is_chained() {
+    let shell = &common::BASH;
+    common::assert_stream_balanced(shell, "trap_return");
+    let out = common::record_like_native(shell, "trap_return");
+    let calls = common::recorded_calls(out.path());
+    common::assert_calls(&calls, "f", 2, &[3, 3]);
+}
+
+/// `trap '... $LINENO ...; return 1' ERR` and a failure inside a function:
+/// `$LINENO` is the line of the failing command, the `return` ends that
+/// function, and the recording goes on after it (the last step is the
+/// final `echo`).
+#[test]
+fn test_bash_script_err_trap_with_return_and_lineno() {
+    let shell = &common::BASH;
+    common::assert_stream_balanced(shell, "trap_err_return");
+    let out = common::record_like_native(shell, "trap_err_return");
+    let calls = common::recorded_calls(out.path());
+    common::assert_calls(&calls, "f", 2, &[1]);
+    let steps = common::step_lines_and_depths(out.path());
+    assert_eq!(steps.last(), Some(&(13, 1)), "steps: {steps:?}");
+}
+
+#[test]
+fn test_bash_script_exit_trap_is_chained() {
+    common::check_script_exit_trap(&common::BASH);
+}
