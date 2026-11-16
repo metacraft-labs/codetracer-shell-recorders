@@ -1273,3 +1273,18 @@ fn test_zsh_script_local_traps_without_outer_trap_are_restored() {
     );
     common::record_like_native(shell, "trap_local_first");
 }
+
+/// A script that takes descriptor 3 for itself (`exec 3>&1`) neither sees
+/// the event stream on its output nor cuts the recording short.
+#[test]
+fn test_zsh_script_redirecting_fd3_keeps_the_trace_channel() {
+    require_zsh!();
+    common::check_script_fd3_does_not_touch_the_trace_channel(&common::ZSH, "fd3_redirected");
+}
+
+/// A script that closes descriptor 3 (`exec 3>&-`) keeps being recorded.
+#[test]
+fn test_zsh_script_closing_fd3_keeps_the_trace_channel() {
+    require_zsh!();
+    common::check_script_fd3_does_not_touch_the_trace_channel(&common::ZSH, "fd3_closed");
+}

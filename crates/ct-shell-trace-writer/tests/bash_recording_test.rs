@@ -944,3 +944,16 @@ fn test_bash_script_err_trap_with_return_and_lineno() {
 fn test_bash_script_exit_trap_is_chained() {
     common::check_script_exit_trap(&common::BASH);
 }
+
+/// A script that takes descriptor 3 for itself (`exec 3>&1`) neither sees
+/// the event stream on its output nor cuts the recording short.
+#[test]
+fn test_bash_script_redirecting_fd3_keeps_the_trace_channel() {
+    common::check_script_fd3_does_not_touch_the_trace_channel(&common::BASH, "fd3_redirected");
+}
+
+/// A script that closes descriptor 3 (`exec 3>&-`) keeps being recorded.
+#[test]
+fn test_bash_script_closing_fd3_keeps_the_trace_channel() {
+    common::check_script_fd3_does_not_touch_the_trace_channel(&common::BASH, "fd3_closed");
+}

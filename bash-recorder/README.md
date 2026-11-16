@@ -6,7 +6,9 @@ canonical CodeTracer CTFS `.ct` container.
 ## Architecture
 
 * `launcher.sh` — CLI entry point.  Resolves the target script, sets up
-  the FD 3 FIFO between the recorder and the trace writer, and forwards
+  the FD 3 event stream between the recorder and the trace writer (staged
+  through a temporary file; the recorder moves it to a descriptor of 10 or
+  above before the script runs, so the script keeps FD 3), and forwards
   argv as `--args ...` so the implicit `<toplevel>` call records the
   script's positional parameters.  Wrapped by `codetracer-bash-recorder`
   so the recorder is invoked by its canonical `codetracer-<lang>-recorder`

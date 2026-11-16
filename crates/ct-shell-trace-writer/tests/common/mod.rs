@@ -1176,3 +1176,46 @@ pub fn check_script_exit_trap(shell: &Shell) {
     );
     record_like_native(shell, "trap_exit");
 }
+
+/// codetracer-pm issue
+/// `2026-11-15-shell-recorders-print-their-event-stream-to-the-terminal-when-the-script-uses-fd-3`:
+/// the script is sourced into the recorder's shell, so a script that
+/// redirects or closes descriptor 3 for its own use must not take the
+/// recorder's event channel with it (spec
+/// `Recording-Backends/Shell-Recorder.md`, "Interactive Preservation": the
+/// trace channel is "invisible to the script and the user").
+///
+/// For the fixture `stem` (five lines; line 2 does something to FD 3, line
+/// 4 assigns `x=1`), recorded through the launcher:
+///
+/// - standard output is exactly the native run's, `progress` and `end`,
+///   with no wire-protocol line in it;
+/// - the trace has a step for every executable line, 2 to 5;
+/// - the last step's variables include `x`;
+/// - the writer saw the `EXIT` event (no missing-EXIT warning).
+pub fn check_script_fd3_does_not_touch_the_trace_channel(shell: &Shell, stem: &str) {
+    assert_eq!(
+        native_stdout(shell, stem),
+        "progress\nend\n",
+        "{} {stem}: the fixture's native output",
+        shell.interpreter
+    );
+    let out = record_like_native(shell, stem);
+    let lines: Vec<u64> = step_lines_and_depths(out.path())
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    for line in 2..=5 {
+        assert!(
+            lines.contains(&line),
+            "{} {stem}: the trace has no step at line {line}; steps: {lines:?}",
+            shell.interpreter
+        );
+    }
+    let vars = last_step_vars(out.path());
+    assert_string(
+        var(&vars, "x"),
+        "1",
+        &format!("{} {stem}: `x` at the last step", shell.interpreter),
+    );
+}

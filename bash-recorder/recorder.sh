@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # ct-bash-recorder: Records a Bash script execution via trap-based instrumentation.
-# FD 3 must be open and connected to ct-shell-trace-writer's stdin.
+# FD 3 must be open and connected to ct-shell-trace-writer's stdin. The
+# recorder moves that channel to a free descriptor of 10 or above before the
+# script runs (see `_ct_events_fd` below).
 
 set -o functrace    # DEBUG trap inherited by functions
 set -o errtrace     # ERR trap inherited by functions
@@ -17,11 +19,44 @@ fi
 # Resolve absolute path
 _ct_target_script="$(cd "$(dirname "$_ct_target_script")" && pwd)/$(basename "$_ct_target_script")"
 
+# Move the event channel off FD 3 before the script runs.
+#
+# The script is sourced into this shell, so it shares our descriptors. FD 3
+# is one scripts take for themselves (`exec 3>&1` keeps a handle on the
+# original standard output; `exec 3>&-` closes it), and every event written
+# to `>&3` would then go wherever the script pointed it -- onto the user's
+# terminal, or nowhere -- and the trace would end at that line. Spec
+# `Recording-Backends/Shell-Recorder.md`, "Interactive Preservation": the
+# trace channel is invisible to the script and the user.
+#
+# The channel is duplicated onto the lowest free descriptor of 10 or above
+# and FD 3 is closed, leaving the script the descriptors a script normally
+# uses (0-9) and the state it would have without the recorder. A script can
+# still redirect or close a descriptor of 10 or above by number; that is
+# the residual risk the spec names. Bash's `exec {var}>&3`, which picks the
+# descriptor the same way, needs Bash 4.1, and the recorder supports 4.0,
+# so the free descriptor is found by probing: `: >&N` fails exactly when N
+# is not open. A descriptor Bash itself holds during the probe (its saved
+# copy of FD 2) reads as open and is skipped, which only moves the choice up.
+# See: https://www.gnu.org/software/bash/manual/html_node/Redirections.html
+if ! { : >&3; } 2>/dev/null; then
+    echo "recorder.sh: FD 3 is not open; run the recorder through launcher.sh" >&2
+    exit 1
+fi
+_ct_events_fd=10
+while { : >&"$_ct_events_fd"; } 2>/dev/null; do
+    if (( ++_ct_events_fd > 255 )); then
+        echo "recorder.sh: no free file descriptor between 10 and 255 for the event stream" >&2
+        exit 1
+    fi
+done
+eval "exec $_ct_events_fd>&3 3>&-"
+
 # Emit START event
-printf 'START program=%s shell=bash shell_version=%s\n' "$_ct_target_script" "$BASH_VERSION" >&3
+printf 'START program=%s shell=bash shell_version=%s\n' "$_ct_target_script" "$BASH_VERSION" >&"$_ct_events_fd"
 
 # Register the main script path
-printf 'PATH file=%s\n' "$_ct_target_script" >&3
+printf 'PATH file=%s\n' "$_ct_target_script" >&"$_ct_events_fd"
 
 # Track which files we've already registered
 declare -A _ct_registered_paths
@@ -189,7 +224,7 @@ _ct_capture_variables() {
         # Emit VAR event with quoted value
         local _ct_quoted_val
         _ct_quoted_val=$(_ct_quote_value "$_ct_value")
-        printf 'VAR name=%s value=%s type=%s\n' "$_ct_varname" "$_ct_quoted_val" "$_ct_type_flag" >&3
+        printf 'VAR name=%s value=%s type=%s\n' "$_ct_varname" "$_ct_quoted_val" "$_ct_type_flag" >&"$_ct_events_fd"
     done <<< "$_ct_decl_output"
 }
 
@@ -312,7 +347,7 @@ _ct_pop_frame() {
     local _ct_last=$(( ${#_ct_frame_depths[@]} - 1 ))
     unset "_ct_frame_depths[$_ct_last]" "_ct_frame_names[$_ct_last]" "_ct_frame_kinds[$_ct_last]"
     _ct_deferred_pop=-1
-    printf 'RETURN status=%d\n' "$1" >&3
+    printf 'RETURN status=%d\n' "$1" >&"$_ct_events_fd"
 }
 
 # Close every open frame deeper than depth $1, innermost first; $2 is the
@@ -410,7 +445,7 @@ _ct_debug_trap() {
 
     # Register new source files
     if [[ -z "${_ct_registered_paths[$_ct_file]+x}" ]]; then
-        printf 'PATH file=%s\n' "$_ct_file" >&3
+        printf 'PATH file=%s\n' "$_ct_file" >&"$_ct_events_fd"
         _ct_registered_paths["$_ct_file"]=1
     fi
 
@@ -482,7 +517,7 @@ _ct_debug_trap() {
         # still appear in the function table (FUNC event), it just must not
         # surface as a counted CALL below.
         if [[ -z "${_ct_registered_funcs[$_ct_func_name]+x}" ]]; then
-            printf 'FUNC name=%s file=%s line=%d\n' "$_ct_func_name" "$_ct_file" "$_ct_line" >&3
+            printf 'FUNC name=%s file=%s line=%d\n' "$_ct_func_name" "$_ct_file" "$_ct_line" >&"$_ct_events_fd"
             _ct_registered_funcs["$_ct_func_name"]=1
         fi
 
@@ -532,12 +567,12 @@ _ct_debug_trap() {
                     local _ct_arg_val="${BASH_ARGV[$_ct_arg_slot]:-}"
                     local _ct_arg_quoted
                     _ct_arg_quoted=$(_ct_quote_value "$_ct_arg_val")
-                    printf 'ARG name=$%d value=%s type=s\n' "$_ct_arg_idx" "$_ct_arg_quoted" >&3
+                    printf 'ARG name=$%d value=%s type=s\n' "$_ct_arg_idx" "$_ct_arg_quoted" >&"$_ct_events_fd"
                 done
             fi
 
             # Emit CALL event (drains the ARG events staged above)
-            printf 'CALL name=%s\n' "$_ct_func_name" >&3
+            printf 'CALL name=%s\n' "$_ct_func_name" >&"$_ct_events_fd"
             if [[ "$_ct_func_name" == source ]]; then
                 _ct_push_frame "$_ct_depth" "$_ct_func_name" s
             else
@@ -554,11 +589,11 @@ _ct_debug_trap() {
         # Extract the content (approximate — just use the full command)
         local _ct_write_content
         _ct_write_content=$(_ct_quote_value "$_ct_cmd")
-        printf 'WRITE content=%s\n' "$_ct_write_content" >&3
+        printf 'WRITE content=%s\n' "$_ct_write_content" >&"$_ct_events_fd"
     fi
 
     # Emit step event
-    printf 'STEP file=%s line=%d\n' "$_ct_file" "$_ct_line" >&3
+    printf 'STEP file=%s line=%d\n' "$_ct_file" "$_ct_line" >&"$_ct_events_fd"
 
     # Capture variables at this step
     _ct_capture_variables
@@ -621,7 +656,7 @@ _ct_err_trap() {
 
     local _ct_quoted_cmd
     _ct_quoted_cmd=$(_ct_quote_value "$_ct_cmd")
-    printf 'ERROR cmd=%s status=%d\n' "$_ct_quoted_cmd" "$_ct_status" >&3
+    printf 'ERROR cmd=%s status=%d\n' "$_ct_quoted_cmd" "$_ct_status" >&"$_ct_events_fd"
 
     # With `errexit` on, the shell exits right after this trap: bash runs the
     # ERR trap under exactly the conditions under which `set -e` exits. In a
@@ -779,7 +814,7 @@ _ct_emit_exit() {
     builtin trap - RETURN
     builtin trap - ERR
 
-    printf 'EXIT code=%d\n' "$_ct_code" >&3
+    printf 'EXIT code=%d\n' "$_ct_code" >&"$_ct_events_fd"
 }
 
 # ---------------------------------------------------------------------------
@@ -1274,7 +1309,7 @@ _ct_report_replaced_traps() {
     [[ -n "$_ct_replaced" ]] || return 0
     local _ct_message="the script replaced the recorder's ${_ct_replaced} trap without going through \`trap\` (\`builtin trap\`, \`command trap\` or POSIX mode); events recorded through it are missing after that point"
     printf 'codetracer-bash-recorder: warning: %s\n' "$_ct_message" >&2
-    printf 'ERROR cmd=%s status=0\n' "$(_ct_quote_value "$_ct_message")" >&3
+    printf 'ERROR cmd=%s status=0\n' "$(_ct_quote_value "$_ct_message")" >&"$_ct_events_fd"
 }
 
 _ct_install_trap DEBUG

@@ -242,7 +242,9 @@ _ct_events_file=$(mktemp "${TMPDIR:-/tmp}/ct-events-XXXXXX")
 # Clean up on exit
 trap 'rm -f "$_ct_events_file"' EXIT
 
-# Run the recorder with FD 3 connected to the event file.
+# Run the recorder with FD 3 connected to the event file. The recorder moves
+# the stream to a free descriptor of 10 or above and closes FD 3 before it
+# sources the script, so a script that uses FD 3 itself does not touch it.
 #
 # The recorder exits with the recorded script's status, and that status is
 # saved here to be returned by the launcher's last line, after the trace is

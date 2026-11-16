@@ -1,6 +1,8 @@
 #!/usr/bin/env zsh
 # ct-zsh-recorder: Records a Zsh script execution via trap-based instrumentation.
-# FD 3 must be open and connected to ct-shell-trace-writer's stdin.
+# FD 3 must be open and connected to ct-shell-trace-writer's stdin. The
+# recorder moves that channel to a free descriptor of 10 or above before the
+# script runs (see `_ct_events_fd` below).
 
 setopt DEBUG_BEFORE_CMD    # DEBUG trap fires BEFORE each command
 
@@ -30,11 +32,35 @@ fi
 [[ "$_ct_target_script" == /* ]] || _ct_target_script="$PWD/$_ct_target_script"
 _ct_target_script="${_ct_target_script:a}"
 
+# Move the event channel off FD 3 before the script runs.
+#
+# The script is sourced into this shell, so it shares our descriptors. FD 3
+# is one scripts take for themselves (`exec 3>&1` keeps a handle on the
+# original standard output; `exec 3>&-` closes it), and every event written
+# to `>&3` would then go wherever the script pointed it -- onto the user's
+# terminal, or nowhere -- and the trace would end at that line. Spec
+# `Recording-Backends/Shell-Recorder.md`, "Interactive Preservation": the
+# trace channel is invisible to the script and the user.
+#
+# `{var}>&3` has zsh open the lowest free descriptor of 10 or above and
+# store its number in the variable; FD 3 is then closed, leaving the script
+# the descriptors a script normally uses (0-9). A script can still redirect
+# or close a descriptor of 10 or above by number; that is the residual risk
+# the spec names. The variable carries the `_ct_` prefix, so the variable
+# capture skips it like the recorder's other state.
+# See: https://zsh.sourceforge.io/Doc/Release/Redirection.html (Opening file descriptors in variables)
+if ! { : >&3 } 2>/dev/null; then
+    echo "recorder.zsh: FD 3 is not open; run the recorder through launcher.zsh" >&2
+    exit 1
+fi
+typeset -i _ct_events_fd
+exec {_ct_events_fd}>&3 3>&-
+
 # Emit START event
-printf 'START program=%s shell=zsh shell_version=%s\n' "$_ct_target_script" "$ZSH_VERSION" >&3
+printf 'START program=%s shell=zsh shell_version=%s\n' "$_ct_target_script" "$ZSH_VERSION" >&$_ct_events_fd
 
 # Register the main script path
-printf 'PATH file=%s\n' "$_ct_target_script" >&3
+printf 'PATH file=%s\n' "$_ct_target_script" >&$_ct_events_fd
 
 # Track which files we've already registered
 typeset -A _ct_registered_paths
@@ -111,7 +137,7 @@ _ct_subshell_closed=0
 _ct_pop_frame() {
     _ct_frame_depths[-1]=()
     _ct_frame_kinds[-1]=()
-    printf 'RETURN status=%d\n' "$1" >&3
+    printf 'RETURN status=%d\n' "$1" >&$_ct_events_fd
 }
 
 # Close every open frame deeper than funcstack depth $1 with status $2: the
@@ -126,7 +152,7 @@ _ct_close_frames_deeper_than() {
 _ct_flush_held_returns() {
     local _ct_entry
     for _ct_entry in "${_ct_held_returns[@]}"; do
-        printf 'RETURN status=%d\n' "${_ct_entry#*:}" >&3
+        printf 'RETURN status=%d\n' "${_ct_entry#*:}" >&$_ct_events_fd
     done
     _ct_held_returns=()
     _ct_exit_suspect=0
@@ -164,7 +190,7 @@ _ct_function_returned() {
     if (( _ct_exit_suspect && _ct_n <= _ct_exit_suspect_size )); then
         _ct_held_returns+=("$_ct_n:$1")
     else
-        printf 'RETURN status=%d\n' "$1" >&3
+        printf 'RETURN status=%d\n' "$1" >&$_ct_events_fd
     fi
 }
 
@@ -181,9 +207,9 @@ _ct_close_subshell_frames() {
     local _ct_entry _ct_code=$(( $1 & 255 ))
     for _ct_entry in "${_ct_held_returns[@]}"; do
         if (( ${_ct_entry%%:*} <= _ct_exit_suspect_size )); then
-            printf 'RETURN status=%d\n' "$_ct_code" >&3
+            printf 'RETURN status=%d\n' "$_ct_code" >&$_ct_events_fd
         else
-            printf 'RETURN status=%d\n' "${_ct_entry#*:}" >&3
+            printf 'RETURN status=%d\n' "${_ct_entry#*:}" >&$_ct_events_fd
         fi
     done
     _ct_held_returns=()
@@ -200,7 +226,7 @@ _ct_flush_held_returns_before_exit() {
     local _ct_entry
     for _ct_entry in "${_ct_held_returns[@]}"; do
         if (( ${_ct_entry%%:*} > _ct_exit_suspect_size )); then
-            printf 'RETURN status=%d\n' "${_ct_entry#*:}" >&3
+            printf 'RETURN status=%d\n' "${_ct_entry#*:}" >&$_ct_events_fd
         fi
     done
     _ct_held_returns=()
@@ -264,7 +290,7 @@ _ct_emit_exit() {
     builtin trap - DEBUG
     builtin trap - ZERR
 
-    printf 'EXIT code=%d\n' "$_ct_code" >&3
+    printf 'EXIT code=%d\n' "$_ct_code" >&$_ct_events_fd
 }
 
 # A zshexit hook rather than an EXIT trap. With a DEBUG trap set, as here,
@@ -426,7 +452,7 @@ _ct_capture_variables() {
 
         # Inline quoting (no subshell) - sets _ct_qv
         _ct_inline_quote "$_ct_value"
-        printf 'VAR name=%s value=%s type=%s\n' "$_ct_varname" "$_ct_qv" "$_ct_type_flag" >&3
+        printf 'VAR name=%s value=%s type=%s\n' "$_ct_varname" "$_ct_qv" "$_ct_type_flag" >&$_ct_events_fd
     done <<< "$_ct_decl_output"
 }
 
@@ -946,7 +972,7 @@ _ct_report_replaced_traps() {
     local _ct_t_message="the script replaced the recorder's ${_ct_t_replaced} trap without going through \`trap\` (\`builtin trap\`, \`command trap\` or a function-form trap the recorder did not see defined); events recorded through it are missing after that point"
     print -r -u2 -- "codetracer-zsh-recorder: warning: $_ct_t_message"
     _ct_inline_quote "$_ct_t_message"
-    printf 'ERROR cmd=%s status=0\n' "$_ct_qv" >&3
+    printf 'ERROR cmd=%s status=0\n' "$_ct_qv" >&$_ct_events_fd
 }
 
 # DEBUG trap (LIST FORM - critical for correct $LINENO)
@@ -1024,7 +1050,7 @@ _ct_debug_action='
 
             # Register new source files
             if [[ -n "$_ct_file" ]] && (( ! ${+_ct_registered_paths[$_ct_file]} )); then
-                printf '\''PATH file=%s\n'\'' "$_ct_file" >&3
+                printf '\''PATH file=%s\n'\'' "$_ct_file" >&$_ct_events_fd
                 _ct_registered_paths[$_ct_file]=1
             fi
 
@@ -1068,7 +1094,7 @@ _ct_debug_action='
                 # Register function if first time seen
                 # Use the definition line from funcsourcetrace
                 if (( ! ${+_ct_registered_funcs[$_ct_func_name]} )); then
-                    printf '\''FUNC name=%s file=%s line=%d\n'\'' "$_ct_func_name" "$_ct_file" "$_ct_func_def_line" >&3
+                    printf '\''FUNC name=%s file=%s line=%d\n'\'' "$_ct_func_name" "$_ct_file" "$_ct_func_def_line" >&$_ct_events_fd
                     _ct_registered_funcs[$_ct_func_name]=1
                 fi
 
@@ -1082,12 +1108,12 @@ _ct_debug_action='
                 while (( _ct_arg_idx <= _ct_arg_count )); do
                     _ct_arg_val="${argv[$_ct_arg_idx]}"
                     _ct_inline_quote "$_ct_arg_val"
-                    printf '\''ARG name=$%d value=%s type=s\n'\'' "$_ct_arg_idx" "$_ct_qv" >&3
+                    printf '\''ARG name=$%d value=%s type=s\n'\'' "$_ct_arg_idx" "$_ct_qv" >&$_ct_events_fd
                     _ct_arg_idx=$(( _ct_arg_idx + 1 ))
                 done
 
                 # Emit CALL event (drains the ARG events staged above)
-                printf '\''CALL name=%s\n'\'' "$_ct_func_name" >&3
+                printf '\''CALL name=%s\n'\'' "$_ct_func_name" >&$_ct_events_fd
 
                 # Open the frame. A function frame gets the EXIT trap that
                 # closes it (see "Open frames"); set here, before the
@@ -1120,11 +1146,11 @@ _ct_debug_action='
             # Detect output commands from ZSH_DEBUG_CMD
             if [[ "$_ct_cmd" == echo\ * ]] || [[ "$_ct_cmd" == printf\ * ]] || [[ "$_ct_cmd" == print\ * ]]; then
                 _ct_inline_quote "$_ct_cmd"
-                printf '\''WRITE content=%s\n'\'' "$_ct_qv" >&3
+                printf '\''WRITE content=%s\n'\'' "$_ct_qv" >&$_ct_events_fd
             fi
 
             # Emit step event
-            printf '\''STEP file=%s line=%d\n'\'' "$_ct_file" "$_ct_line" >&3
+            printf '\''STEP file=%s line=%d\n'\'' "$_ct_file" "$_ct_line" >&$_ct_events_fd
 
             # Capture variables at this step
             _ct_capture_variables
@@ -1222,7 +1248,7 @@ _ct_zerr_action='
             fi
             _ct_zerr_cmd="$_ct_last_cmd"
             _ct_inline_quote "$_ct_zerr_cmd"
-            printf '\''ERROR cmd=%s status=%d\n'\'' "$_ct_qv" "$_ct_zerr_status" >&3
+            printf '\''ERROR cmd=%s status=%d\n'\'' "$_ct_qv" "$_ct_zerr_status" >&$_ct_events_fd
             # Save the error status for the next DEBUG trap (for RETURN detection)
             _ct_last_error_status=$_ct_zerr_status
             _ct_had_error=1
