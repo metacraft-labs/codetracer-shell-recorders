@@ -453,3 +453,187 @@ fn test_cli_version_prints_canonical_line() {
         "--version line should start with the binary name; got: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Script arguments that look like writer options.
+//
+// The launchers pass the recorded script's own arguments to the writer after
+// `--args`, which ends the writer's options: everything after it belongs to
+// the script (spec `CLI/recorders/shell.md`, "Options", `--`). A script
+// argument of `-h`, `--help`, `-V` or `--version` must therefore be recorded
+// as the script's `$1`, not answered with the writer's usage or version, and
+// the writer must still write the trace (`Recorder-CLI-Conventions.md` §6:
+// exit 0 means "recording completed, trace written").
+// ---------------------------------------------------------------------------
+
+/// The writer's own help and version flags, in both spellings.
+const HELP_AND_VERSION_FLAGS: [&str; 4] = ["-h", "--help", "-V", "--version"];
+
+/// Run the writer binary with `args`, feeding `stdin` to it, and return its
+/// captured output.
+fn run_writer(args: &[&str], stdin: &str) -> std::process::Output {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let bin = locate_trace_writer_binary();
+    let mut child = Command::new(&bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to execute {bin:?}: {e}"));
+    // A writer that exits without reading its input (the defect this guards
+    // against) closes the pipe early; a broken pipe here is that outcome,
+    // which the assertions on the output report, not a harness failure.
+    let _ = child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin.as_bytes());
+    child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("failed to wait for {bin:?}: {e}"))
+}
+
+#[test]
+fn test_cli_script_argument_that_is_a_help_or_version_flag_is_recorded() {
+    for flag in HELP_AND_VERSION_FLAGS {
+        let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let out_dir = tmp_dir.path().to_str().expect("utf-8 temp dir");
+        let events = "START program=/tmp/args.sh shell=bash shell_version=5.2.0\n\
+                      PATH file=/tmp/args.sh\n\
+                      STEP file=/tmp/args.sh line=1\n\
+                      EXIT code=0\n";
+        let output = run_writer(
+            &[
+                "--out-dir",
+                out_dir,
+                "--program",
+                "/tmp/args.sh",
+                "--args",
+                flag,
+            ],
+            events,
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "`--args {flag}`: the writer must exit 0; status {:?}, stderr={stderr}",
+            output.status
+        );
+        assert!(
+            stdout.is_empty(),
+            "`--args {flag}`: the writer must not print its version (or anything) \
+             to stdout; stdout={stdout}"
+        );
+        assert!(
+            !stderr.contains("Usage:"),
+            "`--args {flag}`: the writer must not print its usage; stderr={stderr}"
+        );
+
+        let ct_path = tmp_dir.path().join("args.ct");
+        assert!(
+            ct_path.is_file(),
+            "`--args {flag}`: args.ct must be written; files: {:?}; stderr={stderr}",
+            fs::read_dir(tmp_dir.path())
+                .map(|rd| rd
+                    .filter_map(|e| e.ok().map(|e| e.file_name()))
+                    .collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
+
+        // The flag is the script's `$1`, carried by the `<script>` entry call
+        // (the second call, after the writer-owned argument-free root).
+        let reader = NimTraceReaderHandle::open(&ct_path.to_string_lossy())
+            .unwrap_or_else(|e| panic!("failed to open Nim CTFS reader for {ct_path:?}: {e}"));
+        let calls: Vec<serde_json::Value> = (0..reader.call_count())
+            .map(|key| {
+                let json = reader.call_json(key).expect("read call JSON");
+                serde_json::from_str(&json)
+                    .unwrap_or_else(|e| panic!("invalid call JSON: {e}: {json}"))
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "expected root and script: {calls:#?}");
+        let script_fn = calls[1]["function_id"].as_u64().expect("function_id");
+        assert_eq!(
+            reader.function(script_fn).expect("function name"),
+            "<script>"
+        );
+        assert_call_args(
+            &reader,
+            &calls[1..2],
+            &[("$1", ExpectedArgValue::String(flag))],
+        );
+    }
+}
+
+/// The short spellings of the writer's own options still work when given as
+/// options (before `--args`), alongside the long ones covered above.
+#[test]
+fn test_cli_short_help_and_version_options_still_work() {
+    let version = run_writer(&["-V"], "");
+    assert!(version.status.success(), "-V should exit zero");
+    let stdout = String::from_utf8_lossy(&version.stdout);
+    assert_eq!(
+        stdout,
+        format!("ct-shell-trace-writer {}\n", env!("CARGO_PKG_VERSION")),
+        "-V should print exactly the version line"
+    );
+
+    let help = run_writer(&["-h"], "");
+    assert!(help.status.success(), "-h should exit zero");
+    let stderr = String::from_utf8_lossy(&help.stderr);
+    assert!(
+        stderr.contains("Usage:"),
+        "-h should print usage; stderr={stderr}"
+    );
+}
+
+/// `--help` / `--version` given among the writer's options, before `--args`,
+/// is answered even when other options precede it and script arguments
+/// follow; no trace is written.
+#[test]
+fn test_cli_help_and_version_options_before_args_are_answered() {
+    for flag in HELP_AND_VERSION_FLAGS {
+        let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let out_dir = tmp_dir.path().join("out");
+        let out_dir_str = out_dir.to_str().expect("utf-8 temp dir");
+        let output = run_writer(
+            &[
+                "--out-dir",
+                out_dir_str,
+                "--program",
+                "/tmp/args.sh",
+                flag,
+                "--args",
+                "plain",
+            ],
+            "",
+        );
+        assert!(
+            output.status.success(),
+            "`{flag}` before --args should exit zero; status {:?}",
+            output.status
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if flag == "-V" || flag == "--version" {
+            assert!(
+                stdout.starts_with("ct-shell-trace-writer "),
+                "`{flag}` should print the version; stdout={stdout}"
+            );
+        } else {
+            assert!(
+                stderr.contains("Usage:"),
+                "`{flag}` should print usage; stderr={stderr}"
+            );
+        }
+        assert!(
+            !out_dir.exists(),
+            "`{flag}`: help/version must not create the output directory"
+        );
+    }
+}

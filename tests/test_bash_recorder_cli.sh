@@ -665,5 +665,118 @@ else
   echo "skipped: T9 under Bash 3.2 — CT_TEST_BASH_3_2 is unset (Linux dev shell only)"
 fi
 
+# ---------------------------------------------------------------------------
+# T10. A script argument that is one of the recorder's or the writer's own
+# flags (`-h`, `--help`, `-V`, `--version`) belongs to the script.
+#
+# Spec `CLI/recorders/shell.md`, "Options": after the script, everything is
+# the script's arguments. The launcher hands them to `ct-shell-trace-writer`
+# after `--args`, so the writer must not answer them with its own usage or
+# version: the recording must exit 0 with exactly one trace, print only the
+# script's output, and record the flag as the `<script>` call's `$1`
+# (`Recorder-CLI-Conventions.md` §6: exit 0 means "trace written").
+# Each flag is given both plainly after the script and after `--`.
+# ---------------------------------------------------------------------------
+
+ARGS_FIXTURE="${WORK_DIR}/args.sh"
+cat > "${ARGS_FIXTURE}" <<'EOF'
+echo "args: $*"
+EOF
+
+for flag in -h --help -V --version; do
+  for form in plain dashdash; do
+    label="T10 script argument ${flag} (${form})"
+    out="${WORK_DIR}/t10-${flag#--}-${form}"
+    if [[ "${form}" == dashdash ]]; then
+      run_entry "" "${out}" -- -- "${ARGS_FIXTURE}" "${flag}"
+    else
+      run_entry "" "${out}" -- "${ARGS_FIXTURE}" "${flag}"
+    fi
+    [[ "${RUN_RC}" == "0" ]] \
+      || fail "${label}: launcher exited ${RUN_RC}; stdout: ${RUN_STDOUT}; stderr: ${RUN_STDERR}"
+    [[ "${RUN_STDOUT}" == "args: ${flag}" ]] \
+      || fail "${label}: stdout must be exactly the script's 'args: ${flag}'; got: ${RUN_STDOUT}"
+    shopt -s nullglob
+    cts=("${out}"/*.ct)
+    shopt -u nullglob
+    [[ "${#cts[@]}" == "1" && -f "${out}/args.ct" ]] \
+      || fail "${label}: expected exactly one *.ct (args.ct) in ${out}, found ${#cts[@]}: $(ls -A "${out}" 2>/dev/null)"
+    SCRIPT_ARGS="$(run_ct_print --full --strip-paths "${out}/args.ct" | jq -c '
+      [.events[] | select(.kind == "call_entry" and .function == "<script>")
+       | [.args[] | [.varname, .value.kind, .value.text]]]')"
+    [[ "${SCRIPT_ARGS}" == "[[[\"\$1\",\"String\",\"${flag}\"]]]" ]] \
+      || fail "${label}: the <script> call must carry \$1=String(\"${flag}\") and nothing else; got: ${SCRIPT_ARGS}"
+    pass "${label}: exit 0, one .ct, stdout is the script's, <script>(\$1=\"${flag}\")"
+  done
+done
+
+# ---------------------------------------------------------------------------
+# T11. A recording whose trace writer finishes without writing `<script>.ct`
+# fails: a message on stderr naming the missing trace, and exit 1.
+#
+# Spec `CLI/ct/record.md`, "Corner Cases": a recorder that produced no trace
+# but exited 0 is the silent-incompleteness pattern. `Recorder-CLI-
+# Conventions.md` §6 gives a recorder error exit 1 "regardless of the target
+# program's exit code", so a script that itself failed still makes the
+# launcher exit 1; the message carries the script's status instead.
+#
+# Two real ways for the writer to end with no trace and exit 0, neither of
+# them a stub:
+#   * `<out-dir>/args.ct` is already a directory, so the writer cannot create
+#     the container: it warns, and `TraceBridge::finish` writes nothing.
+#     The check must test for a regular file, not merely for the name.
+#   * The recorder cannot move the event channel to a descriptor of 10 or
+#     above (an open-files limit of 12), so no START event reaches the writer
+#     and, again, `finish` writes nothing.
+# ---------------------------------------------------------------------------
+
+FAIL3_FIXTURE="${WORK_DIR}/args3.sh"
+cat > "${FAIL3_FIXTURE}" <<'EOF'
+echo "args: $*"
+exit 3
+EOF
+
+# expect_no_trace_failure <label> <trace-path> <script-stdout> [status-phrase]
+expect_no_trace_failure() {
+  local label="$1" trace="$2" stdout="$3" status_phrase="${4:-}"
+  [[ "${RUN_RC}" == "1" ]] \
+    || fail "${label}: launcher must exit 1, got ${RUN_RC}; stdout: ${RUN_STDOUT}; stderr: ${RUN_STDERR}"
+  [[ "${RUN_STDOUT}" == "${stdout}" ]] \
+    || fail "${label}: the script must still run; stdout: ${RUN_STDOUT}"
+  grep -qF "recording failed" <<< "${RUN_STDERR}" \
+    || fail "${label}: stderr must say the recording failed; stderr: ${RUN_STDERR}"
+  grep -qF "${trace}" <<< "${RUN_STDERR}" \
+    || fail "${label}: stderr must name the missing trace ${trace}; stderr: ${RUN_STDERR}"
+  if [[ -n "${status_phrase}" ]]; then
+    grep -qF "${status_phrase}" <<< "${RUN_STDERR}" \
+      || fail "${label}: stderr must report '${status_phrase}'; stderr: ${RUN_STDERR}"
+  fi
+  pass "${label}: exit 1, stderr names ${trace##*/}"
+}
+
+OUT_DIR_T11="${WORK_DIR}/t11-ct-is-dir"
+mkdir -p "${OUT_DIR_T11}/args.ct"
+run_entry "" "${OUT_DIR_T11}" -- "${ARGS_FIXTURE}" one
+expect_no_trace_failure "T11 args.ct is a directory" \
+  "${OUT_DIR_T11}/args.ct" "args: one"
+
+OUT_DIR_T11B="${WORK_DIR}/t11-ct-is-dir-status3"
+mkdir -p "${OUT_DIR_T11B}/args3.ct"
+run_entry "" "${OUT_DIR_T11B}" -- "${FAIL3_FIXTURE}" one
+expect_no_trace_failure "T11 args3.ct is a directory, script exits 3" \
+  "${OUT_DIR_T11B}/args3.ct" "args: one" "status 3"
+
+OUT_DIR_T11C="${WORK_DIR}/t11-no-start"
+RUN_RC=0
+( ulimit -n 12 && exec "${BIN}" --out-dir "${OUT_DIR_T11C}" "${ARGS_FIXTURE}" one ) \
+  >"${WORK_DIR}/run.out" 2>"${WORK_DIR}/run.err" || RUN_RC=$?
+RUN_STDOUT="$(cat "${WORK_DIR}/run.out")"
+RUN_STDERR="$(cat "${WORK_DIR}/run.err")"
+# Positive control: the writer really received no START event.
+grep -qF "EOF reached without EXIT event" <<< "${RUN_STDERR}" \
+  || fail "T11 control: under 'ulimit -n 12' the writer should see an empty stream; stderr: ${RUN_STDERR}"
+expect_no_trace_failure "T11 no START event (ulimit -n 12)" \
+  "${OUT_DIR_T11C}/args.ct" "args: one"
+
 echo ""
 echo "test_bash_recorder_cli: ${PASS_COUNT} assertions passed"

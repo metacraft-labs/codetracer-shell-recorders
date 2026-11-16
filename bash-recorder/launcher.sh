@@ -299,6 +299,37 @@ else
         < "$_ct_events_file"
 fi
 
+# A writer that exits 0 has not necessarily written a trace: it only warns
+# when it cannot create the container, and it writes nothing at all when no
+# START event arrived (`TraceBridge::finish` in
+# crates/ct-shell-trace-writer/src/trace_bridge.rs). Exiting 0 then would be
+# the silent-incompleteness pattern spec `CLI/ct/record.md` ("Corner Cases")
+# forbids, so a missing trace fails the recording here, before the launcher
+# writes its own sidecars and makes the directory look like a bundle.
+#
+# The exit code is 1 whatever the script's status, as spec
+# `Recorder-CLI-Conventions.md` §6 "Exit Codes" asks of recorder errors; the
+# script's status is reported in the message instead of being lost.
+#
+# The writer names the container after the script: the basename of
+# `--program` without its last extension, a leading dot not counting as one
+# (Rust's `Path::file_stem`, applied in `trace_writer_begin_events`,
+# codetracer-trace-format `codetracer_trace_writer_ffi/src/writer.rs`).
+# https://doc.rust-lang.org/std/path/struct.Path.html#method.file_stem
+# `-f` rather than `-e`: a directory of that name is not a trace.
+_ct_trace_base="${_ct_script##*/}"
+_ct_trace_stem="${_ct_trace_base%.*}"
+[[ -n "$_ct_trace_stem" ]] || _ct_trace_stem="$_ct_trace_base"
+_ct_trace_file="$_ct_output_dir/$_ct_trace_stem.ct"
+if [[ ! -f "$_ct_trace_file" ]]; then
+    _ct_message="Error: recording failed: the trace writer finished without writing $_ct_trace_file"
+    if (( _ct_exit_code != 0 )); then
+        _ct_message+=" (the script exited with status $_ct_exit_code)"
+    fi
+    echo "$_ct_message" >&2
+    exit 1
+fi
+
 # ============================================================================
 # Post-recording steps: enrich the trace folder for self-containment
 # ============================================================================

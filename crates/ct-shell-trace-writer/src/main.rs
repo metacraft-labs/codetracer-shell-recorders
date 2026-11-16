@@ -23,7 +23,8 @@ fn print_usage() {
     eprintln!("Options:");
     eprintln!("  --out-dir <path>      Directory where trace files are written (required)");
     eprintln!("  --program <name>      Override program name (normally from START event)");
-    eprintln!("  --args <arg> ...      Program arguments for metadata");
+    eprintln!("  --args <arg> ...      Script arguments; must come last: every token after");
+    eprintln!("                        it is the script's, even one spelled like an option");
     eprintln!("  --version, -V         Print version and exit");
     eprintln!("  --help, -h            Print this help and exit");
     eprintln!();
@@ -31,54 +32,55 @@ fn print_usage() {
     eprintln!("to convert the recorded `.ct` bundle to JSON / a follow stream.");
 }
 
+/// The settings of a recording run, parsed from the command line.
+#[derive(Debug, PartialEq, Eq)]
 struct CliArgs {
     output_dir: PathBuf,
     program: String,
     args: Vec<String>,
 }
 
-fn parse_cli_args() -> Result<CliArgs, String> {
-    let args: Vec<String> = std::env::args().collect();
+/// What the command line asks the writer to do.
+#[derive(Debug, PartialEq, Eq)]
+enum CliCommand {
+    /// Read the event stream and write a trace.
+    Run(CliArgs),
+    /// Print the usage text and exit 0.
+    Help,
+    /// Print the version line and exit 0.
+    Version,
+}
 
-    if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("ct-shell-trace-writer {}", env!("CARGO_PKG_VERSION"));
-        process::exit(0);
-    }
-
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_usage();
-        process::exit(0);
-    }
-
+/// Parse the writer's command line, without the program name (`argv[1..]`).
+///
+/// Options are read left to right. `--args` ends them: every token after it
+/// is an argument of the recorded script, recorded as `$1`, `$2`, ... and
+/// never interpreted, even when it spells one of the writer's own options.
+/// The launchers rely on this, since they pass the script's arguments
+/// verbatim after `--args` (spec `CLI/recorders/shell.md`, "Options": after
+/// the script, everything is the script's arguments). `--help` / `-h` and
+/// `--version` / `-V` are therefore honoured only among the options before
+/// `--args`, and the first one seen wins; neither needs `--out-dir`.
+fn parse_cli_args(argv: &[String]) -> Result<CliCommand, String> {
     let mut output_dir: Option<PathBuf> = None;
     let mut program = String::from("unknown");
     let mut extra_args: Vec<String> = Vec::new();
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
+    let mut tokens = argv.iter();
+    while let Some(token) = tokens.next() {
+        match token.as_str() {
+            "--version" | "-V" => return Ok(CliCommand::Version),
+            "--help" | "-h" => return Ok(CliCommand::Help),
             "--out-dir" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("--out-dir requires a value".to_string());
-                }
-                output_dir = Some(PathBuf::from(&args[i]));
+                let value = tokens.next().ok_or("--out-dir requires a value")?;
+                output_dir = Some(PathBuf::from(value));
             }
             "--program" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("--program requires a value".to_string());
-                }
-                program = args[i].clone();
+                program = tokens.next().ok_or("--program requires a value")?.clone();
             }
             "--args" => {
-                i += 1;
-                // Consume all remaining args
-                while i < args.len() {
-                    extra_args.push(args[i].clone());
-                    i += 1;
-                }
-                break;
+                // Everything that remains belongs to the script.
+                extra_args.extend(tokens.by_ref().cloned());
             }
             // `--format` was removed in the 2026-05 convention compliance pass.
             // Recorders never branch on output format — CTFS is the sole
@@ -96,21 +98,29 @@ fn parse_cli_args() -> Result<CliArgs, String> {
                 return Err(format!("unknown option: {other}"));
             }
         }
-        i += 1;
     }
 
     let output_dir = output_dir.ok_or("--out-dir is required")?;
 
-    Ok(CliArgs {
+    Ok(CliCommand::Run(CliArgs {
         output_dir,
         program,
         args: extra_args,
-    })
+    }))
 }
 
 fn main() {
-    let cli = match parse_cli_args() {
-        Ok(c) => c,
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let cli = match parse_cli_args(&argv) {
+        Ok(CliCommand::Run(c)) => c,
+        Ok(CliCommand::Version) => {
+            println!("ct-shell-trace-writer {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Ok(CliCommand::Help) => {
+            print_usage();
+            return;
+        }
         Err(e) => {
             eprintln!("ct-shell-trace-writer: error: {e}");
             print_usage();
@@ -188,5 +198,157 @@ fn main() {
     if let Err(e) = bridge.finish() {
         eprintln!("ct-shell-trace-writer: error: failed to finalize trace: {e}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|t| t.to_string()).collect()
+    }
+
+    fn run(output_dir: &str, program: &str, args: &[&str]) -> CliCommand {
+        CliCommand::Run(CliArgs {
+            output_dir: PathBuf::from(output_dir),
+            program: program.to_string(),
+            args: argv(args),
+        })
+    }
+
+    #[test]
+    fn help_and_version_flags_after_args_are_script_arguments() {
+        for flag in ["-h", "--help", "-V", "--version"] {
+            assert_eq!(
+                parse_cli_args(&argv(&["--out-dir", "o", "--program", "p", "--args", flag])),
+                Ok(run("o", "p", &[flag])),
+                "`--args {flag}`"
+            );
+        }
+    }
+
+    #[test]
+    fn every_token_after_args_is_kept_verbatim() {
+        assert_eq!(
+            parse_cli_args(&argv(&[
+                "--out-dir",
+                "o",
+                "--args",
+                "--out-dir",
+                "x",
+                "--format",
+                "json",
+                "--args",
+                "",
+                "-V",
+                "unknown"
+            ])),
+            Ok(run(
+                "o",
+                "unknown",
+                &[
+                    "--out-dir",
+                    "x",
+                    "--format",
+                    "json",
+                    "--args",
+                    "",
+                    "-V",
+                    "unknown"
+                ]
+            ))
+        );
+    }
+
+    #[test]
+    fn args_with_nothing_after_it_records_no_arguments() {
+        assert_eq!(
+            parse_cli_args(&argv(&["--out-dir", "o", "--args"])),
+            Ok(run("o", "unknown", &[]))
+        );
+    }
+
+    #[test]
+    fn help_and_version_before_args_are_answered() {
+        for (flag, expected) in [
+            ("-h", CliCommand::Help),
+            ("--help", CliCommand::Help),
+            ("-V", CliCommand::Version),
+            ("--version", CliCommand::Version),
+        ] {
+            assert_eq!(
+                parse_cli_args(&argv(&[flag])),
+                Ok(expected),
+                "`{flag}` alone"
+            );
+        }
+        assert_eq!(
+            parse_cli_args(&argv(&["--out-dir", "o", "-V", "--args", "-h"])),
+            Ok(CliCommand::Version)
+        );
+        assert_eq!(
+            parse_cli_args(&argv(&["--program", "p", "--help", "--args", "x"])),
+            Ok(CliCommand::Help)
+        );
+    }
+
+    #[test]
+    fn first_of_help_and_version_wins() {
+        assert_eq!(
+            parse_cli_args(&argv(&["--help", "--version"])),
+            Ok(CliCommand::Help)
+        );
+        assert_eq!(
+            parse_cli_args(&argv(&["-V", "-h"])),
+            Ok(CliCommand::Version)
+        );
+    }
+
+    #[test]
+    fn options_parse_without_args() {
+        assert_eq!(
+            parse_cli_args(&argv(&["--program", "p", "--out-dir", "o"])),
+            Ok(run("o", "p", &[]))
+        );
+    }
+
+    #[test]
+    fn errors_are_reported() {
+        assert_eq!(
+            parse_cli_args(&argv(&[])),
+            Err("--out-dir is required".to_string())
+        );
+        assert_eq!(
+            parse_cli_args(&argv(&["--args", "-h"])),
+            Err("--out-dir is required".to_string())
+        );
+        assert_eq!(
+            parse_cli_args(&argv(&["--out-dir"])),
+            Err("--out-dir requires a value".to_string())
+        );
+        assert_eq!(
+            parse_cli_args(&argv(&["--out-dir", "o", "--program"])),
+            Err("--program requires a value".to_string())
+        );
+        assert_eq!(
+            parse_cli_args(&argv(&["--out-dir", "o", "--bogus"])),
+            Err("unknown option: --bogus".to_string())
+        );
+        for flag in ["--format", "-f"] {
+            let err = parse_cli_args(&argv(&[flag, "json", "--out-dir", "o"]))
+                .expect_err("--format must be rejected");
+            assert!(err.contains("--format is no longer supported"), "{err}");
+        }
+    }
+
+    /// An option that takes a value consumes the next token whatever it is,
+    /// as before: `--program --help` names a program called `--help`.
+    #[test]
+    fn option_values_are_not_reinterpreted() {
+        assert_eq!(
+            parse_cli_args(&argv(&["--out-dir", "o", "--program", "--help"])),
+            Ok(run("o", "--help", &[]))
+        );
     }
 }
