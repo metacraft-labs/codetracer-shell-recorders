@@ -95,11 +95,11 @@
     "nim-results": {
       "flake": false,
       "locked": {
-        "lastModified": 1733582743,
-        "narHash": "sha256-KbNqt0FMuzDF4X+XM6JEaZJBypLDnvVPpnBpE7Sq6sA=",
+        "lastModified": 1792307661,
+        "narHash": "sha256-gD+5DVe1C6L0gc1geVbXZKeI/Zo4HlwFO/l1DUY31OA=",
         "owner": "arnetheduck",
         "repo": "nim-results",
-        "rev": "df8113dda4c2d74d460a8fa98252b0b771bf1f27",
+        "rev": "6f4e4b08901645f41eae7730b29b8c1137365eb0",
         "type": "github"
       },
       "original": {
