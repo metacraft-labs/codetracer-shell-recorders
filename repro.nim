@@ -109,8 +109,9 @@ import repro_dsl_stdlib/foreign_env
 import repro_dsl_stdlib/packages/sh as shRunner
 
 # ``jq`` is declared in ``uses:`` below; importing its stdlib package
-# registers the nixpkgs channel that provisions it. Without the import the
-# declaration resolves only against the caller's ``PATH``.
+# registers the realizations that provision it: the nixpkgs channel on
+# Linux and macOS, and the pinned ``jq-win64.exe`` on Windows. Without the
+# import the declaration resolves only against the caller's ``PATH``.
 import repro_dsl_stdlib/packages/jq
 
 # ``zsh`` is declared in ``uses:`` below; reprobuild's stdlib has no package
@@ -214,11 +215,16 @@ package codetracer_shell_recorders:
     # installed yet.
     "git"
 
-    # The programs the launchers and the CLI-convention guards run besides
-    # bash and cargo: ``jq`` (the guards decode ``ct print --json`` output
-    # with it) and the POSIX utilities the scripts call. reprobuild's stdlib
-    # provisions these from nixpkgs; on Windows they come with the
-    # PortableGit bash, in bash's own directory.
+    # ``jq``: the bash and zsh CLI guards decode ``ct print --json`` output
+    # with it, and fail when it is missing. It is declared on every host:
+    # PortableGit, which supplies Windows' bash, does not ship jq, so on
+    # Windows the stdlib package realizes its pinned ``jq-win64.exe``.
+    "jq"
+
+    # The POSIX utilities the launchers and the CLI-convention guards call
+    # besides bash and cargo. reprobuild's stdlib provisions these from
+    # nixpkgs; on Windows they come with the PortableGit bash, in bash's own
+    # directory.
     #
     # ``zsh`` is the interpreter of the zsh launcher, which the zsh cargo
     # suite, the zsh guard and the CLI-convention guard all drive. It has to
@@ -231,7 +237,6 @@ package codetracer_shell_recorders:
     # Windows has no zsh and does not declare it.
     when not defined(windows):
       "zsh"
-      "jq"
       "basename"
       "cat"
       "chmod"
@@ -425,10 +430,10 @@ package codetracer_shell_recorders:
           ["clang", "pkg-config"])
     for action in [testsRun.action, verifyCliGuard, bashCliGuard,
                    zshCliGuard]:
-      appendRegisteredActionToolIdentityRefs(action.id, ["sh", "bash"])
+      appendRegisteredActionToolIdentityRefs(action.id, ["sh", "bash", "jq"])
       when not defined(windows):
         appendRegisteredActionToolIdentityRefs(action.id,
-          ["zsh", "jq", "basename", "cat", "chmod", "dirname", "grep",
+          ["zsh", "basename", "cat", "chmod", "dirname", "grep",
            "head", "ls", "mkdir", "mktemp", "rm", "sed", "sort", "tr"])
 
     discard collect("test", @[
