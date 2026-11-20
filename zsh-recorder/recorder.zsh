@@ -20,15 +20,48 @@ fi
 [[ "$_ct_target_script" == /* ]] || _ct_target_script="$PWD/$_ct_target_script"
 _ct_target_script="${_ct_target_script:a}"
 
+# The trace writer is a native executable. On Windows this recorder runs
+# under an MSYS2 or Cygwin zsh, whose paths (`/c/...`, `/tmp/...`) only
+# that runtime can resolve, and MSYS rewrites command-line arguments but not
+# the events stream. Every path sent to the writer is therefore converted
+# once to Windows mixed form: drive letter, forward slashes and long names
+# (`C:/Users/...`), which both the writer and the trace readers open.
+# Everywhere else the path is sent unchanged.
+# https://www.msys2.org/docs/filesystem-paths/
+# https://cygwin.com/cygwin-ug-net/cygpath.html
+_ct_use_cygpath=0
+case "$OSTYPE" in
+    msys* | cygwin*)
+        (( ${+commands[cygpath]} )) && _ct_use_cygpath=1
+        ;;
+esac
+
+# Sets _ct_np to the writer's form of the path in $1. Like _ct_inline_quote
+# it returns through a variable, so no subshell is spawned off Windows.
+_ct_native_path() {
+    _ct_np="$1"
+    if (( _ct_use_cygpath )); then
+        _ct_np="$(cygpath -m -l -- "$1")" || {
+            echo "ct-zsh-recorder: cygpath could not convert '$1'" >&2
+            _ct_np="$1"
+        }
+    fi
+}
+
+_ct_native_path "$_ct_target_script"
+_ct_target_script_native="$_ct_np"
+
 # Emit START event
-printf 'START program=%s shell=zsh shell_version=%s\n' "$_ct_target_script" "$ZSH_VERSION" >&3
+printf 'START program=%s shell=zsh shell_version=%s\n' "$_ct_target_script_native" "$ZSH_VERSION" >&3
 
 # Register the main script path
-printf 'PATH file=%s\n' "$_ct_target_script" >&3
+printf 'PATH file=%s\n' "$_ct_target_script_native" >&3
 
-# Track which files we've already registered
+# Files already registered, keyed by the path zsh reports in
+# funcsourcetrace, mapped to the form sent to the writer (see
+# _ct_native_path).
 typeset -A _ct_registered_paths
-_ct_registered_paths[$_ct_target_script]=1
+_ct_registered_paths[$_ct_target_script]="$_ct_target_script_native"
 
 # Track which functions we've already registered
 typeset -A _ct_registered_funcs
@@ -216,9 +249,11 @@ trap '
         if (( _ct_in_trap )); then
             # Register new source files
             if [[ -n "$_ct_file" ]] && (( ! ${+_ct_registered_paths[$_ct_file]} )); then
-                printf '\''PATH file=%s\n'\'' "$_ct_file" >&3
-                _ct_registered_paths[$_ct_file]=1
+                _ct_native_path "$_ct_file"
+                printf '\''PATH file=%s\n'\'' "$_ct_np" >&3
+                _ct_registered_paths[$_ct_file]="$_ct_np"
             fi
+            _ct_file_native="${_ct_registered_paths[$_ct_file]}"
 
             # Detect function return: depth decreased compared to previous trap invocation.
             # If the ZERR trap fired (for non-zero return), use its saved status
@@ -240,7 +275,7 @@ trap '
                 # Register function if first time seen
                 # Use the definition line from funcsourcetrace
                 if (( ! ${+_ct_registered_funcs[$_ct_func_name]} )); then
-                    printf '\''FUNC name=%s file=%s line=%d\n'\'' "$_ct_func_name" "$_ct_file" "$_ct_func_def_line" >&3
+                    printf '\''FUNC name=%s file=%s line=%d\n'\'' "$_ct_func_name" "$_ct_file_native" "$_ct_func_def_line" >&3
                     _ct_registered_funcs[$_ct_func_name]=1
                 fi
 
@@ -271,7 +306,7 @@ trap '
             fi
 
             # Emit step event
-            printf '\''STEP file=%s line=%d\n'\'' "$_ct_file" "$_ct_line" >&3
+            printf '\''STEP file=%s line=%d\n'\'' "$_ct_file_native" "$_ct_line" >&3
 
             # Capture variables at this step
             _ct_capture_variables

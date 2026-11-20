@@ -199,6 +199,32 @@ fi
 [[ "$_ct_script" == /* ]] || _ct_script="$PWD/$_ct_script"
 _ct_script="${_ct_script:a}"
 
+# The path the trace writer and the metadata record for a path of this
+# shell. Under an MSYS2 or Cygwin shell (Windows) the shell's `/c/...` and
+# `/tmp/...` paths mean nothing to the native writer or to the trace
+# readers, and MSYS's own rewrite of command-line arguments yields 8.3 short
+# names, so the path is converted to Windows mixed long form
+# (`C:/Users/...`) here. recorder.zsh converts the paths it sends the same
+# way, so both name the script identically. Elsewhere the path is unchanged.
+# When cygpath fails, the path is used unconverted after a warning, as the
+# recorder does; failing here would abort the launcher under `set -e`.
+# https://cygwin.com/cygwin-ug-net/cygpath.html
+_ct_native_path() {
+    case "$OSTYPE" in
+        msys* | cygwin*)
+            if command -v cygpath >/dev/null 2>&1; then
+                if cygpath -m -l -- "$1"; then
+                    return 0
+                fi
+                echo "ct-zsh-recorder: cygpath could not convert '$1'" >&2
+            fi
+            ;;
+    esac
+    printf '%s\n' "$1"
+}
+
+_ct_script_native="$(_ct_native_path "$_ct_script")"
+
 # Create output directory
 mkdir -p "$_ct_output_dir"
 
@@ -257,13 +283,13 @@ _ct_exit_code=$?
 if (( ${#_ct_script_args[@]} > 0 )); then
     "$_ct_trace_writer" \
         --out-dir "$_ct_output_dir" \
-        --program "$_ct_script" \
+        --program "$_ct_script_native" \
         --args "${_ct_script_args[@]}" \
         < "$_ct_events_file"
 else
     "$_ct_trace_writer" \
         --out-dir "$_ct_output_dir" \
-        --program "$_ct_script" \
+        --program "$_ct_script_native" \
         < "$_ct_events_file"
 fi
 
@@ -306,9 +332,9 @@ _ct_write_enhanced_metadata() {
     cat > "$_ct_output_dir/trace_db_metadata.json" <<METADATA
 {
   "language": "zsh",
-  "program": "$_ct_script",
+  "program": "$_ct_script_native",
   "args": $_ct_args_json,
-  "workdir": "$(pwd)",
+  "workdir": "$(_ct_native_path "$(pwd)")",
   "recorder": "codetracer-zsh-recorder",
   "zsh_version": "$_ct_zsh_version"
 }

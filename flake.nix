@@ -17,7 +17,7 @@
     # with the flags the library requires (--threads:off, one process heap),
     # so this revision must carry that build script.
     codetracer-trace-format = {
-      url = "github:metacraft-labs/codetracer-trace-format/3fada0b03c3d1a0cbc7c35f278aa639028d702c5";
+      url = "github:metacraft-labs/codetracer-trace-format/096e3f5cb73f125390dc394957b3faaa958a3e93";
       flake = false;
     };
 
@@ -25,7 +25,7 @@
     # compiles. This revision must carry the process lock its C ABI needs
     # when built --threads:off.
     codetracer-trace-format-nim = {
-      url = "github:metacraft-labs/codetracer-trace-format-nim/051efd22b00ec3b88676fb07755a65c5a4ca8fde";
+      url = "github:metacraft-labs/codetracer-trace-format-nim/30bf1a17decefeadb23606bb8c1af5fe56a5d264";
       flake = false;
     };
 
