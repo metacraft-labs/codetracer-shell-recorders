@@ -81,9 +81,13 @@ jobs:
           attic-token: ${{ secrets.ATTIC_TOKEN }}
           attic-cache: ${{ vars.ATTIC_CACHE }}
           attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+          # nim-stew and nim-results are the Nim packages the ct-print edge
+          # of `repro test` compiles against (see .github/sibling-repos).
           siblings: |
             codetracer-trace-format
             codetracer-trace-format-nim
+            nim-stew
+            arnetheduck/nim-results
 
       - name: Prepare Windows reprobuild runtime
         if: runner.os == 'Windows'

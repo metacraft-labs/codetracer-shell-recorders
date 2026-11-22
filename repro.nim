@@ -96,6 +96,7 @@
 ## has these tools on ``PATH`` hides a missing attachment; a CI runner with
 ## a bare ``PATH`` does not.
 
+import std/os
 import repro_project_dsl
 import repro_dsl_stdlib/foreign_env
 
@@ -126,6 +127,14 @@ import zsh_tools
 import "../codetracer-trace-format-nim/build_writer_artifacts"
 
 const traceFormatNimRoot = "../codetracer-trace-format-nim"
+
+# The sibling checkouts of the Nim packages the trace format's ``.nimble``
+# requires (``stew``, ``results``). ``ct-print`` is compiled against them and
+# against nothing else: reprobuild runs every Nim compile without access to
+# the host's ``~/.nimble``, so a compile that is not told where its packages
+# are fails with ``cannot open file: results``. Both are pinned in
+# ``repro.lock``, so the compile reads fixed revisions of them.
+const ctPrintNimDependencyRoots = ["../nim-stew", "../nim-results"]
 
 package codetracer_shell_recorders:
   devEnv:
@@ -344,13 +353,21 @@ package codetracer_shell_recorders:
     # edges order after it and name the binary as an input, so a missing or
     # rebuilt ``ct-print`` re-runs them.
     #
-    # It runs after the test build because that build's
-    # ``codetracer_trace_writer_nim`` ``build.rs`` is what installs the
-    # sibling's nimble ``requires`` (``results``, ``stew``) into the nimble
-    # path the ct-print compile resolves them from. ``just build-ct-print``
-    # gets the same packages from ``nimble buildCtPrint``.
+    # Its Nim packages come from the sibling checkouts named by
+    # ``ctPrintNimDependencyRoots``, not from a nimble directory, so it reads
+    # nothing the test build installs and needs no ordering after it.
+    # Absolute and normalized, as ``buildCtPrint`` requires; it passes each
+    # as a ``--path:`` and declares it an input of the compile. The provider
+    # also runs this body once while it starts up, with no project root to
+    # resolve them against; nothing that pass registers is kept, so it gets
+    # no directories instead of relative ones the constructor would refuse.
+    var ctPrintNimDependencyDirs: seq[string] = @[]
+    if not providerStartupBodyActive():
+      for dependencyRoot in ctPrintNimDependencyRoots:
+        ctPrintNimDependencyDirs.add(
+          normalizedPath(activeProviderProjectRoot() / dependencyRoot))
     let ctPrintBuild = buildCtPrint(traceFormatNimRoot,
-                                    after = @[testsBuild.action])
+      nimDependencyDirs = ctPrintNimDependencyDirs)
     let ctPrintBinary = ctPrintPath(traceFormatNimRoot)
 
     # ---- CLI-convention guard edges (the `test` collection) ----------
