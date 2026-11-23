@@ -8,6 +8,10 @@ set -o functrace    # DEBUG trap inherited by functions
 set -o errtrace     # ERR trap inherited by functions
 shopt -s extdebug   # Required for DEBUG trap in functions + RETURN trap
 
+# The path of this file, by which the traps tell the recorder's own commands
+# from the script's. `$0` cannot serve: it is set to the script's path below.
+_ct_recorder_file=${BASH_SOURCE[0]}
+
 _ct_target_script="$1"
 shift  # remaining args are the script's arguments
 
@@ -16,8 +20,46 @@ if [[ -z "$_ct_target_script" ]]; then
     exit 1
 fi
 
-# Resolve absolute path
-_ct_target_script="$(cd "$(dirname "$_ct_target_script")" && pwd)/$(basename "$_ct_target_script")"
+# Resolve absolute path (already done when Bash 4 re-entered the recorder
+# below, and done again it could come out different, e.g. under CDPATH).
+if [[ -z "${_ct_reentered_with_argv0:-}" ]]; then
+    _ct_target_script="$(cd "$(dirname "$_ct_target_script")" && pwd)/$(basename "$_ct_target_script")"
+fi
+
+# Give the script its own `$0`.
+#
+# The script is sourced into this shell, where `$0` is this file. A script
+# that runs its entry point only when executed
+# (`[[ "${BASH_SOURCE[0]}" == "$0" ]] && main "$@"`) would then do nothing,
+# and one that finds files beside itself (`$(dirname "$0")`) would look
+# beside the recorder. Spec `Recording-Backends/Shell-Recorder.md`,
+# "Interactive Preservation": the script behaves as when run directly.
+# `$0` is set to the absolute path the script is sourced by, so that it
+# equals `${BASH_SOURCE[0]}` in the script's top level, as in a direct run
+# (`bash ./x.sh` gives both as `./x.sh`; here both are absolute).
+#
+# Bash 5.0 and later set `$0` by assignment to `BASH_ARGV0`, done just
+# before the script is sourced (at the end of this file). Bash 4 has no
+# such variable, and the only way to choose `$0` there is the name argument
+# of `bash -c <string> <name>`, so the recorder re-enters itself once, as a
+# file sourced by `bash -c` with the script's path as that name, before it
+# does anything else (FD 3 is inherited unchanged). The script sees the
+# same stack depth either way: the recorder's bottom frame is then `source`
+# instead of `main`, and the traps count frames, not names. The marker
+# variable is a shell variable, not exported, and exists before the
+# variable baseline is taken, so it is never recorded as the script's.
+# `BASH_EXECUTION_STRING`, which only a `-c` shell has, is removed, as a
+# direct run has none.
+# See: https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html#index-BASH_005fARGV0
+# See: https://www.gnu.org/software/bash/manual/html_node/Invoking-Bash.html (-c)
+if (( BASH_VERSINFO[0] < 5 )); then
+    if [[ -z "${_ct_reentered_with_argv0:-}" ]]; then
+        # shellcheck disable=SC2016 # expanded by the re-entered shell
+        exec "$BASH" -c '_ct_reentered_with_argv0=1; source "$1" "$0" "${@:2}"' \
+            "$_ct_target_script" "$_ct_recorder_file" "$@"
+    fi
+    unset BASH_EXECUTION_STRING
+fi
 
 # Move the event channel off FD 3 before the script runs.
 #
@@ -598,7 +640,7 @@ _ct_debug_trap() {
     [[ "$BASH_COMMAND" == "$_ct_load_command" ]] && return 0
 
     # Skip events from the recorder itself or when inside the RETURN trap
-    [[ "$_ct_file" == "$0" ]] && return 0
+    [[ "$_ct_file" == "$_ct_recorder_file" ]] && return 0
     [[ "$_ct_file" == "" ]] && return 0
     (( _ct_in_return_trap )) && return 0
 
@@ -794,7 +836,7 @@ _ct_err_trap() {
     _ct_run_script_ERR=0
 
     # Skip errors from recorder internals
-    [[ "$_ct_file" == "$0" ]] && return 0
+    [[ "$_ct_file" == "$_ct_recorder_file" ]] && return 0
     [[ -z "$_ct_file" ]] && return 0
 
     # From here on the failing command is the script's, so the script's own
@@ -881,7 +923,7 @@ _ct_return_trap() {
     _ct_run_script_RETURN=0
     # A recorder function returned (the recorder's own script-load `source`
     # also ends here, with the recorder as the file).
-    [[ "${BASH_SOURCE[1]}" == "$0" ]] && return 0
+    [[ "${BASH_SOURCE[1]}" == "$_ct_recorder_file" ]] && return 0
     (( _ct_exit_emitted )) && return 0
 
     # A `return` run by the script's ERR action (`trap '...; return 1' ERR`)
@@ -1483,6 +1525,12 @@ _ct_report_replaced_traps() {
     printf 'codetracer-bash-recorder: warning: %s\n' "$_ct_message" >&2
     printf 'ERROR cmd=%s status=0\n' "$(_ct_quote_value "$_ct_message")" >&"$_ct_events_fd"
 }
+
+# The script's `$0` (see "Give the script its own `$0`" at the top). Set
+# before the traps, so the assignment is not a step of the recording.
+if (( BASH_VERSINFO[0] >= 5 )); then
+    BASH_ARGV0=$_ct_target_script
+fi
 
 _ct_install_trap DEBUG
 _ct_install_trap RETURN

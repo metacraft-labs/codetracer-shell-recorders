@@ -1035,3 +1035,96 @@ fn test_bash_records_file_sourced_by_a_relative_path_through_a_symlinked_dir() {
 fn test_bash_records_function_in_script_whose_path_contains_a_space() {
     common::check_records_function_in_dir_with_space(&common::BASH, "greet", "greet() {", "greet");
 }
+
+// ---------------------------------------------------------------------------
+// Recorded script sees the same `$0` and entry-point guard as a direct run
+// ---------------------------------------------------------------------------
+
+/// Run `bash <launcher> --out-dir <dir> <fixture> args...`.
+fn record_fixture_with_args(fixture: &str, args: &[&str]) -> (TempDir, String) {
+    build_trace_writer();
+    let output_dir = TempDir::new().expect("Failed to create temp dir");
+    let output = Command::new("bash")
+        .args([
+            launcher_path().to_str().unwrap(),
+            "--out-dir",
+            output_dir.path().to_str().unwrap(),
+            fixture_path(fixture).to_str().unwrap(),
+        ])
+        .args(args)
+        .output()
+        .expect("Failed to run launcher");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Launcher failed for {fixture}: stderr={stderr}"
+    );
+    (
+        output_dir,
+        String::from_utf8_lossy(&output.stdout).to_string(),
+    )
+}
+
+/// Run the fixture directly with bash, as the reference behaviour.
+fn run_directly(fixture: &str, args: &[&str]) -> String {
+    let output = Command::new("bash")
+        .arg(fixture_path(fixture))
+        .args(args)
+        .output()
+        .expect("Failed to run fixture directly");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+fn read_symbols(output_dir: &TempDir) -> Vec<String> {
+    serde_json::from_str(
+        &std::fs::read_to_string(output_dir.path().join("symbols.json"))
+            .expect("Failed to read symbols.json"),
+    )
+    .expect("Invalid symbols.json")
+}
+
+/// Control: a script with no `$0` guard and no `$0` use records the same
+/// output as a direct run, so the fixture/harness comparison is sound.
+#[test]
+fn test_bash_recorded_stdout_matches_direct_run_control() {
+    let direct = run_directly("functions.sh", &[]);
+    let (_dir, recorded) = record_fixture_with_args("functions.sh", &[]);
+    assert_eq!(
+        recorded, direct,
+        "control: recorded stdout differs from direct run"
+    );
+}
+
+/// A script guarded by `[[ "${BASH_SOURCE[0]}" == "$0" ]]` runs `main`
+/// when recorded, exactly as when run directly, and the trace shows `main`.
+#[test]
+fn test_bash_recorded_script_runs_main_guard() {
+    let args = ["a", "b"];
+    let direct = run_directly("main_guard.sh", &args);
+    assert_eq!(
+        direct, "main ran with 2 args\n",
+        "fixture sanity (direct run)"
+    );
+
+    let (dir, recorded) = record_fixture_with_args("main_guard.sh", &args);
+    assert_eq!(
+        recorded, direct,
+        "recorded stdout must equal direct-run stdout (the `BASH_SOURCE[0] == $0` guard must hold)"
+    );
+    let symbols = read_symbols(&dir);
+    assert!(
+        symbols.iter().any(|s| s == "main"),
+        "trace should contain a call to `main`, symbols: {symbols:?}"
+    );
+}
+
+/// `$0` inside the recorded script is the script's path, not the recorder's.
+#[test]
+fn test_bash_recorded_script_dollar_zero_is_script_path() {
+    let (_dir, recorded) = record_fixture_with_args("print_dollar0.sh", &[]);
+    let expected = format!("dollar0={}\n", fixture_path("print_dollar0.sh").display());
+    assert_eq!(
+        recorded, expected,
+        "`$0` in the recorded script must be the script path, not recorder.sh"
+    );
+}

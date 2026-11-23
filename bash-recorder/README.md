@@ -17,6 +17,18 @@ canonical CodeTracer CTFS `.ct` container.
   Emits the line-oriented wire protocol consumed by
   `crates/ct-shell-trace-writer/`.
 
+The recorder sources the script into its own shell, so that its traps
+apply to it. The script still sees its own path as `$0`: the script's
+absolute path, equal to `${BASH_SOURCE[0]}` at its top level, so the usual
+`[[ "${BASH_SOURCE[0]}" == "$0" ]] && main "$@"` guard holds and
+`$(dirname "$0")` names the script's directory. One difference from a
+direct run remains: a script given by a relative path (`./x.sh`) sees `$0`
+as an absolute path. Bash 5.0 and later set `$0` through `BASH_ARGV0`; on
+Bash 4 the recorder re-enters itself once as a file sourced by
+`bash -c '...' <script-path>`, the only way to choose `$0` there. That
+`-c` shell shows in two more ways on Bash 4 only: `$-` contains `c`, and
+a file named by `BASH_ENV` is read once more before the script starts.
+
 ## Requirements
 
 Bash 4.0 or newer, both for the launcher and for the recorded script (the

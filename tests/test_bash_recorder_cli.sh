@@ -23,6 +23,8 @@
 #     the installed Bash and on Bash 4.0, the specification's floor, named
 #     by CT_TEST_BASH_4_0; a Bash 3.2 (CT_TEST_BASH_3_2) is refused by name.
 #     Both variables are exported by the Linux dev shell (flake.nix).
+#   * The recorded script sees its own absolute path as `$0`, so a
+#     `BASH_SOURCE[0] == $0` entry-point guard holds, on both Bashes.
 #
 # Usage: bash tests/test_bash_recorder_cli.sh
 #
@@ -777,6 +779,73 @@ grep -qF "EOF reached without EXIT event" <<< "${RUN_STDERR}" \
   || fail "T11 control: under 'ulimit -n 12' the writer should see an empty stream; stderr: ${RUN_STDERR}"
 expect_no_trace_failure "T11 no START event (ulimit -n 12)" \
   "${OUT_DIR_T11C}/args.ct" "args: one"
+
+# ---------------------------------------------------------------------------
+# T12. The recorded script sees its own path as `$0`, on the installed Bash
+# and on Bash 4.0.
+#
+# The recorder sources the script, where `$0` would be `recorder.sh`; spec
+# `Recording-Backends/Shell-Recorder.md`, "Interactive Preservation", makes
+# `$0` the script's absolute path, equal to `${BASH_SOURCE[0]}` at its top
+# level. Bash 5.0 and later get it from `BASH_ARGV0`; Bash 4 has no such
+# variable, and the recorder re-enters itself under `bash -c` instead, which
+# only the Bash 4.0 leg exercises (CT_TEST_BASH_4_0, checked by T8 above).
+#   * `main_guard.sh` runs `main` only when `${BASH_SOURCE[0]} == $0`: its
+#     output must be the direct run's, and the trace must call `main`.
+#   * `print_dollar0.sh` prints `$0`: the absolute path, also when the
+#     script is given by a relative path (`bash ./x.sh` gives `./x.sh`, but
+#     `${BASH_SOURCE[0]}` is absolute under the recorder, and the guard
+#     compares the two).
+#   * The `-c` shell of the Bash 4 path must not show: no
+#     `BASH_EXECUTION_STRING`, which a script run directly does not have.
+# ---------------------------------------------------------------------------
+
+FIXTURES_BASH="${REPO_ROOT}/tests/fixtures/bash"
+EXECSTR_FIXTURE="${WORK_DIR}/execstr.sh"
+cat > "${EXECSTR_FIXTURE}" <<'EOF'
+echo "execstr=${BASH_EXECUTION_STRING-unset}"
+EOF
+
+# check_dollar_zero_cases <label> <path-prefix>
+check_dollar_zero_cases() {
+  local label="$1" prefix="$2" out="${WORK_DIR}/t12-$1" calls
+  run_entry "${prefix}" "${out}-guard" -- "${FIXTURES_BASH}/main_guard.sh" a b
+  [[ "${RUN_RC}" == "0" ]] \
+    || fail "T12 ${label} guard: launcher exited ${RUN_RC}; stderr: ${RUN_STDERR}"
+  [[ "${RUN_STDOUT}" == "main ran with 2 args" ]] \
+    || fail "T12 ${label} guard: the BASH_SOURCE[0] == \$0 guard must hold; stdout: '${RUN_STDOUT}'; stderr: ${RUN_STDERR}"
+  calls="$(run_ct_print --full --strip-paths "${out}-guard/main_guard.ct" | jq -c '
+    [.events[] | select(.kind == "call_entry") | .function]')"
+  [[ "${calls}" == '["<toplevel>","<script>","main"]' ]] \
+    || fail "T12 ${label} guard: the trace must call main from <script>; calls: ${calls}"
+  pass "T12 ${label}: guarded main runs and is recorded"
+
+  run_entry "${prefix}" "${out}-d0" -- "${FIXTURES_BASH}/print_dollar0.sh"
+  [[ "${RUN_RC}" == "0" && "${RUN_STDOUT}" == "dollar0=${FIXTURES_BASH}/print_dollar0.sh" ]] \
+    || fail "T12 ${label} \$0: expected dollar0=${FIXTURES_BASH}/print_dollar0.sh (exit 0), got '${RUN_STDOUT}' (exit ${RUN_RC}); stderr: ${RUN_STDERR}"
+  pass "T12 ${label}: \$0 is the script's path"
+
+  pushd "${FIXTURES_BASH}" >/dev/null
+  run_entry "${prefix}" "${out}-d0-rel" -- ./print_dollar0.sh
+  popd >/dev/null
+  [[ "${RUN_RC}" == "0" && "${RUN_STDOUT}" == "dollar0=${FIXTURES_BASH}/print_dollar0.sh" ]] \
+    || fail "T12 ${label} relative \$0: expected the absolute path, got '${RUN_STDOUT}' (exit ${RUN_RC}); stderr: ${RUN_STDERR}"
+  pass "T12 ${label}: \$0 of a script given by a relative path is absolute"
+
+  run_entry "${prefix}" "${out}-execstr" -- "${EXECSTR_FIXTURE}"
+  [[ "${RUN_RC}" == "0" && "${RUN_STDOUT}" == "execstr=unset" ]] \
+    || fail "T12 ${label}: BASH_EXECUTION_STRING must be unset, as in a direct run; got '${RUN_STDOUT}' (exit ${RUN_RC}); stderr: ${RUN_STDERR}"
+  pass "T12 ${label}: no BASH_EXECUTION_STRING"
+}
+
+check_dollar_zero_cases "installed-bash" ""
+if [[ -n "${BASH40_DIR:-}" ]]; then
+  check_dollar_zero_cases "bash-4.0" "${BASH40_DIR}"
+elif [[ "$(uname -s)" == Linux ]]; then
+  fail "T12: no Bash 4.0 (CT_TEST_BASH_4_0) to run under; run this test in the dev shell"
+else
+  echo "skipped: T12 under Bash 4.0 — CT_TEST_BASH_4_0 is unset (Linux dev shell only)"
+fi
 
 echo ""
 echo "test_bash_recorder_cli: ${PASS_COUNT} assertions passed"
