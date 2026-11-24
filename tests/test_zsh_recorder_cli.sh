@@ -458,7 +458,8 @@ done
 # the script itself failed. See T11 in tests/test_bash_recorder_cli.sh for
 # the specification. The trigger is the real writer meeting a directory
 # named `<script>.ct` in the output directory: it cannot create the
-# container, warns, writes nothing and exits 0. (The bash test's second
+# container and exits 1, and a stale `args.ct` in a read-only output
+# directory must not pass for this run's trace. (The bash test's second
 # trigger, an open-files limit, does not reach the writer here: zsh refuses
 # the descriptor itself and the launcher stops earlier.)
 # ---------------------------------------------------------------------------
@@ -498,6 +499,35 @@ mkdir -p "${OUT_DIR_T11B}/args3.ct"
 run_launcher "${OUT_DIR_T11B}" "${FAIL3_FIXTURE}" one
 expect_no_trace_failure "T11 args3.ct is a directory, script exits 3" \
   "${OUT_DIR_T11B}/args3.ct" "args: one" "status 3"
+
+# A `<script>.ct` left in the output directory by a previous run is not this
+# run's trace. The writer fails here because it cannot create the container
+# (the old `args.ct` and its directory are read-only), and the launcher must
+# take the writer's exit status as the verdict rather than find the old file
+# and report success (issue
+# `2026-11-16-shell-trace-writer-exits-0-when-it-cannot-create-the-trace-container`).
+# The old file must be left as it was. Permissions do not bind root, so the
+# case is skipped by name when the file stays writable.
+OUT_DIR_T11S="${WORK_DIR}/t11-stale-trace"
+mkdir -p "${OUT_DIR_T11S}"
+printf 'stale trace from a previous run' > "${OUT_DIR_T11S}/args.ct"
+chmod 444 "${OUT_DIR_T11S}/args.ct"
+chmod 555 "${OUT_DIR_T11S}"
+if [[ -w "${OUT_DIR_T11S}/args.ct" || -w "${OUT_DIR_T11S}" ]]; then
+  echo "skipped: T11 stale args.ct — read-only permissions do not bind this user"
+else
+  run_launcher "${OUT_DIR_T11S}" "${ARGS_FIXTURE}" one
+  grep -qF "failed to create streaming CTFS container" <<< "${RUN_STDERR}" \
+    || fail "T11 stale args.ct control: the writer must fail to create the container; stderr: ${RUN_STDERR}"
+  expect_no_trace_failure "T11 stale args.ct, writer fails" \
+    "${OUT_DIR_T11S}/args.ct" "args: one" "trace writer exited with status 1"
+  [[ "$(cat "${OUT_DIR_T11S}/args.ct")" == "stale trace from a previous run" ]] \
+    || fail "T11 stale args.ct: the old file must be left as it was"
+  [[ ! -e "${OUT_DIR_T11S}/trace_db_metadata.json" ]] \
+    || fail "T11 stale args.ct: a failed recording must not write the launcher's sidecars"
+fi
+chmod 755 "${OUT_DIR_T11S}"
+chmod 644 "${OUT_DIR_T11S}/args.ct"
 
 echo ""
 echo "test_zsh_recorder_cli: ${PASS_COUNT} assertions passed"

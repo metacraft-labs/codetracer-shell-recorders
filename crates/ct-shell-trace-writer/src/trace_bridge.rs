@@ -358,15 +358,35 @@ impl TraceBridge {
     /// `files/` (see `copy_source_files`) so the recorded bundle is
     /// self-contained.  This is done only after `close()` has flushed the
     /// container, so a failure copying sources cannot corrupt the trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no trace was written: the writer was never
+    /// started because the event stream carried no `START` event. A run that
+    /// ends that way has not "completed, trace written"
+    /// (`Recorder-CLI-Conventions.md` §6 "Exit Codes"), so it must not report
+    /// success; only the writer can tell, since a caller that tests for
+    /// `<script>.ct` cannot tell a fresh container from one a previous run
+    /// left behind. (A `START` that fails to create the container is reported
+    /// by `handle_event`, and the caller is expected to stop there.)
+    /// Also returns an error, prefixed `failed to finalize trace:`, when
+    /// finalizing the container or writing the bundle's sidecar and source
+    /// copies fails.
     pub fn finish(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.started {
-            TraceWriter::finish_writing_trace_events(self.writer.as_mut())?;
-            self.writer.write_meta_dat("codetracer-shell-recorders")?;
-            TraceWriter::close(self.writer.as_mut())?;
-
-            self.write_sidecar_files()?;
-            self.copy_source_files()?;
+        if !self.started {
+            return Err("no trace was written: the event stream carried no START event".into());
         }
+        fn finalize(e: impl std::fmt::Display) -> Box<dyn Error> {
+            format!("failed to finalize trace: {e}").into()
+        }
+        TraceWriter::finish_writing_trace_events(self.writer.as_mut()).map_err(finalize)?;
+        self.writer
+            .write_meta_dat("codetracer-shell-recorders")
+            .map_err(finalize)?;
+        TraceWriter::close(self.writer.as_mut()).map_err(finalize)?;
+
+        self.write_sidecar_files().map_err(finalize)?;
+        self.copy_source_files().map_err(finalize)?;
         Ok(())
     }
 

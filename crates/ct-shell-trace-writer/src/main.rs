@@ -175,8 +175,25 @@ fn main() {
         };
 
         let is_exit = matches!(event, wire_protocol::WireEvent::Exit { .. });
+        let is_start = matches!(event, wire_protocol::WireEvent::Start { .. });
 
         if let Err(e) = bridge.handle_event(event) {
+            // A failed START means the trace container could not be created
+            // (for instance `<out-dir>/<script>.ct` is a directory). Nothing
+            // that follows can be recorded, so the run has failed: exit 1
+            // rather than warn and go on to exit 0 without a trace
+            // (`Recorder-CLI-Conventions.md` §6 "Exit Codes"; the
+            // silent-incompleteness pattern of `CLI/ct/record.md`). Feeding
+            // the remaining events to a writer that never started would only
+            // produce discard warnings.
+            if is_start {
+                eprintln!(
+                    "ct-shell-trace-writer: error: line {}: {}",
+                    line_number + 1,
+                    e
+                );
+                process::exit(1);
+            }
             eprintln!(
                 "ct-shell-trace-writer: warning: line {}: event handling error: {}",
                 line_number + 1,
@@ -195,8 +212,13 @@ fn main() {
         eprintln!("ct-shell-trace-writer: warning: EOF reached without EXIT event");
     }
 
+    // `finish` fails both when the trace could not be finalized and when no
+    // trace was written at all (no START event arrived). Either way the run
+    // wrote no usable trace, and exit 0 would claim it had: only the writer
+    // knows, since a caller testing for `<script>.ct` cannot tell a fresh
+    // container from one a previous run left in the same directory.
     if let Err(e) = bridge.finish() {
-        eprintln!("ct-shell-trace-writer: error: failed to finalize trace: {e}");
+        eprintln!("ct-shell-trace-writer: error: {e}");
         process::exit(1);
     }
 }

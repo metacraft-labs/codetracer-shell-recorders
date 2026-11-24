@@ -637,3 +637,122 @@ fn test_cli_help_and_version_options_before_args_are_answered() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A run that writes no trace must not exit 0.
+//
+// `Recorder-CLI-Conventions.md` §6 "Exit Codes": 0 means "recording
+// completed, trace written", 1 "recording failed (recorder error)"; and
+// `CLI/ct/record.md` "Corner Cases" names a recorder that produced no trace
+// but exited 0 as the silent-incompleteness pattern. Only the writer knows
+// whether it wrote the trace (a caller that tests for `<script>.ct`
+// afterwards cannot tell a fresh container from one a previous run left), so
+// the writer's own exit status must say so. These run the real binary on
+// real filesystem conditions; nothing is mocked.
+// ---------------------------------------------------------------------------
+
+/// A well-formed event stream for `/tmp/args.sh`, from START to EXIT.
+const ARGS_SCRIPT_EVENTS: &str = "START program=/tmp/args.sh shell=bash shell_version=5.2.0\n\
+                                  PATH file=/tmp/args.sh\n\
+                                  STEP file=/tmp/args.sh line=1\n\
+                                  EXIT code=0\n";
+
+/// The container cannot be created because `<out-dir>/args.ct` is already a
+/// directory: the writer must fail, naming the container it could not create,
+/// rather than warn and exit 0.
+#[test]
+fn test_cli_exits_nonzero_when_the_trace_container_cannot_be_created() {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let ct_path = tmp_dir.path().join("args.ct");
+    fs::create_dir(&ct_path).expect("create the blocking args.ct directory");
+    let out_dir = tmp_dir.path().to_str().expect("utf-8 temp dir");
+
+    let output = run_writer(
+        &["--out-dir", out_dir, "--program", "/tmp/args.sh"],
+        ARGS_SCRIPT_EVENTS,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a writer that could not create {ct_path:?} must exit 1; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("ct-shell-trace-writer: error:")
+            && stderr.contains("failed to create streaming CTFS container")
+            && stderr.contains(&*ct_path.to_string_lossy()),
+        "stderr must report, as an error, the container that could not be created; \
+         stderr={stderr}"
+    );
+    assert!(
+        ct_path.is_dir(),
+        "the blocking directory must be left as it was"
+    );
+    assert!(
+        !tmp_dir.path().join("symbols.json").exists(),
+        "a failed recording must not write the symbols.json sidecar"
+    );
+}
+
+/// An empty event stream carries no START, so no trace is written: the writer
+/// must fail and say why.
+#[test]
+fn test_cli_exits_nonzero_on_an_empty_event_stream() {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_dir = tmp_dir.path().to_str().expect("utf-8 temp dir");
+
+    let output = run_writer(&["--out-dir", out_dir, "--program", "/tmp/args.sh"], "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a writer that received no START must exit 1; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("ct-shell-trace-writer: error:")
+            && stderr.contains("no trace was written")
+            && stderr.contains("START"),
+        "stderr must say no trace was written because no START arrived; stderr={stderr}"
+    );
+    assert!(
+        !tmp_dir.path().join("args.ct").exists(),
+        "no container may appear for a stream without START"
+    );
+}
+
+/// A `<script>.ct` left by a previous run is not this run's trace. With a
+/// stream that has events but no START, the writer writes nothing and must
+/// fail even though a regular `args.ct` is present, and must leave that old
+/// file untouched.
+#[test]
+fn test_cli_exits_nonzero_without_start_even_over_a_stale_trace() {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let ct_path = tmp_dir.path().join("args.ct");
+    fs::write(&ct_path, b"stale trace from a previous run").expect("write stale args.ct");
+    let out_dir = tmp_dir.path().to_str().expect("utf-8 temp dir");
+
+    let events_without_start = "PATH file=/tmp/args.sh\n\
+                                STEP file=/tmp/args.sh line=1\n\
+                                EXIT code=0\n";
+    for (label, events) in [("empty stream", ""), ("no START", events_without_start)] {
+        let output = run_writer(&["--out-dir", out_dir, "--program", "/tmp/args.sh"], events);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{label}: a stale args.ct must not make a run without START succeed; \
+             stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("no trace was written"),
+            "{label}: stderr must say no trace was written; stderr={stderr}"
+        );
+        assert_eq!(
+            fs::read(&ct_path).expect("read args.ct"),
+            b"stale trace from a previous run",
+            "{label}: the old file must be left as it was"
+        );
+    }
+}

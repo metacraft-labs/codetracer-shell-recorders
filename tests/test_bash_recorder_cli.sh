@@ -722,15 +722,18 @@ done
 # program's exit code", so a script that itself failed still makes the
 # launcher exit 1; the message carries the script's status instead.
 #
-# Two real ways for the writer to end with no trace and exit 0, neither of
-# them a stub:
+# Real ways for the writer to end with no trace, none of them a stub; the
+# writer exits 1 for each, and the launcher must still say why:
 #   * `<out-dir>/args.ct` is already a directory, so the writer cannot create
-#     the container: it warns, and `TraceBridge::finish` writes nothing.
-#     The check must test for a regular file, not merely for the name.
+#     the container.
+#   * A read-only `args.ct` left by a previous run sits in a read-only output
+#     directory: the writer cannot create the container, and the old file
+#     must not pass for this run's trace.
 #   * The recorder cannot move the event channel to a descriptor of 10 or
 #     above (an open-files limit of 12), so no START event reaches the writer
-#     and, again, `finish` writes nothing. Here the recorder must also stop
-#     before the script runs, and say which descriptor it could not open.
+#     and `TraceBridge::finish` reports that no trace was written. Here the
+#     recorder must also stop before the script runs, and say which
+#     descriptor it could not open.
 #   * The recorder cannot write START (FD 3 on /dev/full): it must likewise
 #     stop before the script runs.
 # ---------------------------------------------------------------------------
@@ -802,6 +805,35 @@ grep -qF "before the script ran" <<< "${RUN_STDERR}" \
 ! grep -qF "the script exited with status" <<< "${RUN_STDERR}" \
   || fail "T11 failed FD move: the recorder's status must not be reported as the script's; stderr: ${RUN_STDERR}"
 pass "T11 failed FD move (ulimit -n 12): script not run, stderr names the descriptor"
+
+# A `<script>.ct` left in the output directory by a previous run is not this
+# run's trace. The writer fails here because it cannot create the container
+# (the old `args.ct` and its directory are read-only), and the launcher must
+# take the writer's exit status as the verdict rather than find the old file
+# and report success (issue
+# `2026-11-16-shell-trace-writer-exits-0-when-it-cannot-create-the-trace-container`).
+# The old file must be left as it was. Permissions do not bind root, so the
+# case is skipped by name when the file stays writable.
+OUT_DIR_T11S="${WORK_DIR}/t11-stale-trace"
+mkdir -p "${OUT_DIR_T11S}"
+printf 'stale trace from a previous run' > "${OUT_DIR_T11S}/args.ct"
+chmod 444 "${OUT_DIR_T11S}/args.ct"
+chmod 555 "${OUT_DIR_T11S}"
+if [[ -w "${OUT_DIR_T11S}/args.ct" || -w "${OUT_DIR_T11S}" ]]; then
+  echo "skipped: T11 stale args.ct — read-only permissions do not bind this user"
+else
+  run_entry "" "${OUT_DIR_T11S}" -- "${ARGS_FIXTURE}" one
+  grep -qF "failed to create streaming CTFS container" <<< "${RUN_STDERR}" \
+    || fail "T11 stale args.ct control: the writer must fail to create the container; stderr: ${RUN_STDERR}"
+  expect_no_trace_failure "T11 stale args.ct, writer fails" \
+    "${OUT_DIR_T11S}/args.ct" "args: one" "trace writer exited with status 1"
+  [[ "$(cat "${OUT_DIR_T11S}/args.ct")" == "stale trace from a previous run" ]] \
+    || fail "T11 stale args.ct: the old file must be left as it was"
+  [[ ! -e "${OUT_DIR_T11S}/trace_db_metadata.json" ]] \
+    || fail "T11 stale args.ct: a failed recording must not write the launcher's sidecars"
+fi
+chmod 755 "${OUT_DIR_T11S}"
+chmod 644 "${OUT_DIR_T11S}/args.ct"
 
 # The launcher reads an empty event file as "the recorder stopped before the
 # script ran", so the recorder must not run the script when its START write

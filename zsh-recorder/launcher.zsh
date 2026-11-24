@@ -268,26 +268,34 @@ _ct_exit_code=0
 #
 # The CTFS format is hard-pinned in the writer, which rejects `--format`;
 # no such flag is forwarded here.
+#
+# The writer exits 1 when it ends without writing a trace: the container
+# could not be created, no START event arrived, or finalizing failed
+# (`main` in crates/ct-shell-trace-writer/src/main.rs). Its status is captured
+# with `||` for the same `errexit` reason as the recorder's above, so that the
+# check below reports the failure instead of the launcher ending silently
+# here.
+_ct_writer_status=0
 if (( ${#_ct_script_args[@]} > 0 )); then
     "$_ct_trace_writer" \
         --out-dir "$_ct_output_dir" \
         --program "$_ct_script" \
         --args "${_ct_script_args[@]}" \
-        < "$_ct_events_file"
+        < "$_ct_events_file" || _ct_writer_status=$?
 else
     "$_ct_trace_writer" \
         --out-dir "$_ct_output_dir" \
         --program "$_ct_script" \
-        < "$_ct_events_file"
+        < "$_ct_events_file" || _ct_writer_status=$?
 fi
 
-# A writer that exits 0 has not necessarily written a trace: it only warns
-# when it cannot create the container, and it writes nothing at all when no
-# START event arrived (`TraceBridge::finish` in
-# crates/ct-shell-trace-writer/src/trace_bridge.rs). Exiting 0 then would be
-# the silent-incompleteness pattern spec `CLI/ct/record.md` ("Corner Cases")
-# forbids, so a missing trace fails the recording here, before the launcher
-# writes its own sidecars and makes the directory look like a bundle.
+# A recording that wrote no trace fails here, before the launcher writes its
+# own sidecars and makes the directory look like a bundle: exiting 0 then
+# would be the silent-incompleteness pattern spec `CLI/ct/record.md`
+# ("Corner Cases") forbids. The writer's status is the authority: a
+# `<script>.ct` that is present after a failed writer is one a previous run
+# left in the same directory, not this run's trace. The test for the file
+# remains as a second check, for a writer that exits 0 without one.
 #
 # The exit code is 1 whatever the script's status, as spec
 # `Recorder-CLI-Conventions.md` §6 "Exit Codes" asks of recorder errors; the
@@ -303,8 +311,12 @@ _ct_trace_base="${_ct_script##*/}"
 _ct_trace_stem="${_ct_trace_base%.*}"
 [[ -n "$_ct_trace_stem" ]] || _ct_trace_stem="$_ct_trace_base"
 _ct_trace_file="$_ct_output_dir/$_ct_trace_stem.ct"
-if [[ ! -f "$_ct_trace_file" ]]; then
-    _ct_message="Error: recording failed: the trace writer finished without writing $_ct_trace_file"
+if (( _ct_writer_status != 0 )) || [[ ! -f "$_ct_trace_file" ]]; then
+    if (( _ct_writer_status != 0 )); then
+        _ct_message="Error: recording failed: the trace writer exited with status $_ct_writer_status without writing $_ct_trace_file"
+    else
+        _ct_message="Error: recording failed: the trace writer finished without writing $_ct_trace_file"
+    fi
     if (( _ct_exit_code != 0 )); then
         _ct_message+=" (the script exited with status $_ct_exit_code)"
     fi
