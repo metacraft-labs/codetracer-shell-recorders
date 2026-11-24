@@ -409,12 +409,16 @@ zshexit_functions+=(_ct_zshexit_hook)
 
 # The start of one parameter's line in `typeset -p` output, up to and
 # including its name: the declaration keyword, the option flags, the name.
-# match[1] is the keyword, match[2] the flags ("-g -i " or ""), match[4] the
-# name. Shared by the baseline snapshot and `_ct_capture_variables`, so that
-# the two accept exactly the same lines: a line the capture accepts but the
-# baseline skips would report an inherited parameter as one of the script's.
+# match[1] is the keyword, match[2] the flags ("-g -i ", "-i16 ", "-Z3 -r "
+# or ""), match[4] the name. A flag word is letters followed by an optional
+# number: the integer base of `-i` (`-i16`) or the field width of `-Z`, `-L`
+# and `-R` (`-Z5`). The type is read from the letters alone. Shared by the
+# baseline snapshot and `_ct_capture_variables`, so that the two accept
+# exactly the same lines: a line the capture accepts but the baseline skips
+# would report an inherited parameter (such as `typeset -i10 COLUMNS=0`) as
+# one of the script's.
 # See the `typeset -p` output format above `_ct_capture_variables`.
-_ct_decl_prefix_re='^(typeset|export) (([-][[:alpha:]]+ )*)([_[:alpha:]][_[:alnum:]]*)'
+_ct_decl_prefix_re='^(typeset|export) (([-][[:alpha:]]+[[:digit:]]* )*)([_[:alpha:]][_[:alnum:]]*)'
 
 # Snapshot all variable names that exist BEFORE the target script runs.
 # Any variable not in this set was created by the user script and should be captured.
@@ -444,12 +448,26 @@ typeset -A _ct_baseline_vars
 #   typeset -A name=( [k]=v ... )        (associative array)
 #   typeset -g -a name=( ... )           (global array)
 #
+# A flag word may end in a number, the integer base of -i or the field width
+# of -Z, -L and -R; other flags follow as separate words (zsh 5.9.1):
+#   typeset -i16 name=255                 (integer, base 16; value in decimal)
+#   typeset -i10 name=value               (integer, how zsh's own are printed)
+#   typeset -Z5 name=42                   (zero-filled string; the value as
+#                                          assigned, though $name is 00042)
+#   typeset -L3 name=value                (left-justified string)
+#   typeset -R4 name=value                (right-justified string)
+#   typeset -Z3 -r name=value             (typeset -rZ3)
+#   typeset -L4 -Z4 name=value            (typeset -L4 -Z4)
+#   typeset -i2 name=value                (typeset -gi2 in a function)
+#
 # An exported scalar parameter is printed with the keyword `export` instead
 # of `typeset`, and without the -x flag (zsh 5.9, 5.9.1):
 #   export name=value                     (export name=value, or
 #                                          typeset -gx name=value in a function)
 #   export -i name=value                  (exported integer)
 #   export -F name=value                  (exported float)
+#   export -i16 name=value                (exported integer, base 16)
+#   export -Z4 name=value                 (typeset -gxZ4 in a function)
 # An exported array keeps the keyword: `typeset -ax name=( ... )`.
 # See `typeset -p` under "typeset" in
 # https://zsh.sourceforge.io/Doc/Release/Shell-Builtin-Commands.html
@@ -498,7 +516,10 @@ _ct_capture_variables() {
         [[ "$_ct_varname" == mend ]] && continue
 
         # Determine type flag from the combined flags string
-        # Flags string looks like "-g -i " or "-a " or "" etc.
+        # Flags string looks like "-g -i ", "-a ", "-i16 ", "-Z3 -r " or "".
+        # Each pattern anchors on the dash, so a width or base after the
+        # letter does not change the match: "-i16 " is integer, "-Z5 " is
+        # none of these and stays a string.
         local _ct_type_flag="s"
         if [[ "$_ct_flags_raw" == *-A* ]]; then
             _ct_type_flag="A"

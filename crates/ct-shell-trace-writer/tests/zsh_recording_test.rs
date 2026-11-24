@@ -394,6 +394,73 @@ fn test_zsh_exported_variable_types() {
     assert_no_inherited_vars(&vars, "zsh exported_typed");
 }
 
+// Issue `2026-11-15-zsh-recorder-drops-variables-whose-typeset-flag-carries-a-number`:
+// `typeset -p` prints an integer base or a field width inside the flag word
+// (`typeset -i16 h=255`, `typeset -Z5 z=42`, `export -Z4 gx=1`), and the
+// recorder accepted only letters there, so every such variable was dropped.
+// Spec `Recording-Backends/Shell-Recorder.md`, "Variable Capture": the type
+// comes from the type flag (`-i` → Int); width and base attributes do not
+// change it, so `-Z`/`-L`/`-R` parameters are Strings. Values are recorded
+// as `typeset -p` prints them: the decimal value for `-i16`, the assigned
+// text for `-Z5` (not the zero-filled `$z`).
+#[test]
+fn test_zsh_numeric_typeset_flags() {
+    require_zsh!();
+    let vars = record_last_step_vars(&common::ZSH, &fixture_path("numeric_flags.zsh"));
+    let get = |name: &str| {
+        common::var(&vars, name).unwrap_or_else(|| {
+            panic!(
+                "{name} not recorded at the last step: {:?}",
+                common::var_names(&vars)
+            )
+        })
+    };
+
+    common::assert_int(get("h"), 255, "h (typeset -i16)");
+    common::assert_int(get("xh"), 17, "xh (export -i16)");
+    common::assert_int(get("gb"), 5, "gb (typeset -gi2 in a function)");
+    for (name, value, what) in [
+        ("z", "42", "z (typeset -Z5)"),
+        ("l", "abcdef", "l (typeset -L3)"),
+        ("r", "ab", "r (typeset -R4)"),
+        ("rz", "7", "rz (typeset -Z3 -r)"),
+        ("lz", "9", "lz (typeset -L4 -Z4)"),
+        ("gx", "1", "gx (typeset -gxZ4 in a function)"),
+        ("plain_str", "s", "plain_str"),
+    ] {
+        common::assert_string(Some(get(name)), value, what);
+    }
+
+    for name in ["xh", "gb"] {
+        assert_eq!(
+            type_id_of(get(name)),
+            type_id_of(get("h")),
+            "{name} must have the trace type of h: {:?} vs {:?}",
+            get(name),
+            get("h")
+        );
+    }
+    for name in ["z", "l", "r", "rz", "lz", "gx"] {
+        assert_eq!(
+            type_id_of(get(name)),
+            type_id_of(get("plain_str")),
+            "{name} must have the trace type of plain_str: {:?} vs {:?}",
+            get(name),
+            get("plain_str")
+        );
+    }
+    // Inherited numeric-flag parameters (`typeset -i10 COLUMNS=0`, ...) are
+    // in the baseline now, and still not variables of the script.
+    for name in ["COLUMNS", "RANDOM", "SECONDS", "TRY_BLOCK_ERROR"] {
+        assert!(
+            common::var(&vars, name).is_none(),
+            "the inherited {name} must not be recorded; recorded: {:?}",
+            common::var_names(&vars)
+        );
+    }
+    assert_no_inherited_vars(&vars, "zsh numeric_flags");
+}
+
 /// The trace type of a scalar value record.
 fn type_id_of(value: &ValueRecord) -> u64 {
     match value {
