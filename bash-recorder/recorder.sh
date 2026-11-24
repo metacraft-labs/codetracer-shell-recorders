@@ -648,7 +648,7 @@ _ct_debug_trap() {
 
     # BASH_SOURCE[0] is the recorder itself when in the trap function
     # BASH_SOURCE[1] is the actual source file being executed
-    local _ct_file="${BASH_SOURCE[1]}"
+    local _ct_file="${BASH_SOURCE[1]-}"
     local _ct_line="${BASH_LINENO[0]}"
     local _ct_depth=${#FUNCNAME[@]}
 
@@ -856,7 +856,7 @@ _ct_debug_trap() {
 _ct_err_trap() {
     local _ct_status=$?
     local _ct_cmd="$BASH_COMMAND"
-    local _ct_file="${BASH_SOURCE[1]}"
+    local _ct_file="${BASH_SOURCE[1]-}"
     _ct_run_script_ERR=0
 
     # Skip errors from recorder internals
@@ -1013,46 +1013,197 @@ _ct_return_trap() {
     return 0
 }
 
-# Set once the EXIT event has been written, so it is written exactly once.
+# Set once recording has stopped, and once the EXIT event has been
+# written, so that each happens exactly once.
+_ct_recording_stopped=0
 _ct_exit_emitted=0
 
+# Stop recording: nothing the shell runs after this is a command of the
+# script to record. Called when the script's exit begins, before the
+# script's own EXIT action runs, so that the action is not recorded (as it
+# never was) and the recorder's DEBUG, RETURN and ERR traps no longer fire
+# inside it. The latter matters for more than the event stream: Bash runs
+# `exit` without an argument in a trap action with the `$?` saved by the
+# most recent trap it entered, so a recorder trap firing inside the action
+# would change the status the script's `exit` exits with.
+_ct_stop_recording() {
+    (( BASHPID == _ct_recorder_pid )) || return 0
+    (( _ct_recording_stopped )) && return 0
+    _ct_recording_stopped=1
+
+    # Before the traps are removed: a trap of the recorder's that the script
+    # replaced behind its back leaves a partial recording, which is said here.
+    _ct_report_replaced_traps
+
+    # `builtin` bypasses the shadow `trap` below, which would keep them.
+    builtin trap - DEBUG
+    builtin trap - RETURN
+    builtin trap - ERR
+}
+
 # Emit the EXIT event for exit status $1: the event that closes the
-# `<script>` frame and carries the script's exit code.
+# `<script>` frame and carries the status the process exits with. It is the
+# last event of the stream.
 #
-# It has two callers. The EXIT trap covers a script that calls `exit`, which
-# ends this shell inside the `source` below, so no line after `source` runs.
-# The call after `source` covers a script that runs off its end, and is the
-# fallback for a script that replaced the EXIT trap where the shadow `trap`
-# cannot see it (see "Traps set by the script"). Whichever runs first
-# writes the event; the flag makes the other a no-op.
+# The script's EXIT action can still change that status, with `exit N`, so
+# the event is written once the action can no longer do so:
+#
+# - the recorder's EXIT trap (`_ct_exit_trap`) writes it at once when the
+#   script has no EXIT action; otherwise the trap action writes it after
+#   the script's action ran off its end, with the status the trap was
+#   entered with, which Bash then exits with;
+# - an `exit` of the script's EXIT action writes it with the status it is
+#   about to exit with (the `exit` function `_ct_exit_trap` defines);
+# - under `set -e`, the ERR trap of the script's EXIT action writes it with
+#   the status of the failing command that ends the shell
+#   (`_ct_exit_action_failed`);
+# - the line after the recorder's `source` of the script writes it when the
+#   script replaced the EXIT trap where the shadow `trap` cannot see it (see
+#   "Traps set by the script").
 #
 # Only the recorder's own shell writes it. The EXIT trap is not run by a
 # subshell in bash, but the PID test keeps a subshell's `exit` from ever
 # being mistaken for the script's exit.
 # See: https://www.gnu.org/software/bash/manual/html_node/Command-Execution-Environment.html
 _ct_emit_exit() {
-    local _ct_code="$1"
-    # The script's own EXIT action, chained after this in the EXIT trap (see
-    # "Traps set by the script"), runs whether or not the event is written
-    # here, with `$?` the status the shell exits with.
-    _ct_run_script_EXIT=1
-    _ct_script_status_EXIT=$_ct_code
     (( BASHPID == _ct_recorder_pid )) || return 0
     (( _ct_exit_emitted )) && return 0
     _ct_exit_emitted=1
+    _ct_stop_recording
+    printf 'EXIT code=%d\n' "$1" >&"$_ct_events_fd"
+}
 
-    # Before the traps are removed: a trap of the recorder's that the script
-    # replaced behind its back leaves a partial recording, which is said here.
-    _ct_report_replaced_traps
-
-    # Nothing after this point belongs to the script: stop recording before
-    # writing the event, so it is the last one in the stream. `builtin`
-    # bypasses the shadow `trap` below, which would keep them.
+# Make $1 the status Bash saved on entering the trap that runs now, as it
+# was before the recorder's own traps ran inside it.
+#
+# Bash keeps one saved status for trap actions, the `$?` of the moment the
+# most recent trap was entered, and `exit` without an argument in a trap
+# action exits with it (POSIX: "the value of the special parameter '?'
+# that it had immediately preceding the trap action"). Each DEBUG and
+# RETURN trap the recorder's handlers ran inside the EXIT trap replaced it,
+# so a script's `trap '...; exit' EXIT` would exit with the status of one
+# of the recorder's commands. Entering one more trap with `$?` at $1 puts
+# it back: a DEBUG trap (the one trap whose action Bash enters with the
+# `$?` of the moment; a RETURN action is entered with 0) that removes
+# itself the first time it runs with `$?` at $1, before the `:` below.
+# Called after `_ct_stop_recording`, so no recorder trap runs after it.
+# This is how Bash 5.1 and later behave; an older Bash instead stops using
+# the saved status once any other trap has run inside the EXIT trap, which
+# no trap entered here undoes, and the `exit` function deals with that (see
+# `_ct_define_exit_function`).
+# $1 is a number, the status a trap was entered with, and is expanded into
+# the action as such.
+# See: https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html#exit
+_ct_restore_trap_status() {
+    # shellcheck disable=SC2064 # $1 is meant to expand now; `\$?` later
+    builtin trap "if (( \$? == $1 )); then builtin trap - DEBUG; fi" DEBUG
+    _ct_set_status "$1" && :
+    :
     builtin trap - DEBUG
-    builtin trap - RETURN
-    builtin trap - ERR
+}
 
-    printf 'EXIT code=%d\n' "$_ct_code" >&"$_ct_events_fd"
+# The recorder's EXIT trap handler, for exit status $1 (`$?` on entry to
+# the trap: the argument of `exit`, or the status of the last command).
+# The script's own EXIT action, chained after this in the EXIT trap (see
+# "Traps set by the script"), runs with `$?` set back to $1.
+_ct_exit_trap() {
+    _ct_run_script_EXIT=1
+    _ct_script_status_EXIT=$1
+    (( BASHPID == _ct_recorder_pid )) || return 0
+    _ct_stop_recording
+    _ct_restore_trap_status "$1"
+    if [[ -z "${_ct_script_traps[EXIT]:-}" ]]; then
+        _ct_emit_exit "$1"
+        return 0
+    fi
+    # The script's EXIT action can end the shell, and nothing Bash runs
+    # after that could write the event: an `exit` inside an EXIT trap ends
+    # the shell without running the trap again. So the recorder writes the
+    # event at each point where the action ends the shell:
+    #
+    # - `exit`: for as long as the action runs, `exit` is a function that
+    #   writes the event with the status the shell exits with and then runs
+    #   the builtin (`_ct_define_exit_function`);
+    # - `set -e`, at a failing command, with that command's status: Bash
+    #   runs the ERR trap under exactly the conditions under which `set -e`
+    #   exits (see `_ct_err_trap`), so an ERR trap writes the event when
+    #   `set -e` is on as the command fails. It is set whether or not
+    #   `set -e` is on as the action starts, since the action can turn it
+    #   on itself (`trap 'set -e; ...' EXIT`).
+    builtin trap '_ct_exit_action_failed "$?"' ERR
+    _ct_define_exit_function
+}
+
+# The ERR trap of the script's EXIT action (see `_ct_exit_trap`): a command
+# of the action failed with status $1, and `set -e` ends the shell with it.
+# An action that turned `set -e` off goes on, with the status `exit`
+# without an argument uses put back to the one the EXIT trap was entered
+# with, which entering this trap replaced (see `_ct_restore_trap_status`).
+_ct_exit_action_failed() {
+    if [[ $- == *e* ]]; then
+        _ct_emit_exit "$1"
+    else
+        _ct_restore_trap_status "$_ct_script_status_EXIT"
+    fi
+    return 0
+}
+
+# Define the `exit` function of the script's EXIT action (see
+# `_ct_exit_trap`). It is defined only once the action is about to run,
+# since anywhere else a function named `exit` would be recorded as a call.
+# A function of that name the script defined itself is left in place (see
+# "Signal Handler Conflicts" in the spec).
+_ct_define_exit_function() {
+    declare -F exit >/dev/null && return 0
+    exit() {
+        # `$?` as the caller left it: `exit` without an argument may use it.
+        local _ct_status=$? _ct_probe _ct_code _ct_where="${BASH_SOURCE[1]-}"
+        # Bash before 5.1 forgets that it runs the EXIT trap once any other
+        # trap has run inside it (`_run_trap_internal` sets `running_trap`
+        # to 0 when it returns), and an `exit` without an argument then
+        # exits with `$?`, not with the status the trap was entered with.
+        # The recorder's own traps have run inside it, so on those releases
+        # the argument the script left out is given: the trap's status,
+        # which is what such an `exit` exits with in the script's action
+        # without the recorder (in a function or a subshell of it as well).
+        # See: https://git.savannah.gnu.org/cgit/bash.git/tree/trap.c?h=bash-5.0 (_run_trap_internal)
+        if (( $# == 0 && (BASH_VERSINFO[0] < 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] < 1)) )); then
+            set -- "$_ct_script_status_EXIT"
+        fi
+        # What the builtin does with these arguments, asked of a command
+        # substitution, where it ends only that subshell: the status it
+        # exits with, and its messages, if any (`exit 1 2` exits, after
+        # "too many arguments"); or, when it refuses its arguments and
+        # returns (`exit foo`, except in Bash 4.0, which exits with 255),
+        # its messages and, after the `_ct_exit_refused` mark, the status
+        # it returns. Bash's rules (the low eight bits of the argument;
+        # without one, the status the trap was entered with; which
+        # arguments it refuses, and whether it then returns or exits) are
+        # thereby the running Bash's own. `&& :` keeps a non-zero status
+        # from ending a `set -e` shell (see `_ct_compose_trap_action`).
+        _ct_probe=$(_ct_set_status "$_ct_status" && :; builtin exit "$@" 2>&1; printf '\n_ct_exit_refused%d' "$?") && :
+        _ct_code=$?
+        # The builtin's messages name the script's file and line. The action
+        # of a trap that the recorder's own `exit` ran, after the script ran
+        # off its end, is the script's all the same; so is one that Bash 4.4
+        # runs with no caller's file on the call stack.
+        [[ -z "$_ct_where" || "$_ct_where" == "$_ct_recorder_file" ]] && _ct_where=$_ct_target_script
+        _ct_where="${_ct_where}: line ${BASH_LINENO[0]}: "
+        if [[ "$_ct_probe" == *$'\n'_ct_exit_refused* ]]; then
+            # Refused: the shell goes on, as after the builtin's refusal.
+            # Without the line break the mark's `printf` starts with.
+            local _ct_messages="${_ct_probe%$'\n'_ct_exit_refused*}"
+            _ct_messages=${_ct_messages%$'\n'}
+            [[ -z "$_ct_messages" ]] || _ct_print_builtin_messages "$_ct_messages" "$_ct_where"
+            return "${_ct_probe##*_ct_exit_refused}"
+        fi
+        [[ -z "$_ct_probe" ]] || _ct_print_builtin_messages "$_ct_probe" "$_ct_where"
+        # A subshell of the action exiting is not the script's exit.
+        _ct_emit_exit "$_ct_code"
+        _ct_set_status "$_ct_status" && :
+        # Its messages were printed above, from the probe.
+        builtin exit "$@" 2>/dev/null
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -1075,9 +1226,9 @@ _ct_emit_exit() {
 # `trap 'echo "failed at $LINENO"; return 1' ERR`.
 #
 # EXIT is kept the same way in the recorder's own shell, where the
-# recorder's EXIT trap writes the EXIT event of a script that calls `exit`:
-# the script's EXIT action runs after the event is written, unrecorded, as
-# the rest of the script's EXIT trap always was. A subshell has no EXIT trap
+# recorder's EXIT trap writes the EXIT event: the script's EXIT action runs
+# unrecorded, and the event is written once the action can no longer change
+# the exit status (see `_ct_emit_exit`). A subshell has no EXIT trap
 # of the recorder's (Bash resets it there), so its EXIT goes to the builtin;
 # the subshell's PID is noted in `_ct_exit_trap_pid`, for
 # `_ct_begin_subshell_exit`. Every other condition goes to the builtin
@@ -1141,9 +1292,18 @@ declare -A _ct_recorder_handlers=(
     [ERR]='_ct_err_trap'
     # `$?` in an EXIT trap is the status the shell is exiting with: the
     # argument of `exit`, or the status of the last command when omitted.
-    [EXIT]='_ct_emit_exit "$?"'
+    [EXIT]='_ct_exit_trap "$?"'
 )
 declare -A _ct_installed_traps=()
+
+# What the recorder runs after the script's action for a condition, when
+# the action runs off its end. For EXIT, the EXIT event, with the status
+# the shell then exits with: the one the trap was entered with (see
+# `_ct_emit_exit`).
+# shellcheck disable=SC2016 # expanded when the trap runs
+declare -A _ct_recorder_finishers=(
+    [EXIT]=$'\n_ct_emit_exit "$_ct_script_status_EXIT"'
+)
 
 # Set by each handler: whether the script's action for its condition runs
 # this time (1) or not (0), and the `$?` it runs with. One pair per
@@ -1269,7 +1429,7 @@ _ct_compose_trap_action() {
     _ct_reply="$_ct_handler"
     [[ -n "${_ct_script_traps[$_ct_sig]:-}" ]] || return 0
     local _ct_prologue="case \$_ct_run_script_${_ct_sig} in 1) _ct_set_status \"\$_ct_script_status_${_ct_sig}\" && :;"
-    local _ct_epilogue=$'\n;; esac\n'"_ct_script_action_end ${_ct_sig}"
+    local _ct_epilogue=$'\n;; esac\n'"_ct_script_action_end ${_ct_sig}${_ct_recorder_finishers[$_ct_sig]-}"
     local _ct_composed="${_ct_handler}; ${_ct_prologue} ${_ct_script_traps[$_ct_sig]}${_ct_epilogue}"
     if ( builtin eval "_ct_parse_probe() { ${_ct_composed}"$'\n}' ) >/dev/null 2>&1; then
         _ct_reply="$_ct_composed"
@@ -1367,28 +1527,34 @@ _ct_print_all_traps() {
     return 0
 }
 
-# Run the `trap` builtin with "$@" for the script's `trap` (called from it
-# directly). When it fails, its message is printed as the builtin prints it
-# for a command of the script, naming the script's file and line, not this
-# file's: the builtin runs again in a subshell to capture the message (it
-# has no effect there), and the location prefix
-# ("<file>: line <n>: ") of each line is replaced.
-_ct_builtin_trap() {
-    # shellcheck disable=SC2064 # the script's own `trap` arguments
-    builtin trap "$@" 2>/dev/null && return 0
-    local _ct_rc=$? _ct_messages _ct_message
-    # shellcheck disable=SC2064 # the same arguments, for the message
-    _ct_messages=$(builtin trap "$@" 2>&1 >/dev/null)
-    local _ct_here="${BASH_SOURCE[0]}: line "
-    local _ct_there="${BASH_SOURCE[2]}: line ${BASH_LINENO[1]}: "
+# Print $1, the error messages of a builtin the recorder ran for a command
+# of the script, on standard error as the builtin prints them for the
+# script's own command: the location prefix ("<file>: line <n>: ") naming
+# this file is replaced by $2, the script's file and line in that form.
+_ct_print_builtin_messages() {
+    local _ct_here="${BASH_SOURCE[0]}: line " _ct_message
     local _ct_rest_re='^[0-9]+: (.*)$'
     while IFS= read -r _ct_message; do
         if [[ "$_ct_message" == "$_ct_here"* ]] &&
            [[ "${_ct_message#"$_ct_here"}" =~ $_ct_rest_re ]]; then
-            _ct_message="${_ct_there}${BASH_REMATCH[1]}"
+            _ct_message="${2}${BASH_REMATCH[1]}"
         fi
         printf '%s\n' "$_ct_message" >&2
-    done <<< "$_ct_messages"
+    done <<< "$1"
+}
+
+# Run the `trap` builtin with "$@" for the script's `trap` (called from it
+# directly). When it fails, its message is printed as the builtin prints it
+# for a command of the script, naming the script's file and line, not this
+# file's: the builtin runs again in a subshell to capture the message (it
+# has no effect there).
+_ct_builtin_trap() {
+    # shellcheck disable=SC2064 # the script's own `trap` arguments
+    builtin trap "$@" 2>/dev/null && return 0
+    local _ct_rc=$? _ct_messages
+    # shellcheck disable=SC2064 # the same arguments, for the message
+    _ct_messages=$(builtin trap "$@" 2>&1 >/dev/null)
+    _ct_print_builtin_messages "$_ct_messages" "${BASH_SOURCE[2]}: line ${BASH_LINENO[1]}: "
     return "$_ct_rc"
 }
 
@@ -1571,6 +1737,17 @@ _ct_load_command='source "$_ct_target_script"'
 source "$_ct_target_script"
 _ct_exit_code=$?
 
-_ct_emit_exit "$_ct_exit_code"
+# The script ran off its end. The recorder's EXIT trap, run by the `exit`
+# below, writes the EXIT event, after the script's EXIT action if it has
+# one (see `_ct_emit_exit`). A script that replaced that trap where the
+# shadow `trap` cannot see it gets its event here instead.
+#
+# Recording stops first, as the EXIT trap would stop it: the `exit` below
+# is the recorder's, not a command of the script, and Bash 4.4 would run
+# the DEBUG trap for the EXIT trap's action with a call stack in which,
+# under the script's `set -u`, the trap fails on an unset `BASH_SOURCE`
+# element and ends the shell before the event is written.
+_ct_trap_is_recorders EXIT || _ct_emit_exit "$_ct_exit_code"
+_ct_stop_recording
 
 exit "$_ct_exit_code"

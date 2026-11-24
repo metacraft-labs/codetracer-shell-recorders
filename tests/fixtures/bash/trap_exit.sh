@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The script's own EXIT trap runs, with the exit status, after the recorder
+# The script's own EXIT trap runs, with the exit status, before the recorder
 # writes its EXIT event; a subshell that exits under `set -e` runs its own
 # EXIT trap but never its parent's, which Bash shows it without running.
 trap 'echo "bye $?"' EXIT

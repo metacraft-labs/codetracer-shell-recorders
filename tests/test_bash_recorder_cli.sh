@@ -25,6 +25,8 @@
 #     Both variables are exported by the Linux dev shell (flake.nix).
 #   * The recorded script sees its own absolute path as `$0`, so a
 #     `BASH_SOURCE[0] == $0` entry-point guard holds, on both Bashes.
+#   * The EXIT event carries the status the process exits with when the
+#     script's EXIT action changes it, on both Bashes.
 #
 # Usage: bash tests/test_bash_recorder_cli.sh
 #
@@ -925,6 +927,54 @@ elif [[ "$(uname -s)" == Linux ]]; then
   fail "T12: no Bash 4.0 (CT_TEST_BASH_4_0) to run under; run this test in the dev shell"
 else
   echo "skipped: T12 under Bash 4.0 — CT_TEST_BASH_4_0 is unset (Linux dev shell only)"
+fi
+
+# ---------------------------------------------------------------------------
+# T13. The EXIT event carries the status the process exits with when the
+# script's EXIT action changes it, on the installed Bash and on Bash 4.0.
+#
+# codetracer-pm issue
+# `2026-11-16-bash-recorder-exit-event-keeps-the-old-code-when-the-scripts-exit-trap-calls-exit.md`;
+# spec `Recording-Backends/Shell-Recorder.md`, "Script Exit". What an
+# `exit` in a trap action exits with differs between Bash releases (Bash
+# before 5.1 forgets it runs the EXIT trap once another trap has run in it;
+# Bash 4.0 exits on `exit foo` where later releases go on), so each fixture is
+# compared with its own run without the recorder under the same Bash:
+# the recorder must exit with that status and end its event stream with
+# exactly one `EXIT code=<that status>`. The cargo tests check the rest of
+# the recording, on the installed Bash only.
+# ---------------------------------------------------------------------------
+
+# check_exit_action_fixtures <label> <bash>
+check_exit_action_fixtures() {
+  local label="$1" shell="$2" fixture name native_rc rec_rc events exits last
+  for fixture in "${FIXTURES_BASH}"/trap_exit_*.sh; do
+    name="$(basename "${fixture}" .sh)"
+    native_rc=0
+    # shellcheck disable=SC2016 # $1 is the inner shell's first argument
+    "${shell}" -c 'set -o functrace -o errtrace; shopt -s extdebug; source "$1"' \
+      bash "${fixture}" >/dev/null 2>&1 || native_rc=$?
+    events="${WORK_DIR}/t13-${label}-${name}.events"
+    rec_rc=0
+    "${shell}" "${REPO_ROOT}/bash-recorder/recorder.sh" "${fixture}" \
+      >/dev/null 2>&1 3>"${events}" || rec_rc=$?
+    [[ "${rec_rc}" == "${native_rc}" ]] \
+      || fail "T13 ${label} ${name}: the recorder exited ${rec_rc}, the script exits ${native_rc} without it"
+    exits="$(grep -c '^EXIT ' "${events}" || true)"
+    last="$(tail -n 1 "${events}")"
+    [[ "${exits}" == 1 && "${last}" == "EXIT code=${native_rc}" ]] \
+      || fail "T13 ${label} ${name}: expected one EXIT event, code=${native_rc}, last; got ${exits}, last event '${last}'"
+    pass "T13 ${label} ${name}: exit ${native_rc}, EXIT code=${native_rc}"
+  done
+}
+
+check_exit_action_fixtures "installed-bash" "$(command -v bash)"
+if [[ -n "${CT_TEST_BASH_4_0:-}" ]]; then
+  check_exit_action_fixtures "bash-4.0" "${CT_TEST_BASH_4_0}"
+elif [[ "$(uname -s)" == Linux ]]; then
+  fail "T13: no Bash 4.0 (CT_TEST_BASH_4_0) to run under; run this test in the dev shell"
+else
+  echo "skipped: T13 under Bash 4.0 — CT_TEST_BASH_4_0 is unset (Linux dev shell only)"
 fi
 
 echo ""

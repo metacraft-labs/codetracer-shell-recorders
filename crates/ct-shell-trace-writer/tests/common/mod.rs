@@ -933,12 +933,18 @@ pub const REPLACED_TRAP_WARNING: &str = "replaced the recorder's";
 /// `DEBUG_BEFORE_CMD`, which is on by default.
 /// See: https://www.gnu.org/software/bash/manual/html_node/The-Shopt-Builtin.html (extdebug)
 pub fn native_stdout(shell: &Shell, stem: &str) -> String {
+    String::from_utf8_lossy(&native_output(shell, stem).stdout).into_owned()
+}
+
+/// Run the fixture `stem` without the recorder, as `native_stdout` does,
+/// and return its whole output, exit status included.
+pub fn native_output(shell: &Shell, stem: &str) -> Output {
     let fixture = shell.fixture(stem);
     let prelude = match shell.interpreter {
         "bash" => "set -o functrace -o errtrace; shopt -s extdebug; ",
         _ => "",
     };
-    let output = Command::new(shell.interpreter)
+    Command::new(shell.interpreter)
         .current_dir(repo_root())
         .args([
             "-c",
@@ -947,8 +953,7 @@ pub fn native_stdout(shell: &Shell, stem: &str) -> String {
             fixture.to_str().unwrap(),
         ])
         .output()
-        .expect("failed to run the fixture natively");
-    String::from_utf8_lossy(&output.stdout).into_owned()
+        .expect("failed to run the fixture natively")
 }
 
 /// The text of every `Error` IO event of the trace in `out_dir`, in order.
@@ -1176,6 +1181,44 @@ pub fn check_script_exit_trap(shell: &Shell) {
         shell.interpreter
     );
     record_like_native(shell, "trap_exit");
+}
+
+/// codetracer-pm issue
+/// `2026-11-16-bash-recorder-exit-event-keeps-the-old-code-when-the-scripts-exit-trap-calls-exit`:
+/// the `EXIT` event carries the status the process exits with (spec
+/// `Recording-Backends/Shell-Recorder.md`, "Script Exit"), also when the
+/// script's own `EXIT` action changes it. For the fixture `stem`, whose
+/// `EXIT` action makes the shell exit with `status`:
+///
+/// - natively, the fixture exits with `status`, so the fixture shows what
+///   it claims to;
+/// - the recorder exits with `status`, and its event stream ends with
+///   exactly one `EXIT code=<status>`, with nothing of the recorder's own
+///   in it (`assert_recorder_exit`);
+/// - through the launcher, the script prints what it prints natively, the
+///   launcher passes `status` through, the writer sees the `EXIT` event,
+///   and the `<script>` frame returns `Int <status>`; the script's `EXIT`
+///   action is not recorded, so the last step is at `exit_line`, the line
+///   of the command that started the exit (`assert_launcher_records`).
+pub fn check_exit_action_sets_exit_code(shell: &Shell, stem: &str, status: i32, exit_line: u64) {
+    let native = native_output(shell, stem);
+    assert_eq!(
+        native.status.code(),
+        Some(status),
+        "{} {stem}: the fixture's native exit status; stderr={}",
+        shell.interpreter,
+        String::from_utf8_lossy(&native.stderr)
+    );
+    assert_recorder_exit(shell, stem, status);
+    let (_out, output) = run_launcher_with_built_writer(shell, &shell.fixture(stem));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&native.stdout),
+        "{} {stem}: the recorded script must print what it prints without the recorder; stderr={}",
+        shell.interpreter,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_launcher_records(shell, stem, status, exit_line);
 }
 
 /// codetracer-pm issue

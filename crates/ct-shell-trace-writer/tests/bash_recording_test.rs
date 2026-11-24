@@ -945,6 +945,64 @@ fn test_bash_script_exit_trap_is_chained() {
     common::check_script_exit_trap(&common::BASH);
 }
 
+/// The issue's reproduction: the script runs off its end with status 0 and
+/// its EXIT action calls `exit 7`, so the process exits 7 and the `EXIT`
+/// event must say 7.
+#[test]
+fn test_bash_exit_action_calling_exit_sets_the_exit_code() {
+    common::check_exit_action_sets_exit_code(&common::BASH, "trap_exit_calls_exit", 7, 5);
+}
+
+/// The script exits from inside a function, and its EXIT action exits from
+/// inside a function of its own with an out-of-range status (303, so 47),
+/// after an `exit` in a subshell and in a command substitution of the
+/// action, which end only those.
+#[test]
+fn test_bash_exit_action_exiting_from_a_function_sets_the_exit_code() {
+    common::check_exit_action_sets_exit_code(
+        &common::BASH,
+        "trap_exit_calls_exit_in_function",
+        47,
+        14,
+    );
+}
+
+/// `exit` without an argument in the EXIT action exits with the status the
+/// trap was entered with, as natively, and an `exit` that refuses its
+/// argument lets the action go on.
+#[test]
+fn test_bash_exit_action_plain_exit_keeps_the_trap_status() {
+    common::check_exit_action_sets_exit_code(&common::BASH, "trap_exit_plain_exit", 5, 7);
+}
+
+/// Under `set -e`, a failing command of the EXIT action ends the shell with
+/// its status.
+#[test]
+fn test_bash_exit_action_failing_under_errexit_sets_the_exit_code() {
+    common::check_exit_action_sets_exit_code(&common::BASH, "trap_exit_errexit", 4, 7);
+}
+
+/// An EXIT action that turns `set -e` off and then fails goes on, and its
+/// `exit` without an argument still exits with the trap's status.
+#[test]
+fn test_bash_exit_action_without_errexit_keeps_the_trap_status() {
+    common::check_exit_action_sets_exit_code(&common::BASH, "trap_exit_errexit_off", 3, 7);
+}
+
+/// An EXIT action that turns `set -e` on itself: its failing command ends
+/// the shell with that command's status.
+#[test]
+fn test_bash_exit_action_turning_errexit_on_sets_the_exit_code() {
+    common::check_exit_action_sets_exit_code(&common::BASH, "trap_exit_errexit_in_action", 6, 6);
+}
+
+/// `exit` with too many arguments in the EXIT action still exits, with the
+/// status the trap was entered with, and the action does not go on.
+#[test]
+fn test_bash_exit_action_exit_with_too_many_arguments_still_exits() {
+    common::check_exit_action_sets_exit_code(&common::BASH, "trap_exit_too_many_args", 6, 6);
+}
+
 /// A script that takes descriptor 3 for itself (`exec 3>&1`) neither sees
 /// the event stream on its output nor cuts the recording short.
 #[test]
