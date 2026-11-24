@@ -302,6 +302,37 @@ _ct_resolve_source_file() {
     _ct_absolute_path "$1"
 }
 
+# The trace writer is a native executable. On Windows this recorder runs
+# under an MSYS2 or Cygwin bash, whose paths (`/c/...`, `/tmp/...`) only
+# that runtime can resolve, and MSYS rewrites command-line arguments but not
+# the events stream. Every path sent to the writer is therefore converted
+# once to Windows mixed form: drive letter, forward slashes and long names
+# (`C:/Users/...`), which both the writer and the trace readers open.
+# Everywhere else the path is sent unchanged.
+# https://www.msys2.org/docs/filesystem-paths/
+# https://cygwin.com/cygwin-ug-net/cygpath.html
+_ct_use_cygpath=0
+case "$OSTYPE" in
+    msys* | cygwin*)
+        command -v cygpath >/dev/null 2>&1 && _ct_use_cygpath=1
+        ;;
+esac
+
+# Sets _ct_np to the writer's form of the path in $1. A variable rather than
+# stdout, so that no subshell is spawned off Windows.
+_ct_native_path() {
+    _ct_np="$1"
+    if (( _ct_use_cygpath )); then
+        _ct_np="$(cygpath -m -l -- "$1")" || {
+            echo "ct-bash-recorder: cygpath could not convert '$1'" >&2
+            _ct_np="$1"
+        }
+    fi
+}
+
+_ct_native_path "$_ct_target_script"
+_ct_target_script_native="$_ct_np"
+
 # Emit START event
 #
 # The write is checked for the same reason as the move above: a failed
@@ -309,7 +340,7 @@ _ct_resolve_source_file() {
 # and the script would run with no START, so unrecorded. Stopping here also
 # keeps the launcher's reading of an empty event file true: the recorder
 # stopped before the script ran (launcher.sh, after the trace writer).
-_ct_inline_quote "$_ct_target_script"
+_ct_inline_quote "$_ct_target_script_native"
 _ct_target_script_q=$_ct_qv
 _ct_inline_quote "$BASH_VERSION"
 if ! printf 'START program=%s shell=bash shell_version=%s\n' "$_ct_target_script_q" "$_ct_qv" >&"$_ct_events_fd"; then
@@ -321,14 +352,15 @@ fi
 printf 'PATH file=%s\n' "$_ct_target_script_q" >&"$_ct_events_fd"
 
 # The source files already registered, by the path BASH_SOURCE reports,
-# each mapped to the quoted form of its absolute path for the PATH, FUNC
-# and STEP events (see `_ct_resolve_source_file`). Keyed by the reported
-# string because that is all a later step offers: a function keeps the
-# BASH_SOURCE it was defined with, and a step in it after another `cd`
-# must map to the path fixed when the file was first seen. The same key
-# makes one limit inherent: two different files reported by the same
-# relative string from different directories cannot be told apart, and
-# both are recorded as the first one resolved. A file that only defines
+# each mapped to the quoted writer form (see `_ct_native_path`) of its
+# absolute path for the PATH, FUNC and STEP events (see
+# `_ct_resolve_source_file`). Keyed by the reported string because that is
+# all a later step offers: a function keeps the BASH_SOURCE it was defined
+# with, and a step in it after another `cd` must map to the path fixed when
+# the file was first seen. The same key makes one limit inherent: two
+# different files reported by the same relative string from different
+# directories cannot be told apart, and both are recorded as the first one
+# resolved. A file that only defines
 # functions has a second, narrower one: it is resolved against the newest
 # `source` directory that has a file by that relative path, which is
 # another file when a newer `source` ran where one by that name exists.
@@ -929,14 +961,15 @@ _ct_debug_trap() {
 
     # Register new source files by their absolute path, resolved against
     # the working directory the file was opened in (see
-    # `_ct_resolve_source_file`), and keep the quoted path for the events
-    # below (see `_ct_inline_quote`). The filters above compare the raw
-    # string.
+    # `_ct_resolve_source_file`), and keep the quoted writer form of it
+    # (see `_ct_native_path` and `_ct_inline_quote`) for the events below.
+    # The filters above compare the raw string.
     _ct_note_source_dir "$_ct_command"
-    local _ct_qv _ct_ap
+    local _ct_qv _ct_ap _ct_np
     if [[ -z "${_ct_registered_paths[$_ct_file]+x}" ]]; then
         _ct_resolve_source_file "$_ct_file" "${FUNCNAME[1]}"
-        _ct_inline_quote "$_ct_ap"
+        _ct_native_path "$_ct_ap"
+        _ct_inline_quote "$_ct_np"
         _ct_registered_paths["$_ct_file"]=$_ct_qv
         if [[ -z "${_ct_emitted_paths[$_ct_ap]+x}" ]]; then
             _ct_emitted_paths["$_ct_ap"]=1

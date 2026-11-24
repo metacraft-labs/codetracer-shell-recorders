@@ -13,6 +13,7 @@ use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use tempfile::TempDir;
 
 mod common;
+use common::{files_copy_path, recorded_form};
 
 /// CTFS magic bytes: 0xC0 0xDE 0x72 0xAC 0xE2
 const CTFS_MAGIC: &[u8] = &[0xC0, 0xDE, 0x72, 0xAC, 0xE2];
@@ -575,7 +576,7 @@ fn e2e_bash_simple_script() {
 
     // Verify the source file was copied — it should be under files/<absolute-path>
     let fixture = fixture_path("simple.sh");
-    let copied = files_dir.join(fixture.strip_prefix("/").unwrap_or(&fixture));
+    let copied = files_copy_path(output_dir.path(), &fixture);
     assert!(
         copied.exists(),
         "Source file copy not found at expected path: {}",
@@ -619,22 +620,26 @@ fn e2e_bash_multi_file() {
     let with_source_fixture = fixture_path("with_source.sh");
     let sourced_lib_fixture = fixture_path("sourced_lib.sh");
 
-    let copied_with_source = files_dir.join(
-        with_source_fixture
-            .strip_prefix("/")
-            .unwrap_or(&with_source_fixture),
-    );
+    // Both files are named in the form a native reader opens, not only by
+    // a matching file name.
+    for fixture in [&with_source_fixture, &sourced_lib_fixture] {
+        let expected = recorded_form(fixture);
+        assert!(
+            paths.contains(&expected),
+            "paths should contain {}: {:?}",
+            expected,
+            paths
+        );
+    }
+
+    let copied_with_source = files_copy_path(output_dir.path(), &with_source_fixture);
     assert!(
         copied_with_source.exists(),
         "with_source.sh copy not found at: {}",
         copied_with_source.display()
     );
 
-    let copied_sourced_lib = files_dir.join(
-        sourced_lib_fixture
-            .strip_prefix("/")
-            .unwrap_or(&sourced_lib_fixture),
-    );
+    let copied_sourced_lib = files_copy_path(output_dir.path(), &sourced_lib_fixture);
     assert!(
         copied_sourced_lib.exists(),
         "sourced_lib.sh copy not found at: {}",
@@ -755,14 +760,15 @@ fn e2e_bash_metadata() {
         db_meta["language"]
     );
 
-    // Verify: program contains "simple.sh"
+    // Verify: program is the script, in the form a native reader opens
     let program = db_meta["program"]
         .as_str()
         .expect("program field should be a string");
-    assert!(
-        program.contains("simple.sh"),
-        "program should contain 'simple.sh', got: {}",
-        program
+    let expected_program = recorded_form(&fixture_path("simple.sh"));
+    assert_eq!(
+        program, expected_program,
+        "program should be {}, got: {}",
+        expected_program, program
     );
 
     // Verify: bash_version is non-empty
@@ -800,12 +806,13 @@ fn e2e_bash_metadata() {
         db_meta["args"]
     );
 
-    // Also verify the .ct container's metadata records the script as the program
+    // Also verify the .ct container's metadata records the script as the
+    // program, named exactly as trace_db_metadata.json names it
     let meta_program = read_trace_program(&output_dir);
-    assert!(
-        meta_program.contains("simple.sh"),
-        "meta.dat program should reference simple.sh, got: {}",
-        meta_program
+    assert_eq!(
+        meta_program, expected_program,
+        "meta.dat program should be {}, got: {}",
+        expected_program, meta_program
     );
 }
 

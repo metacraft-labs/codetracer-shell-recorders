@@ -43,7 +43,15 @@ pass() {
   PASS_COUNT=$((PASS_COUNT + 1))
 }
 
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ct-zsh-cli-XXXXXX")"
+# The recorder stores each traced path in canonical form, and the
+# assertions below compare it with FIXTURE byte for byte, so FIXTURE must
+# not carry the doubled slash a trailing-slash TMPDIR would put into it
+# (macOS sets TMPDIR to ".../T/"). A TMPDIR of "/" leaves it empty.
+TMP_ROOT="${TMPDIR:-/tmp}"
+while [[ ${TMP_ROOT} == */ ]]; do
+  TMP_ROOT="${TMP_ROOT%/}"
+done
+WORK_DIR="$(mktemp -d "${TMP_ROOT}/ct-zsh-cli-XXXXXX")"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 ( cd "${REPO_ROOT}" && cargo build --quiet )
@@ -54,6 +62,16 @@ cat > "${FIXTURE}" <<'EOF'
 echo "fixture-marker"
 EOF
 chmod +x "${FIXTURE}"
+
+# The recording names FIXTURE in the form a native reader opens. Under
+# MSYS2 or Cygwin (Windows) that is the `cygpath -m -l` form of this shell's
+# path (`C:/Users/...`: drive letter, forward slashes, long names); elsewhere
+# it is the path itself. The assertions compare against this form.
+# https://cygwin.com/cygwin-ug-net/cygpath.html
+case "${OSTYPE}" in
+  msys* | cygwin*) FIXTURE_RECORDED="$(cygpath -m -l -- "${FIXTURE}")" ;;
+  *) FIXTURE_RECORDED="${FIXTURE}" ;;
+esac
 
 # Richer fixture — used by T7 (`ct-print --full` exact-value layer).
 # Surfaces a positional-arg call so we can assert on a decoded
@@ -179,10 +197,10 @@ run_ct_print() {
 
 if [[ -x "${CT_PRINT}" ]]; then
   CT_JSON="$(run_ct_print --json "${OUT_DIR_T4}/fixture.ct")"
-  grep -qF "\"program\": \"${FIXTURE}\"" <<< "${CT_JSON}" \
-    || fail "ct-print --json: metadata.program missing ${FIXTURE}: ${CT_JSON}"
-  grep -qF "\"${FIXTURE}\"" <<< "${CT_JSON}" \
-    || fail "ct-print --json: paths/steps do not reference ${FIXTURE}: ${CT_JSON}"
+  grep -qF "\"program\": \"${FIXTURE_RECORDED}\"" <<< "${CT_JSON}" \
+    || fail "ct-print --json: metadata.program missing ${FIXTURE_RECORDED}: ${CT_JSON}"
+  grep -qF "\"${FIXTURE_RECORDED}\"" <<< "${CT_JSON}" \
+    || fail "ct-print --json: paths/steps do not reference ${FIXTURE_RECORDED}: ${CT_JSON}"
   grep -qF '<toplevel>' <<< "${CT_JSON}" \
     || fail "ct-print --json: <toplevel> call missing: ${CT_JSON}"
   pass "ct print --json round-trips the recorded .ct bundle"

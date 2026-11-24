@@ -1,6 +1,7 @@
 // Shared helpers for the recorder tests in `bash_recording_test.rs` and
-// `zsh_recording_test.rs`: the exit-code claims, and reading the variables
-// recorded at a step back out of a `.ct` container.
+// `zsh_recording_test.rs`: the exit-code claims, reading the variables
+// recorded at a step back out of a `.ct` container, and the path
+// expectations (see "Path expectations" below).
 //
 // The exit-code claims are identical for both shells (spec
 // `Recording-Backends/Shell-Recorder.md`, "Bash Traps" / "Zsh Traps": the
@@ -13,7 +14,7 @@
 // back through the Nim reader.
 #![allow(dead_code)] // each test crate uses a different subset
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
 use codetracer_trace_types::ValueRecord;
@@ -468,13 +469,10 @@ pub fn assert_launcher_records(shell: &Shell, stem: &str, status: i32, exit_line
             shell.interpreter
         );
     }
-    // The writer copies each recorded source to `files/<absolute path
-    // without its leading separator>` (`copy_source_files` in
+    // The writer copies each recorded source below `files/`, where the
+    // readers look it up (`files_copy_path`; `copy_source_files` in
     // `src/trace_bridge.rs`).
-    let copied = out
-        .path()
-        .join("files")
-        .join(fixture.strip_prefix("/").unwrap_or(&fixture));
+    let copied = files_copy_path(out.path(), &fixture);
     assert!(
         copied.is_file(),
         "{} {file_name}: the script was not copied to {}; present: {present:?}",
@@ -1308,9 +1306,10 @@ impl ScriptDir {
     }
 }
 
-/// The path of `p` as the wire protocol and the trace carry it.
+/// The path of `p` as the wire protocol and the trace carry it on this
+/// host (see `recorded_form`).
 fn path_str(p: &Path) -> String {
-    p.to_str().expect("UTF-8 path").to_string()
+    recorded_form(p)
 }
 
 /// Parse every line of a recorder run's raw event stream with the writer's
@@ -1373,8 +1372,9 @@ pub fn assert_stream_paths(shell: &Shell, events: &[WireEvent], expected: &[&Pat
 /// - the trace's program is `main`, its path table is exactly `sources`
 ///   with `main` first, and every step is in one of them;
 /// - every entry of the path table is absolute;
-/// - each source is copied to `files/<absolute path>` (`copy_source_files`
-///   in `src/trace_bridge.rs`), and the copy's bytes equal the original's.
+/// - each source is copied below `files/` where the readers look it up
+///   (`files_copy_path`; `copy_source_files` in `src/trace_bridge.rs`), and
+///   the copy's bytes equal the original's.
 ///
 /// Returns the output directory for further checks.
 pub fn assert_records_exact_paths(
@@ -1429,7 +1429,7 @@ pub fn assert_records_exact_paths(
     // `2026-11-15-shell-recorders-record-a-relatively-sourced-file-by-its-relative-path-and-may-not-copy-it`).
     for path in &paths {
         assert!(
-            path.starts_with('/'),
+            Path::new(path).is_absolute(),
             "{} {main_str:?}: the path table holds a path that is not absolute: {path:?}; table: {paths:?}",
             shell.interpreter
         );
@@ -1449,10 +1449,7 @@ pub fn assert_records_exact_paths(
     drop(reader);
 
     for source in sources {
-        let copy = out
-            .path()
-            .join("files")
-            .join(source.strip_prefix("/").unwrap_or(source));
+        let copy = files_copy_path(out.path(), source);
         assert!(copy.is_file(), "no copy of {source:?} at {copy:?}");
         assert_eq!(
             std::fs::read(&copy).expect("read the copy"),
@@ -1733,4 +1730,54 @@ pub fn check_records_relatively_sourced_file(shell: &Shell, how: RelativeSource)
         shell.interpreter,
         run.events.join("\n")
     );
+}
+
+// Path expectations.
+//
+// A recording names each source file in the form a native reader can open,
+// and copies it below `files/` where the readers look it up.  The helpers
+// below compute both from a fixture's path independently of the recorder and
+// the writer, so a test compares the recording against what a reader needs
+// rather than against what the recorder happens to produce.
+
+/// The form a recording names `path` in on this host.
+///
+/// On Linux and macOS it is the path itself: the launchers keep the logical
+/// path the shell resolved, symlinks included.
+///
+/// On Windows the shell is an MSYS2 or Cygwin one, and the launchers convert
+/// its paths with `cygpath -m -l`: drive letter, forward slashes, long names
+/// (`C:/Users/runner/x.sh`).  `canonicalize` yields the long names; it also
+/// prefixes the verbatim marker `\\?\`, which is dropped.
+/// <https://cygwin.com/cygwin-ug-net/cygpath.html>
+pub fn recorded_form(path: &Path) -> String {
+    if cfg!(windows) {
+        let canonical = std::fs::canonicalize(path)
+            .unwrap_or_else(|e| panic!("cannot canonicalize {}: {e}", path.display()));
+        let canonical = canonical.to_str().expect("fixture path must be UTF-8");
+        canonical
+            .strip_prefix(r"\\?\")
+            .unwrap_or(canonical)
+            .replace('\\', "/")
+    } else {
+        path.to_str()
+            .expect("fixture path must be UTF-8")
+            .to_string()
+    }
+}
+
+/// Where a recording in `output_dir` must hold its copy of the source file
+/// at `path`: below `files/`, at the recorded path with its root and, on
+/// Windows, its drive dropped (`C:/a/b.sh` -> `files/a/b.sh`), which is how
+/// the trace readers look the copy up.
+pub fn files_copy_path(output_dir: &Path, path: &Path) -> PathBuf {
+    let recorded = recorded_form(path);
+    let mut copy = output_dir.join("files");
+    for component in Path::new(&recorded).components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {}
+            other => copy.push(other.as_os_str()),
+        }
+    }
+    copy
 }

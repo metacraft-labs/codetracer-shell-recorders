@@ -400,10 +400,13 @@ impl TraceBridge {
     /// `trace_paths.json` sidecar; the launcher no longer participates in
     /// source-file copying.
     ///
-    /// Layout mirrors the RR trace-folder spec (`RR-Trace-Folders.md`
-    /// §files/): each absolute source path `/a/b/c.sh` is copied to
-    /// `files/a/b/c.sh` (the leading `/` is stripped and the remaining path
-    /// is reproduced verbatim under `files/`).
+    /// `files/` reproduces each recorded source path below it, which is
+    /// where the CodeTracer readers look a recorded path up: an absolute
+    /// path `/a/b/c.sh` is copied to `files/a/b/c.sh` (the leading `/` is
+    /// stripped and the remaining path is reproduced under `files/`).  A
+    /// Windows path `C:/a/b/c.sh` loses its drive the same way and also
+    /// lands at `files/a/b/c.sh`; see [`files_relative_path`] for the
+    /// complete mapping.
     ///
     /// Paths that do not resolve to an existing regular file on disk are
     /// skipped: synthetic paths (`<toplevel>`, `<unknown>`), character
@@ -427,12 +430,18 @@ impl TraceBridge {
                 _ => continue,
             }
 
-            // Reproduce the absolute path under `files/` with the leading
-            // separator stripped: `/a/b/c.sh` -> `files/a/b/c.sh`.  Relative
-            // paths (no leading separator) are placed under `files/` as-is.
-            let relative = src_path.strip_prefix("/").unwrap_or(src_path);
+            // A path with no place inside `files/` (one that climbs above
+            // its root, or is not a plain file path at all) is left out,
+            // like a path that names no file.
+            let Some(relative) = files_relative_path(src) else {
+                continue;
+            };
             let dest = files_dir.join(relative);
 
+            // `dest` keeps any `..` of the recorded path, so this creates
+            // every directory the path passes through.  A POSIX reader that
+            // joins the recorded path onto `files/` needs them: the kernel
+            // resolves `files/a/b/../c.sh` only when `files/a/b` exists.
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -463,6 +472,80 @@ impl TraceBridge {
     }
 }
 
+/// Map a recorded source path to the path of its copy relative to the trace
+/// bundle's `files/` directory, or `None` when it has no place there.
+///
+/// The mapping is the one the trace readers apply when they look a recorded
+/// path up in `files/`: the root, and on Windows the drive, is dropped and
+/// the remaining components are kept.
+///
+/// - `/a/b/c.sh` -> `a/b/c.sh`
+/// - `C:/a/b/c.sh` and `C:\a\b\c.sh` -> `a/b/c.sh`
+/// - `//server/share/c.sh` (a UNC path) -> `server/share/c.sh`
+/// - a relative path stays relative: `lib/c.sh` -> `lib/c.sh`
+///
+/// Empty and `.` components are dropped.  A `..` component is kept, so the
+/// copy lands where the file system resolves it inside `files/`, the place
+/// a reader that joins the recorded path onto `files/` opens:
+/// `/a/b/../c.sh` -> `a/b/../c.sh`, which is `files/a/c.sh`.  A path whose
+/// `..` would climb above the root of `files/` has no place there, since
+/// copying it would write outside `files/`, and neither has a path that
+/// ends in `..` or names nothing below the root (`/`, `/a/..`).
+///
+/// A backslash separates components only in a Windows path, one that starts
+/// with a drive (`C:`) or a backslash: in a POSIX path it is an ordinary
+/// file-name character.  A Windows path whose component holds a character
+/// Windows forbids in file names (`C:relative`, `\\?\C:\x`) is not a plain
+/// file path and is refused.
+/// <https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>
+///
+/// This is pure string manipulation, independent of the host, so the
+/// Windows mapping is the same, and tested, everywhere.
+pub fn files_relative_path(src: &str) -> Option<PathBuf> {
+    let bytes = src.as_bytes();
+    let has_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let windows = has_drive || src.starts_with('\\');
+
+    let rest = if has_drive {
+        // `C:` must be followed by a separator: `C:x` is relative to the
+        // drive's current directory, which a recording does not capture.
+        let rest = &src[2..];
+        if !rest.starts_with(['/', '\\']) {
+            return None;
+        }
+        rest
+    } else {
+        src
+    };
+
+    let is_separator = |c: char| c == '/' || (windows && c == '\\');
+    let mut components: Vec<&str> = Vec::new();
+    // How many directories below the root of `files/` the components
+    // reached so far; a `..` at depth 0 would leave `files/`.
+    let mut depth = 0usize;
+    for component in rest.split(is_separator) {
+        match component {
+            "" | "." => {}
+            ".." => {
+                depth = depth.checked_sub(1)?;
+                components.push(component);
+            }
+            _ if windows && component.contains([':', '*', '?', '"', '<', '>', '|']) => {
+                return None;
+            }
+            _ => {
+                depth += 1;
+                components.push(component);
+            }
+        }
+    }
+
+    match components.last() {
+        None | Some(&"..") => None,
+        Some(_) => Some(components.iter().collect()),
+    }
+}
+
 /// Escape a string for embedding in JSON output.
 ///
 /// Produces a quoted JSON string with backslash, double-quote, and control
@@ -485,4 +568,117 @@ fn serde_json_escape(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::files_relative_path;
+    use std::path::PathBuf;
+
+    fn mapped(src: &str) -> Option<PathBuf> {
+        files_relative_path(src)
+    }
+
+    fn path(components: &[&str]) -> Option<PathBuf> {
+        Some(components.iter().collect())
+    }
+
+    #[test]
+    fn posix_absolute_path_drops_the_root() {
+        assert_eq!(mapped("/a/b/c.sh"), path(&["a", "b", "c.sh"]));
+        assert_eq!(mapped("//a//b/./c.sh"), path(&["a", "b", "c.sh"]));
+    }
+
+    #[test]
+    fn posix_backslash_is_a_file_name_character() {
+        assert_eq!(mapped("/a/b\\c.sh"), path(&["a", "b\\c.sh"]));
+        assert_eq!(mapped("/a/x:y.sh"), path(&["a", "x:y.sh"]));
+    }
+
+    #[test]
+    fn relative_path_stays_relative() {
+        assert_eq!(mapped("lib/c.sh"), path(&["lib", "c.sh"]));
+        assert_eq!(mapped("./c.sh"), path(&["c.sh"]));
+    }
+
+    #[test]
+    fn windows_drive_path_drops_the_drive() {
+        assert_eq!(mapped("C:/a/b/c.sh"), path(&["a", "b", "c.sh"]));
+        assert_eq!(mapped("c:/a/c.sh"), path(&["a", "c.sh"]));
+        assert_eq!(mapped("C:\\a\\b\\c.sh"), path(&["a", "b", "c.sh"]));
+        assert_eq!(mapped("D:\\a/b\\c.sh"), path(&["a", "b", "c.sh"]));
+    }
+
+    #[test]
+    fn windows_long_form_from_cygpath_maps_like_the_readers() {
+        // `cygpath -m -l` of an MSYS `/tmp/...` path on a CI runner.
+        assert_eq!(
+            mapped("C:/Windows/ServiceProfiles/NetworkService/AppData/Local/Temp/x/f.sh"),
+            path(&[
+                "Windows",
+                "ServiceProfiles",
+                "NetworkService",
+                "AppData",
+                "Local",
+                "Temp",
+                "x",
+                "f.sh"
+            ])
+        );
+    }
+
+    #[test]
+    fn unc_path_keeps_server_and_share() {
+        assert_eq!(
+            mapped("//server/share/a/c.sh"),
+            path(&["server", "share", "a", "c.sh"])
+        );
+        assert_eq!(
+            mapped("\\\\server\\share\\a\\c.sh"),
+            path(&["server", "share", "a", "c.sh"])
+        );
+    }
+
+    #[test]
+    fn dot_dot_resolves_inside_files_and_is_refused_above_it() {
+        assert_eq!(mapped("/a/b/../c.sh"), path(&["a", "b", "..", "c.sh"]));
+        assert_eq!(
+            mapped("C:\\a\\b\\..\\c.sh"),
+            path(&["a", "b", "..", "c.sh"])
+        );
+        assert_eq!(
+            mapped("/a/b/../../c.sh"),
+            path(&["a", "b", "..", "..", "c.sh"])
+        );
+        assert_eq!(mapped("/../c.sh"), None);
+        assert_eq!(mapped("/a/../../c.sh"), None);
+        assert_eq!(mapped("C:/../c.sh"), None);
+        assert_eq!(mapped("../c.sh"), None);
+    }
+
+    #[test]
+    fn path_with_nothing_to_copy_is_refused() {
+        assert_eq!(mapped(""), None);
+        assert_eq!(mapped("/"), None);
+        assert_eq!(mapped("C:/"), None);
+        assert_eq!(mapped("/a/.."), None);
+        assert_eq!(mapped("/a/b/.."), None);
+    }
+
+    #[test]
+    fn windows_path_that_is_not_a_plain_file_path_is_refused() {
+        // Relative to the drive's current directory.
+        assert_eq!(mapped("C:a/c.sh"), None);
+        // Verbatim and device namespaces.
+        assert_eq!(mapped("\\\\?\\C:\\a\\c.sh"), None);
+        // An alternate data stream.
+        assert_eq!(mapped("C:/a/c.sh:stream"), None);
+    }
+
+    #[test]
+    fn synthetic_names_map_to_plain_relative_paths() {
+        // `copy_source_files` skips these because no such file exists; the
+        // mapping itself does not have to know them.
+        assert_eq!(mapped("<unknown>"), path(&["<unknown>"]));
+    }
 }

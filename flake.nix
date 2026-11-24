@@ -17,7 +17,7 @@
     # with the flags the library requires (--threads:off, one process heap),
     # so this revision must carry that build script.
     codetracer-trace-format = {
-      url = "github:metacraft-labs/codetracer-trace-format/3fada0b03c3d1a0cbc7c35f278aa639028d702c5";
+      url = "github:metacraft-labs/codetracer-trace-format/096e3f5cb73f125390dc394957b3faaa958a3e93";
       flake = false;
     };
 
@@ -25,7 +25,7 @@
     # compiles. This revision must carry the process lock its C ABI needs
     # when built --threads:off.
     codetracer-trace-format-nim = {
-      url = "github:metacraft-labs/codetracer-trace-format-nim/051efd22b00ec3b88676fb07755a65c5a4ca8fde";
+      url = "github:metacraft-labs/codetracer-trace-format-nim/30bf1a17decefeadb23606bb8c1af5fe56a5d264";
       flake = false;
     };
 
@@ -199,6 +199,23 @@
 
             # CT_TEST_BASH_4_0 / CT_TEST_BASH_3_2 (Linux): see `oldBashEnv` above.
             env = oldBashEnv;
+
+            # A prefix holding both zstd.h and libzstd, for reprobuild's path
+            # mode. That mode resolves programs from PATH, and a library has
+            # no program there, so reprobuild reads the prefix of the C
+            # library `zstd-dev` (declared in repro.nim) from this variable and
+            # checks include/zstd.h and lib/libzstd* under it. nixpkgs splits
+            # zstd into a `dev` output (the header) and an `out` output (the
+            # library), so the prefix joins the two. It is the same nixpkgs
+            # zstd as the one above, so the header matches the library this
+            # shell's compiler links.
+            ZSTD_DEV_PREFIX = pkgs.symlinkJoin {
+              name = "zstd-dev-prefix";
+              paths = [
+                pkgs.zstd.dev
+                pkgs.zstd.out
+              ];
+            };
 
             # `cargo <subcommand>` looks for `cargo-<subcommand>` in
             # `$CARGO_HOME/bin` BEFORE it searches PATH. On any machine with

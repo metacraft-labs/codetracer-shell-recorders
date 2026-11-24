@@ -58,7 +58,15 @@ pass() {
   PASS_COUNT=$((PASS_COUNT + 1))
 }
 
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ct-bash-cli-XXXXXX")"
+# The recorder stores each traced path in canonical form, and the
+# assertions below compare it with FIXTURE byte for byte, so FIXTURE must
+# not carry the doubled slash a trailing-slash TMPDIR would put into it
+# (macOS sets TMPDIR to ".../T/"). A TMPDIR of "/" leaves it empty.
+TMP_ROOT="${TMPDIR:-/tmp}"
+while [[ ${TMP_ROOT} == */ ]]; do
+  TMP_ROOT="${TMP_ROOT%/}"
+done
+WORK_DIR="$(mktemp -d "${TMP_ROOT}/ct-bash-cli-XXXXXX")"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 # Build the trace writer once up-front so the launcher can find it.
@@ -72,6 +80,16 @@ cat > "${FIXTURE}" <<'EOF'
 echo "fixture-marker"
 EOF
 chmod +x "${FIXTURE}"
+
+# The recording names FIXTURE in the form a native reader opens. Under
+# MSYS2 or Cygwin (Windows) that is the `cygpath -m -l` form of this shell's
+# path (`C:/Users/...`: drive letter, forward slashes, long names); elsewhere
+# it is the path itself. The assertions compare against this form.
+# https://cygwin.com/cygwin-ug-net/cygpath.html
+case "${OSTYPE}" in
+  msys* | cygwin*) FIXTURE_RECORDED="$(cygpath -m -l -- "${FIXTURE}")" ;;
+  *) FIXTURE_RECORDED="${FIXTURE}" ;;
+esac
 
 # Richer fixture — used by T7 (`ct-print --full` exact-value layer).
 # Surfaces a positional-arg call so we can assert on a decoded
@@ -214,10 +232,10 @@ if [[ -x "${CT_PRINT}" ]]; then
   # parallels the cardano/circom/flow precedent — we no longer assert on
   # JSON written by the recorder, we assert on JSON produced by
   # `ct print` from the canonical CTFS bundle.
-  grep -qF "\"program\": \"${FIXTURE}\"" <<< "${CT_JSON}" \
-    || fail "ct-print --json: metadata.program missing ${FIXTURE}: ${CT_JSON}"
-  grep -qF "\"${FIXTURE}\"" <<< "${CT_JSON}" \
-    || fail "ct-print --json: paths/steps do not reference ${FIXTURE}: ${CT_JSON}"
+  grep -qF "\"program\": \"${FIXTURE_RECORDED}\"" <<< "${CT_JSON}" \
+    || fail "ct-print --json: metadata.program missing ${FIXTURE_RECORDED}: ${CT_JSON}"
+  grep -qF "\"${FIXTURE_RECORDED}\"" <<< "${CT_JSON}" \
+    || fail "ct-print --json: paths/steps do not reference ${FIXTURE_RECORDED}: ${CT_JSON}"
   # `<toplevel>` is the implicit top-level call we always stage on START
   # — confirm the call frame survived the round-trip.
   grep -qF '<toplevel>' <<< "${CT_JSON}" \

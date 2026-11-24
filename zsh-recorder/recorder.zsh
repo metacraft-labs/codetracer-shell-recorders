@@ -122,8 +122,39 @@ _ct_absolute_path() {
 # (and draws no warning under WARN_CREATE_GLOBAL).
 _ct_ap=""
 
+# The trace writer is a native executable. On Windows this recorder runs
+# under an MSYS2 or Cygwin zsh, whose paths (`/c/...`, `/tmp/...`) only
+# that runtime can resolve, and MSYS rewrites command-line arguments but not
+# the events stream. Every path sent to the writer is therefore converted
+# once to Windows mixed form: drive letter, forward slashes and long names
+# (`C:/Users/...`), which both the writer and the trace readers open.
+# Everywhere else the path is sent unchanged.
+# https://www.msys2.org/docs/filesystem-paths/
+# https://cygwin.com/cygwin-ug-net/cygpath.html
+_ct_use_cygpath=0
+case "$OSTYPE" in
+    msys* | cygwin*)
+        (( ${+commands[cygpath]} )) && _ct_use_cygpath=1
+        ;;
+esac
+
+# Sets _ct_np to the writer's form of the path in $1. Like _ct_inline_quote
+# it returns through a variable, so no subshell is spawned off Windows.
+_ct_native_path() {
+    _ct_np="$1"
+    if (( _ct_use_cygpath )); then
+        _ct_np="$(cygpath -m -l -- "$1")" || {
+            echo "ct-zsh-recorder: cygpath could not convert '$1'" >&2
+            _ct_np="$1"
+        }
+    fi
+}
+
+_ct_native_path "$_ct_target_script"
+_ct_target_script_native="$_ct_np"
+
 # Emit START event
-_ct_inline_quote "$_ct_target_script"
+_ct_inline_quote "$_ct_target_script_native"
 _ct_target_script_q=$_ct_qv
 _ct_inline_quote "$ZSH_VERSION"
 printf 'START program=%s shell=zsh shell_version=%s\n' "$_ct_target_script_q" "$_ct_qv" >&$_ct_events_fd
@@ -132,14 +163,15 @@ printf 'START program=%s shell=zsh shell_version=%s\n' "$_ct_target_script_q" "$
 printf 'PATH file=%s\n' "$_ct_target_script_q" >&$_ct_events_fd
 
 # The source files already registered, by the path funcsourcetrace
-# reports, each mapped to the quoted form of its absolute path for the
-# PATH, FUNC and STEP events (see `_ct_absolute_path`). Keyed by the
-# reported string because that is all a later step offers: a function
-# keeps the funcsourcetrace entry it was defined with, and a step in it
-# after another `cd` must map to the path fixed when the file was first
-# seen. The same key makes one limit inherent: two different files
-# reported by the same relative string from different directories cannot
-# be told apart, and both are recorded as the first one.
+# reports, each mapped to the quoted writer form (see `_ct_native_path`) of
+# its absolute path for the PATH, FUNC and STEP events (see
+# `_ct_absolute_path`). Keyed by the reported string because that is all a
+# later step offers: a function keeps the funcsourcetrace entry it was
+# defined with, and a step in it after another `cd` must map to the path
+# fixed when the file was first seen. The same key makes one limit
+# inherent: two different files reported by the same relative string from
+# different directories cannot be told apart, and both are recorded as the
+# first one.
 typeset -A _ct_registered_paths
 _ct_registered_paths[$_ct_target_script]=$_ct_target_script_q
 
@@ -1143,14 +1175,16 @@ _ct_debug_action='
 
             # Register new source files by their absolute path, resolved
             # now, while the working directory is the one a relative path
-            # is relative to (and keep the quoted path for the events
-            # below; see `_ct_absolute_path` and `_ct_inline_quote`; `-`
+            # is relative to (and keep the quoted writer form of it for the
+            # events below; see `_ct_absolute_path`, `_ct_native_path` and
+            # `_ct_inline_quote`; `-`
             # keeps an unknown, empty file from failing when the script
             # sets NO_UNSET). The recorder-file filter above compares the
             # raw string.
             if [[ -n "$_ct_file" ]] && (( ! ${+_ct_registered_paths[$_ct_file]} )); then
                 _ct_absolute_path "$_ct_file"
-                _ct_inline_quote "$_ct_ap"
+                _ct_native_path "$_ct_ap"
+                _ct_inline_quote "$_ct_np"
                 _ct_registered_paths[$_ct_file]=$_ct_qv
                 if (( ! ${+_ct_emitted_paths[$_ct_ap]} )); then
                     _ct_emitted_paths[$_ct_ap]=1
