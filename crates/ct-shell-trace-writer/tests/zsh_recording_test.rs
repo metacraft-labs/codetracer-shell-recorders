@@ -12,6 +12,9 @@ use std::process::Command;
 use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use tempfile::TempDir;
 
+mod common;
+use common::{files_copy_path, recorded_form};
+
 /// CTFS magic bytes: 0xC0 0xDE 0x72 0xAC 0xE2
 const CTFS_MAGIC: &[u8] = &[0xC0, 0xDE, 0x72, 0xAC, 0xE2];
 
@@ -360,14 +363,15 @@ fn e2e_zsh_metadata() {
         db_meta["language"]
     );
 
-    // Verify: program contains "simple.zsh"
+    // Verify: program is the script, in the form a native reader opens
     let program = db_meta["program"]
         .as_str()
         .expect("program field should be a string");
-    assert!(
-        program.contains("simple.zsh"),
-        "program should contain 'simple.zsh', got: {}",
-        program
+    let expected_program = recorded_form(&fixture_path("simple.zsh"));
+    assert_eq!(
+        program, expected_program,
+        "program should be {}, got: {}",
+        expected_program, program
     );
 
     // Verify: zsh_version is non-empty
@@ -443,7 +447,7 @@ fn e2e_zsh_source_files_copy() {
 
     // Verify the source file was copied — it should be under files/<absolute-path>
     let fixture = fixture_path("simple.zsh");
-    let copied = files_dir.join(fixture.strip_prefix("/").unwrap_or(&fixture));
+    let copied = files_copy_path(output_dir.path(), &fixture);
     assert!(
         copied.exists(),
         "Source file copy not found at expected path: {}",
@@ -598,6 +602,18 @@ fn test_zsh_sourced_file() {
         paths
     );
 
+    // Both files are named in the form a native reader opens, not only by
+    // a matching file name.
+    for fixture in ["with_source.zsh", "zsh_sourced_lib.zsh"] {
+        let expected = recorded_form(&fixture_path(fixture));
+        assert!(
+            paths.contains(&expected),
+            "paths should contain {}: {:?}",
+            expected,
+            paths
+        );
+    }
+
     // Verify .ct container exists
     let ct_path = find_ct_file(&output_dir);
     let ct_size = std::fs::metadata(&ct_path).unwrap().len();
@@ -625,11 +641,7 @@ fn test_zsh_sourced_file() {
     assert!(files_dir.exists(), "files/ directory not found");
 
     let with_source_fixture = fixture_path("with_source.zsh");
-    let copied_with_source = files_dir.join(
-        with_source_fixture
-            .strip_prefix("/")
-            .unwrap_or(&with_source_fixture),
-    );
+    let copied_with_source = files_copy_path(output_dir.path(), &with_source_fixture);
     assert!(
         copied_with_source.exists(),
         "with_source.zsh copy not found at: {}",
@@ -637,11 +649,7 @@ fn test_zsh_sourced_file() {
     );
 
     let sourced_lib_fixture = fixture_path("zsh_sourced_lib.zsh");
-    let copied_sourced_lib = files_dir.join(
-        sourced_lib_fixture
-            .strip_prefix("/")
-            .unwrap_or(&sourced_lib_fixture),
-    );
+    let copied_sourced_lib = files_copy_path(output_dir.path(), &sourced_lib_fixture);
     assert!(
         copied_sourced_lib.exists(),
         "zsh_sourced_lib.zsh copy not found at: {}",
@@ -752,11 +760,7 @@ fn e2e_zsh_complex_script() {
     assert!(files_dir.exists(), "files/ directory not found");
 
     let comprehensive_fixture = fixture_path("comprehensive.zsh");
-    let copied_comprehensive = files_dir.join(
-        comprehensive_fixture
-            .strip_prefix("/")
-            .unwrap_or(&comprehensive_fixture),
-    );
+    let copied_comprehensive = files_copy_path(output_dir.path(), &comprehensive_fixture);
     assert!(
         copied_comprehensive.exists(),
         "comprehensive.zsh copy not found at: {}",
@@ -764,11 +768,7 @@ fn e2e_zsh_complex_script() {
     );
 
     let sourced_lib_fixture = fixture_path("zsh_sourced_lib.zsh");
-    let copied_sourced_lib = files_dir.join(
-        sourced_lib_fixture
-            .strip_prefix("/")
-            .unwrap_or(&sourced_lib_fixture),
-    );
+    let copied_sourced_lib = files_copy_path(output_dir.path(), &sourced_lib_fixture);
     assert!(
         copied_sourced_lib.exists(),
         "zsh_sourced_lib.zsh copy not found at: {}",
