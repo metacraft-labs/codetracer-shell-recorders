@@ -257,8 +257,18 @@ fi
 # before the script of interest is large enough for streaming to matter.
 _ct_events_file=$(mktemp "${TMPDIR:-/tmp}/ct-events-XXXXXX")
 
+# A private directory for the recorder's variable snapshots (see
+# `_ct_capture_variables` in recorder.sh), owned here rather than by the
+# recorder: the recorder's shell is the recorded script's, so it ends
+# without running any cleanup of its own when the script `exec`s another
+# program, while this launcher runs the recorder as a child and always gets
+# here afterwards. It is handed over in `_CT_BASH_RECORDER_SCRATCH_DIR`,
+# set for the recorder's command only; the recorder unsets it before the
+# script runs, so the script and its children never see it.
+_ct_scratch_dir=$(mktemp -d "${TMPDIR:-/tmp}/ct-bash-recorder.XXXXXX")
+
 # Clean up on exit
-trap 'rm -f "$_ct_events_file"' EXIT
+trap 'rm -f "$_ct_events_file"; rm -rf "$_ct_scratch_dir"' EXIT
 
 # Run the recorder with FD 3 connected to the event file. The recorder moves
 # the stream to a free descriptor of 10 or above and closes FD 3 before it
@@ -276,7 +286,8 @@ trap 'rm -f "$_ct_events_file"' EXIT
 # would delete the event file. A command on the left of `||` is exempt
 # from `errexit`.
 _ct_exit_code=0
-bash "$_ct_script_dir/recorder.sh" "$_ct_script" ${_ct_script_args[@]+"${_ct_script_args[@]}"} 3>"$_ct_events_file" || _ct_exit_code=$?
+_CT_BASH_RECORDER_SCRATCH_DIR=$_ct_scratch_dir \
+    bash "$_ct_script_dir/recorder.sh" "$_ct_script" ${_ct_script_args[@]+"${_ct_script_args[@]}"} 3>"$_ct_events_file" || _ct_exit_code=$?
 
 # Feed the recorded event stream to the trace writer, passing the program
 # name and its positional argv for metadata + top-level call-arg staging.

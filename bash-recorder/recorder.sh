@@ -109,6 +109,54 @@ if ! eval "exec $_ct_events_fd>&3 3>&-" 2>/dev/null; then
     exit 1
 fi
 
+# A private directory for the variable snapshots the DEBUG trap takes (see
+# `_ct_capture_variables`).
+#
+# The launcher makes it, removes it when the recording is over, and names it
+# in `_CT_BASH_RECORDER_SCRATCH_DIR`: the recorder cannot clean up reliably
+# itself, since a script that `exec`s another program ends this shell
+# without running the EXIT trap. The variable is unset here, after the Bash 4
+# re-entry above has passed it on and before the variable baseline below,
+# so the script and its children never see it.
+#
+# Run without the launcher (as the tests that read the raw event stream
+# do), the recorder makes the directory itself and removes it when the
+# EXIT event is written (`_ct_remove_scratch_dir`); only an `exec` of the
+# script leaves that one behind. `rm` is resolved now, while `PATH` is
+# still the caller's: the script may change it.
+#
+# A directory that cannot be made or used stops the recorder before START,
+# as the failures above do: without it, every step would be recorded
+# without its variables.
+# See: https://www.gnu.org/software/coreutils/manual/html_node/mktemp-invocation.html
+_ct_scratch_dir="${_CT_BASH_RECORDER_SCRATCH_DIR:-}"
+unset _CT_BASH_RECORDER_SCRATCH_DIR
+_ct_owns_scratch_dir=0
+if [[ -z "$_ct_scratch_dir" ]]; then
+    if ! _ct_scratch_dir=$(mktemp -d "${TMPDIR:-/tmp}/ct-bash-recorder.XXXXXX"); then
+        _ct_scratch_dir=""
+    fi
+    _ct_owns_scratch_dir=1
+fi
+if [[ -z "$_ct_scratch_dir" || ! -d "$_ct_scratch_dir" || ! -w "$_ct_scratch_dir" ]]; then
+    echo "recorder.sh: no usable temporary directory (${_ct_scratch_dir:-mktemp -d in ${TMPDIR:-/tmp} failed}); the script was not run" >&2
+    exit 1
+fi
+# A relative `TMPDIR` gives a relative name, which would stop resolving
+# once the script changes directory.
+[[ "$_ct_scratch_dir" == /* ]] || _ct_scratch_dir="$PWD/$_ct_scratch_dir"
+_ct_rm=$(type -P rm) || _ct_rm="rm"
+
+# Remove the scratch directory when the recorder made it. Called once the
+# recording has ended, by the recorder's own shell only: a subshell still
+# running (a background job) finds the directory gone and records no more
+# variables, which `_ct_capture_variables` tolerates.
+_ct_remove_scratch_dir() {
+    (( _ct_owns_scratch_dir )) || return 0
+    "$_ct_rm" -rf -- "$_ct_scratch_dir" 2>/dev/null
+    return 0
+}
+
 # Quote a value for the wire protocol, without a subshell: sets `_ct_qv`.
 #
 # The writer ends an unquoted value at the first whitespace and reads a
@@ -120,7 +168,8 @@ fi
 # line protocol at all, quoted or not.
 #
 # It runs inside the DEBUG trap, so it sets a variable instead of printing
-# into a `$(...)` that would fork each time; and a path or a function name,
+# into a `$(...)` that would fork each time (and, before Bash 5.1, break the
+# status of a pipeline: see `_ct_capture_variables`); and a path or a function name,
 # which every STEP and CALL repeats, is quoted once, when it is registered,
 # and read back from `_ct_registered_paths` / `_ct_registered_funcs`. A
 # glob rather than `=~`, so that quoting never touches the script's
@@ -132,13 +181,6 @@ _ct_inline_quote() {
         _ct_qv="${_ct_qv//\"/\\\"}"
         _ct_qv="\"$_ct_qv\""
     fi
-}
-
-# Print the quoted form of a value (see `_ct_inline_quote`).
-_ct_quote_value() {
-    local _ct_qv
-    _ct_inline_quote "$1"
-    printf '%s' "$_ct_qv"
 }
 
 # Make a source file's path absolute, without a subshell: sets `_ct_ap`.
@@ -378,6 +420,114 @@ _ct_subshell_status=0
 # See: https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html
 _ct_recorder_pid=$BASHPID
 
+# The step the DEBUG trap recorded last at each FUNCNAME depth (as the
+# trap counts it): its file, line and command text, indexed by depth. A
+# subshell inherits a copy, which describes the frames it goes on running.
+# Read by the Bash 4.0 line numbering in `_ct_debug_trap`.
+_ct_depth_step_file=()
+_ct_depth_step_line=()
+_ct_depth_step_cmd=()
+
+# Set when the recorder's own shell is about to exit, so that the DEBUG
+# trap Bash runs before the first command of the EXIT action is not taken
+# for a script command: 1 after the step of the script's `exit` (the
+# command text is in `_ct_exit_pending_cmd`), 2 after the ERR trap of a
+# command that `errexit` stops the script at. The next DEBUG trap in this
+# shell clears it, and skips itself when it is that trap: for 1, one that
+# sees the same command text (a failed `exit`, `exit 1 2`, is followed by
+# the script's next command instead, or by the ERR action's DEBUG trap,
+# which repeats the step); for 2, one that runs with `errexit` still on.
+#
+# On Bash 5.0 and later that DEBUG trap sees the recorder's script-load
+# command as BASH_COMMAND and is skipped for it, and Bash 4.4 unwinds the
+# script's frames before the EXIT action; but Bash 4.0 runs it inside the
+# script's frame, at line 1 of the action, with BASH_COMMAND the `exit`
+# command or, after `errexit`, what a trap action ran last (see
+# `_ct_trap_action_keeps_command` and `_ct_leftover_command`).
+_ct_exit_pending=0
+_ct_exit_pending_cmd=""
+
+# BASH_COMMAND as the DEBUG trap last saw it for a command of the script:
+# for the DEBUG trap Bash runs before a trap action, the command that
+# triggered the trap (see `_ct_trap_action_keeps_command`).
+_ct_debug_command=""
+
+# The status every `return` of `_ct_return_trap` returns, and the text Bash
+# gives those commands: the BASH_COMMAND a trap action leaves behind on a
+# Bash before 5.1.
+#
+# There BASH_COMMAND follows the commands of a trap action after its first
+# (see `_ct_trap_action_keeps_command`), and keeps the last of them after
+# the action, until the next command of the script replaces it. The DEBUG
+# trap Bash runs before the first command of the next trap action sees that
+# leftover: an ERR action right after a function returned (`f` failing as
+# a whole), or the RETURN action of `outer` right after `inner` returned.
+# Every action of the recorder ends in `_ct_return_trap` or in
+# `_ct_script_action_end`: the RETURN action's handler or its last command,
+# or, in an ERR action, the RETURN trap that the return of the recorder
+# function the action called last runs (`functrace` is on). So the
+# leftover is the text of one of their `return` commands, all spelled the
+# same, and a DEBUG trap that sees it is one for the first command of a
+# trap action. It is then given the command that Bash 5.1 and later show
+# there: the script's command the DEBUG trap saw last
+# (`_ct_debug_command`). On Bash 5.1 and later BASH_COMMAND never takes
+# this text.
+_ct_trap_done=0
+# shellcheck disable=SC2016 # the unexpanded command text is the point
+_ct_leftover_command='return "$_ct_trap_done"'
+
+# The depth (as the DEBUG trap counts it) a function or sourced file last
+# returned into, set by `_ct_return_trap` and cleared when the next step is
+# recorded; -1 for none. A leftover seen at line 1 on Bash 4.0 is the ERR
+# action of the call that returned there, and the step last recorded at
+# that depth is the call's.
+_ct_returned_into=-1
+
+# Whether BASH_COMMAND stays the command that triggered a trap for every
+# command of the trap's action (1), or only until the first of them (0).
+#
+# The manual says the former, and the handlers (`_ct_err_trap`,
+# `_ct_begin_script_action`) and `_ct_in_script_action_command` read
+# BASH_COMMAND inside trap actions. But when a DEBUG trap is set, as the
+# recorder's always is, Bash before 5.1 changes BASH_COMMAND to each
+# command of the action after its first: the DEBUG trap that runs before
+# that first command ends by setting `running_trap` to 0 (trap.c,
+# `_run_trap_internal`), and `execute_simple_command` updates
+# BASH_COMMAND whenever `running_trap` is 0. Bash 5.1 restores the
+# previous `running_trap` instead (CWRU/changelog, 1/14/2020, trap.c:
+# "_run_trap_internal: save and restore the value of running_trap around
+# running the trap handler"). Measured with `trap : DEBUG; trap ':; echo
+# "$BASH_COMMAND"' ERR; false`: `false` on Bash 5.1, 5.2 and 5.3, the
+# `echo` command on 4.0, 4.4 and 5.0.
+#
+# So the behaviour is probed, here, in a command substitution that sets
+# both traps and runs a failing command. Where it does not hold, the
+# triggering command is the one the DEBUG trap saw last
+# (`_ct_debug_command`).
+#
+# The probe is a plain assignment, not the test of an `if` or a `[[ ]]`: a
+# command substitution there inherits the condition's exemption from the
+# ERR trap, so its `false` would run no ERR action and the probe would
+# report "does not hold" on every Bash.
+# shellcheck disable=SC2016 # expanded by the probe's ERR action
+_ct_probe=$(builtin trap ':' DEBUG; builtin trap ':; printf %s "$BASH_COMMAND"' ERR; false; :)
+if [[ "$_ct_probe" == false ]]; then
+    _ct_trap_action_keeps_command=1
+else
+    _ct_trap_action_keeps_command=0
+fi
+unset _ct_probe
+
+# Set `_ct_trapped_cmd` to the command that triggered the trap whose action
+# the caller runs in (see `_ct_trap_action_keeps_command`).
+_ct_trapped_command() {
+    if (( _ct_trap_action_keeps_command )); then
+        _ct_trapped_cmd=$BASH_COMMAND
+    else
+        _ct_trapped_cmd=$_ct_debug_command
+    fi
+}
+
 # Snapshot all variable names that exist BEFORE the target script runs.
 # Any variable not in this set was created by the user script and should be captured.
 declare -A _ct_baseline_vars
@@ -393,9 +543,38 @@ _ct_baseline_vars["BASH_REMATCH"]=1
 # Capture all user-visible variables and emit VAR events.
 # Called after each STEP event to record variable state.
 # Only captures variables NOT in the baseline snapshot (i.e., user-created variables).
+#
+# `declare -p` is written to a file of the scratch directory and read back,
+# rather than captured with `$(declare -p)`, because the DEBUG trap must not
+# fork. Bash runs the DEBUG trap of each command of a pipeline in the shell
+# that runs the pipeline, before it forks that command, and before Bash 5.1
+# a child process started there (a command substitution, a subshell) is
+# taken into the pipeline being built: for `false | true` the command
+# substitution of the DEBUG trap of `true` replaces `false` in the
+# pipeline's statuses. `PIPESTATUS` then lacks the failure, `pipefail`
+# gives the pipeline status 0, and a script under `set -eo pipefail` runs
+# on past the failure instead of stopping there. Measured with
+# `set -o pipefail; trap ': $(:)' DEBUG; false | true; echo $?`: 0 on Bash
+# 4.0, 4.4 and 5.0, 1 on 5.1 and later; without the command substitution in
+# the trap, 1 on all of them. The fix is in bash-5.1-alpha ("Fixed several
+# problems caused by running the DEBUG trap on simple commands executed as
+# part of a pipeline").
+# See: https://tiswww.case.edu/php/chet/bash/CHANGES (bash-5.1-alpha, gg)
+#
+# One file per shell (`$BASHPID`), so a subshell running beside its parent
+# (`f &`, a pipeline element) never reads the parent's snapshot. `>|`
+# writes it even under the script's `set -o noclobber`. When it cannot be
+# written or read (the directory is gone, the script's `umask` made the
+# file unreadable), this step's variables are not recorded, silently.
+#
+# The file is emptied (`: >|`, no fork) once it has been read, so that the
+# snapshot of every subshell the script started (each command substitution
+# leaves one, of the size of the whole `declare -p`) does not stay in the
+# directory until the recording ends.
 _ct_capture_variables() {
-    local _ct_decl_output
-    _ct_decl_output=$(declare -p 2>/dev/null) || return
+    local _ct_vars_file="$_ct_scratch_dir/vars.$BASHPID"
+    { declare -p >| "$_ct_vars_file"; } 2>/dev/null || return 0
+    [[ -r "$_ct_vars_file" ]] || return 0
 
     local _ct_decl_line
     while IFS= read -r _ct_decl_line; do
@@ -447,10 +626,11 @@ _ct_capture_variables() {
         fi
 
         # Emit VAR event with quoted value
-        local _ct_quoted_val
-        _ct_quoted_val=$(_ct_quote_value "$_ct_value")
-        printf 'VAR name=%s value=%s type=%s\n' "$_ct_varname" "$_ct_quoted_val" "$_ct_type_flag" >&"$_ct_events_fd"
-    done <<< "$_ct_decl_output"
+        _ct_inline_quote "$_ct_value"
+        printf 'VAR name=%s value=%s type=%s\n' "$_ct_varname" "$_ct_qv" "$_ct_type_flag" >&"$_ct_events_fd"
+    done < "$_ct_vars_file"
+    { : >| "$_ct_vars_file"; } 2>/dev/null
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -640,17 +820,34 @@ _ct_debug_trap() {
     # A subshell that is exiting runs no more script commands.
     (( _ct_subshell_exiting )) && return 0
 
-    # A command of one of the script's own ERR or RETURN actions: Bash runs
-    # the DEBUG trap before each of them, with BASH_COMMAND still the command
-    # that triggered the trap. They are not script commands to record (nor
-    # to hand to the script's DEBUG action: see `_ct_begin_script_action`).
-    _ct_in_script_action_command && return 0
-
     # BASH_SOURCE[0] is the recorder itself when in the trap function
-    # BASH_SOURCE[1] is the actual source file being executed
+    # BASH_SOURCE[1] is the actual source file being executed. It is unset
+    # when the trap runs outside every file, as before the EXIT action on
+    # Bash 4.4 (which unwinds the script's frames first), and the script's
+    # `set -u` must not turn that into an error.
     local _ct_file="${BASH_SOURCE[1]-}"
     local _ct_line="${BASH_LINENO[0]}"
     local _ct_depth=${#FUNCNAME[@]}
+
+    # The recorder's own commands, its handlers' included when they run as
+    # part of a trap action.
+    [[ "$_ct_file" == "$_ct_recorder_file" ]] && return 0
+    [[ "$_ct_file" == "" ]] && return 0
+
+    # A command of one of the script's own ERR or RETURN actions: Bash runs
+    # the DEBUG trap before each of them. They are not script commands to
+    # record (nor to hand to the script's DEBUG action: see
+    # `_ct_begin_script_action`).
+    _ct_in_script_action_command "$_ct_depth" && return 0
+
+    # The command this DEBUG trap runs for. A leftover of the recorder's
+    # last trap action means a trap action is starting, with no script
+    # command run since (see `_ct_leftover_command`).
+    local _ct_command="$BASH_COMMAND" _ct_action_start=0
+    if [[ "$_ct_command" == "$_ct_leftover_command" ]]; then
+        _ct_command=$_ct_debug_command
+        _ct_action_start=1
+    fi
 
     # A trap action is not a script command. Bash runs the DEBUG trap before
     # each command of the EXIT trap's action too, with BASH_SOURCE naming the
@@ -658,22 +855,84 @@ _ct_debug_trap() {
     # a STEP at a line the script never ran (and a RETURN, when `exit` in a
     # sourced file has already unwound that file's frame). While a trap
     # action runs, BASH_COMMAND is "the command executing at the time of the
-    # trap", which is the recorder's own script-load command below: it is
-    # never a command of the script itself.
+    # trap", which on Bash 5.0 and later is the recorder's own script-load
+    # command below: it is never a command of the script itself. Bash 4.0
+    # gives another command there (see `_ct_exit_pending`).
     # See: https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html#index-BASH_005fCOMMAND
-    [[ "$BASH_COMMAND" == "$_ct_load_command" ]] && return 0
+    [[ "$_ct_command" == "$_ct_load_command" ]] && return 0
 
-    # Skip events from the recorder itself or when inside the RETURN trap
-    [[ "$_ct_file" == "$_ct_recorder_file" ]] && return 0
-    [[ "$_ct_file" == "" ]] && return 0
+    # The command a trap action that runs next was triggered by, for the
+    # handlers (see `_ct_trap_action_keeps_command`). Taken before the
+    # filters below, which may skip the DEBUG trap that comes before an ERR
+    # action. Not the recorder's script-load command, which the filter
+    # above leaves for a trap action whose triggering command is unknown:
+    # one after a failing `( ... )` on Bash 4.0, which runs no DEBUG trap
+    # for it in this shell nor sets BASH_COMMAND to it.
+    _ct_debug_command=$_ct_command
+
     (( _ct_in_return_trap )) && return 0
+
+    # The DEBUG trap of the EXIT action after the script's `exit`, or after
+    # `errexit` stopped it, in the recorder's own shell (see
+    # `_ct_exit_pending`). One trap at most is skipped this way.
+    if (( _ct_exit_pending )); then
+        local _ct_pending=$_ct_exit_pending
+        _ct_exit_pending=0
+        if (( BASHPID == _ct_recorder_pid )); then
+            if (( _ct_pending == 1 )) && [[ "$_ct_command" == "$_ct_exit_pending_cmd" ]]; then
+                return 0
+            fi
+            if (( _ct_pending == 2 )) && [[ "$-" == *e* ]]; then
+                return 0
+            fi
+        fi
+    fi
+
+    # Bash 4.0 numbers the lines of an ERR (and EXIT) trap's action from 1:
+    # bash-4.0 "changed trap command execution to reset the line number
+    # before running a trap (except DEBUG and RETURN traps)", and
+    # bash-4.1-alpha exempted ERR again ("Fixed a bug that caused traps to
+    # set $LINENO to the wrong value when they execute"; trap.c,
+    # `_run_trap_internal`, SEVAL_RESETLINE). The DEBUG trap Bash runs
+    # before the first command of the ERR action then names line 1. From
+    # Bash 4.1 it names the line of the command that failed, and the
+    # recorder records it as a repeat of that command's step. On 4.0 it is
+    # given the line of the step last recorded at this depth, which is that
+    # command's (a failing function call's step is recorded before its
+    # CALL), so that the stream is the same on every Bash and the trace does
+    # not go back to a line 1 the script never ran there.
+    #
+    # The DEBUG trap is known to start a trap action when it saw a leftover
+    # (`_ct_action_start`). Otherwise it is recognised as the same command,
+    # in the same file, as the step last recorded at this depth, at line 1
+    # when that step was not. A script command matches that only if it is
+    # at line 1 and repeats the last command its frame ran on another line:
+    # the condition of a loop that starts on line 1 and whose body ends with
+    # the same command.
+    # See: https://tiswww.case.edu/php/chet/bash/CHANGES (bash-4.0-release b,
+    #      bash-4.1-alpha p)
+    if (( _ct_line == 1 )) && [[ -n "${_ct_depth_step_line[_ct_depth]+x}" ]] &&
+       (( _ct_depth_step_line[_ct_depth] != 1 )) &&
+       [[ "$_ct_file" == "${_ct_depth_step_file[_ct_depth]}" ]]; then
+        if (( _ct_action_start )); then
+            # Only when a call returned into this depth just before is the
+            # step last recorded here the command that failed. Otherwise it
+            # is not known (on Bash 4.0 a failing `( ... )` gets no DEBUG
+            # trap in this shell and leaves BASH_COMMAND as it was), and the
+            # trap is not recorded.
+            (( _ct_returned_into == _ct_depth )) || return 0
+            _ct_line=${_ct_depth_step_line[_ct_depth]}
+        elif [[ "$_ct_command" == "${_ct_depth_step_cmd[_ct_depth]}" ]]; then
+            _ct_line=${_ct_depth_step_line[_ct_depth]}
+        fi
+    fi
 
     # Register new source files by their absolute path, resolved against
     # the working directory the file was opened in (see
     # `_ct_resolve_source_file`), and keep the quoted path for the events
     # below (see `_ct_inline_quote`). The filters above compare the raw
     # string.
-    _ct_note_source_dir "$BASH_COMMAND"
+    _ct_note_source_dir "$_ct_command"
     local _ct_qv _ct_ap
     if [[ -z "${_ct_registered_paths[$_ct_file]+x}" ]]; then
         _ct_resolve_source_file "$_ct_file" "${FUNCNAME[1]}"
@@ -712,9 +971,9 @@ _ct_debug_trap() {
     fi
 
     if (( ! _ct_deferred )); then
-        _ct_note_command "$_ct_depth" "$BASH_COMMAND"
+        _ct_note_command "$_ct_depth" "$_ct_command"
         # `exit` in a subshell ends it inside whatever functions it is in.
-        if (( BASHPID != _ct_recorder_pid )) && [[ "$BASH_COMMAND" =~ $_ct_exit_re ]]; then
+        if (( BASHPID != _ct_recorder_pid )) && [[ "$_ct_command" =~ $_ct_exit_re ]]; then
             _ct_begin_subshell_exit
         fi
     fi
@@ -803,9 +1062,8 @@ _ct_debug_trap() {
                 for (( _ct_arg_idx = 1; _ct_arg_idx <= _ct_argc; _ct_arg_idx++ )); do
                     local _ct_arg_slot=$(( _ct_argv_base + _ct_argc - _ct_arg_idx ))
                     local _ct_arg_val="${BASH_ARGV[$_ct_arg_slot]:-}"
-                    local _ct_arg_quoted
-                    _ct_arg_quoted=$(_ct_quote_value "$_ct_arg_val")
-                    printf 'ARG name=$%d value=%s type=s\n' "$_ct_arg_idx" "$_ct_arg_quoted" >&"$_ct_events_fd"
+                    _ct_inline_quote "$_ct_arg_val"
+                    printf 'ARG name=$%d value=%s type=s\n' "$_ct_arg_idx" "$_ct_qv" >&"$_ct_events_fd"
                 done
             fi
 
@@ -821,17 +1079,29 @@ _ct_debug_trap() {
 
     _ct_prev_depth=$_ct_depth
 
-    # Detect output commands from BASH_COMMAND
-    local _ct_cmd="$BASH_COMMAND"
+    # Detect output commands from the command text
+    local _ct_cmd="$_ct_command"
     if [[ "$_ct_cmd" == echo\ * ]] || [[ "$_ct_cmd" == printf\ * ]] || [[ "$_ct_cmd" == print\ * ]]; then
         # Extract the content (approximate — just use the full command)
-        local _ct_write_content
-        _ct_write_content=$(_ct_quote_value "$_ct_cmd")
-        printf 'WRITE content=%s\n' "$_ct_write_content" >&"$_ct_events_fd"
+        _ct_inline_quote "$_ct_cmd"
+        printf 'WRITE content=%s\n' "$_ct_qv" >&"$_ct_events_fd"
     fi
 
     # Emit step event
     printf 'STEP file=%s line=%d\n' "$_ct_file_q" "$_ct_line" >&"$_ct_events_fd"
+    _ct_depth_step_file[_ct_depth]=$_ct_file
+    _ct_depth_step_line[_ct_depth]=$_ct_line
+    _ct_depth_step_cmd[_ct_depth]=$_ct_command
+    _ct_returned_into=-1
+
+    # The script's `exit`, in the recorder's own shell: the next DEBUG trap
+    # here is the one before the EXIT action (see `_ct_exit_pending`). Not
+    # for a function the script named `exit`, which a plain `exit` calls.
+    if (( BASHPID == _ct_recorder_pid )) && [[ "$_ct_command" =~ $_ct_exit_re ]] &&
+       { [[ -n "${BASH_REMATCH[1]}" ]] || ! declare -F exit >/dev/null; }; then
+        _ct_exit_pending=1
+        _ct_exit_pending_cmd=$_ct_command
+    fi
 
     # Capture variables at this step
     _ct_capture_variables
@@ -855,7 +1125,9 @@ _ct_debug_trap() {
 # BASH_SOURCE[1] is the file where the failing command was executed.
 _ct_err_trap() {
     local _ct_status=$?
-    local _ct_cmd="$BASH_COMMAND"
+    local _ct_trapped_cmd
+    _ct_trapped_command
+    local _ct_cmd="$_ct_trapped_cmd"
     local _ct_file="${BASH_SOURCE[1]-}"
     _ct_run_script_ERR=0
 
@@ -892,16 +1164,21 @@ _ct_err_trap() {
         _ct_cmd_hits=$(( _ct_cmd_hits - 1 ))
     fi
 
-    local _ct_quoted_cmd
-    _ct_quoted_cmd=$(_ct_quote_value "$_ct_cmd")
-    printf 'ERROR cmd=%s status=%d\n' "$_ct_quoted_cmd" "$_ct_status" >&"$_ct_events_fd"
+    local _ct_qv
+    _ct_inline_quote "$_ct_cmd"
+    printf 'ERROR cmd=%s status=%d\n' "$_ct_qv" "$_ct_status" >&"$_ct_events_fd"
 
     # With `errexit` on, the shell exits right after this trap: bash runs the
     # ERR trap under exactly the conditions under which `set -e` exits. In a
     # subshell that ends it inside whatever functions it is in.
     # See: https://www.gnu.org/software/bash/manual/html_node/The-Set-Builtin.html
-    if (( BASHPID != _ct_recorder_pid )) && [[ "$-" == *e* ]]; then
-        _ct_begin_subshell_exit
+    if [[ "$-" == *e* ]]; then
+        if (( BASHPID != _ct_recorder_pid )); then
+            _ct_begin_subshell_exit
+        else
+            # In the recorder's own shell the EXIT action comes next.
+            _ct_exit_pending=2
+        fi
     fi
 
     if (( _ct_has_script_action )); then
@@ -947,8 +1224,8 @@ _ct_return_trap() {
     _ct_run_script_RETURN=0
     # A recorder function returned (the recorder's own script-load `source`
     # also ends here, with the recorder as the file).
-    [[ "${BASH_SOURCE[1]}" == "$_ct_recorder_file" ]] && return 0
-    (( _ct_exit_emitted )) && return 0
+    [[ "${BASH_SOURCE[1]-}" == "$_ct_recorder_file" ]] && return "$_ct_trap_done"
+    (( _ct_exit_emitted )) && return "$_ct_trap_done"
 
     # A `return` run by the script's ERR action (`trap '...; return 1' ERR`)
     # ends the action together with the function the error happened in; this
@@ -971,9 +1248,9 @@ _ct_return_trap() {
     # function returning in a subshell that is exiting: not recorded.
     if (( _ct_in_script_action || _ct_in_script_debug || _ct_subshell_exiting )); then
         _ct_run_script_RETURN=$_ct_has_script_action
-        return 0
+        return "$_ct_trap_done"
     fi
-    (( _ct_in_return_trap )) && return 0
+    (( _ct_in_return_trap )) && return "$_ct_trap_done"
     _ct_in_return_trap=1
 
     local _ct_depth=${#FUNCNAME[@]}
@@ -989,14 +1266,17 @@ _ct_return_trap() {
         _ct_frame_status "$_ct_top_depth" s "$_ct_status" ${1+"$@"}
         _ct_pop_frame "$_ct_frame_status_result"
         _ct_prev_depth=$_ct_depth
+        _ct_returned_into=$_ct_depth
     elif (( _ct_cmd_depth == _ct_depth && _ct_cmd_hits >= 2 )) &&
          [[ "$_ct_cmd_text" =~ $_ct_source_re ]]; then
         _ct_prev_depth=$_ct_depth
+        _ct_returned_into=$_ct_depth
     elif [[ "$_ct_top_kind" == f && "$_ct_top_name" == "${FUNCNAME[1]}" ]] &&
          (( _ct_top_depth == _ct_depth )); then
         _ct_frame_status "$_ct_depth" f "$_ct_status" ${1+"$@"}
         _ct_pop_frame "$_ct_frame_status_result"
         _ct_prev_depth=$(( _ct_depth - 1 ))
+        _ct_returned_into=$_ct_prev_depth
     fi
 
     # The remembered command belonged to the frame that just ended.
@@ -1010,7 +1290,7 @@ _ct_return_trap() {
         _ct_run_script_RETURN=1
         _ct_begin_script_action RETURN
     fi
-    return 0
+    return "$_ct_trap_done"
 }
 
 # Set once recording has stopped, and once the EXIT event has been
@@ -1071,6 +1351,7 @@ _ct_emit_exit() {
     _ct_exit_emitted=1
     _ct_stop_recording
     printf 'EXIT code=%d\n' "$1" >&"$_ct_events_fd"
+    _ct_remove_scratch_dir
 }
 
 # Make $1 the status Bash saved on entering the trap that runs now, as it
@@ -1330,9 +1611,10 @@ _ct_exit_trap_pid=0
 # trap before each of its commands and the ERR and RETURN traps inside it,
 # and none of those is a script command to record. `_ct_script_action_owner`
 # is the condition whose action set it, `_ct_script_action_depth` the
-# FUNCNAME depth its handler ran at, `_ct_script_action_cmd` BASH_COMMAND
-# then (the command that triggered the trap, which Bash keeps for the whole
-# action) and `_ct_script_action_pid` the shell it runs in.
+# FUNCNAME depth its handler ran at, `_ct_script_action_cmd` the command
+# that triggered the trap (`_ct_trapped_command`; from Bash 5.1 Bash keeps it
+# as BASH_COMMAND for the whole action) and `_ct_script_action_pid` the
+# shell it runs in.
 _ct_in_script_action=0
 _ct_script_action_owner=""
 _ct_script_action_depth=-1
@@ -1352,7 +1634,9 @@ _ct_begin_script_action() {
     _ct_script_action_owner="$1"
     # The caller's depth: this function's own frame is not counted.
     _ct_script_action_depth=$(( ${#FUNCNAME[@]} - 1 ))
-    _ct_script_action_cmd="$BASH_COMMAND"
+    local _ct_trapped_cmd
+    _ct_trapped_command
+    _ct_script_action_cmd="$_ct_trapped_cmd"
     _ct_script_action_pid=$BASHPID
 }
 
@@ -1368,29 +1652,50 @@ _ct_end_script_action() {
 # by `return` (see `_ct_return_trap`), `break`, `continue` or `exit`; see
 # `_ct_in_script_action_command` for the rest. Returns 0, so that a DEBUG
 # action that falls off its end never skips a command.
+#
+# Its `return` is spelled as `_ct_return_trap`'s: inside a RETURN action no
+# RETURN trap runs for it, so it is the last command of that action (see
+# `_ct_leftover_command`).
 _ct_script_action_end() {
     if [[ "$1" == DEBUG ]]; then
         _ct_in_script_debug=0
     elif [[ "$_ct_script_action_owner" == "$1" ]]; then
         _ct_end_script_action
     fi
-    return 0
+    return "$_ct_trap_done"
 }
 
-# Whether the DEBUG trap that calls this runs for a command of the script's
-# ERR or RETURN action (status 0) rather than for a script command (1).
+# Whether the DEBUG trap that calls this, at FUNCNAME depth $1, runs for a
+# command of the script's ERR or RETURN action (status 0) rather than for a
+# script command (1).
 #
-# Inside an action BASH_COMMAND stays the command that triggered it. A
-# different BASH_COMMAND in the action's own shell therefore means the
-# action ended without reaching `_ct_script_action_end` (a `break` or
-# `continue` in it): the flag is stale, and the command is the script's. A
-# subshell the action started keeps the flag, and its commands are the
+# The action's own commands run at the depth its handler ran at, and the
+# functions it calls deeper. A command shallower than that runs after the
+# frame the action ran in has returned, so the action is over: a RETURN
+# action that ended without reaching `_ct_script_action_end`.
+#
+# Where BASH_COMMAND stays the command that triggered the action for the
+# whole action (`_ct_trap_action_keeps_command`), a different BASH_COMMAND
+# in the action's own shell also means the action ended without reaching
+# `_ct_script_action_end` (a `break` or `continue` in it): the flag is
+# stale, and the command is the script's. On a Bash where BASH_COMMAND
+# follows the action's commands, a different one is expected inside the
+# action and says nothing; there an ERR action left by `break` or
+# `continue` is taken to last until its frame returns, and the script's
+# commands until then are not recorded.
+#
+# A subshell the action started keeps the flag, and its commands are the
 # action's.
 # See: https://www.gnu.org/software/bash/manual/html_node/Bash-Variables.html#index-BASH_005fCOMMAND
 _ct_in_script_action_command() {
     (( _ct_in_script_action )) || return 1
-    if (( BASHPID == _ct_script_action_pid )) &&
-       [[ "$BASH_COMMAND" != "$_ct_script_action_cmd" ]]; then
+    (( BASHPID == _ct_script_action_pid )) || return 0
+    if (( $1 < _ct_script_action_depth )); then
+        _ct_end_script_action
+        return 1
+    fi
+    [[ "$BASH_COMMAND" == "$_ct_script_action_cmd" ]] && return 0
+    if (( _ct_trap_action_keeps_command )); then
         _ct_end_script_action
         return 1
     fi
@@ -1713,7 +2018,9 @@ _ct_report_replaced_traps() {
     [[ -n "$_ct_replaced" ]] || return 0
     local _ct_message="the script replaced the recorder's ${_ct_replaced} trap without going through \`trap\` (\`builtin trap\`, \`command trap\` or POSIX mode); events recorded through it are missing after that point"
     printf 'codetracer-bash-recorder: warning: %s\n' "$_ct_message" >&2
-    printf 'ERROR cmd=%s status=0\n' "$(_ct_quote_value "$_ct_message")" >&"$_ct_events_fd"
+    local _ct_qv
+    _ct_inline_quote "$_ct_message"
+    printf 'ERROR cmd=%s status=0\n' "$_ct_qv" >&"$_ct_events_fd"
 }
 
 # The script's `$0` (see "Give the script its own `$0`" at the top). Set

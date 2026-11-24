@@ -10,6 +10,7 @@ build:
 # first from the sibling checkout they read it from.
 test: build-ct-print
     cargo test
+    just test-bash-4-0
     just verify-cli-convention
     just test-bash-cli
     just test-zsh-cli
@@ -28,6 +29,12 @@ build-ct-print:
 # See tests/verify-cli-convention-no-silent-skip.sh for the assertion list.
 verify-cli-convention:
     bash tests/verify-cli-convention-no-silent-skip.sh
+
+# The Bash recorder's cargo suite again, under Bash 4.0 (the spec's floor),
+# named by CT_TEST_BASH_4_0 from the Linux dev shell. Fails on Linux when
+# that variable is unset, rather than skipping; see the script's header.
+test-bash-4-0 *ARGS:
+    bash tests/test_bash_suite_under_bash_4_0.sh {{ ARGS }}
 
 # End-to-end Bash launcher CLI tests (env vars, format rejection,
 # ct-print round-trip). Needs `just build-ct-print` first.
