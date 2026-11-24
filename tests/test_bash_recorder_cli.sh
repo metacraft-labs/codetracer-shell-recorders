@@ -729,7 +729,10 @@ done
 #     The check must test for a regular file, not merely for the name.
 #   * The recorder cannot move the event channel to a descriptor of 10 or
 #     above (an open-files limit of 12), so no START event reaches the writer
-#     and, again, `finish` writes nothing.
+#     and, again, `finish` writes nothing. Here the recorder must also stop
+#     before the script runs, and say which descriptor it could not open.
+#   * The recorder cannot write START (FD 3 on /dev/full): it must likewise
+#     stop before the script runs.
 # ---------------------------------------------------------------------------
 
 FAIL3_FIXTURE="${WORK_DIR}/args3.sh"
@@ -777,8 +780,53 @@ RUN_STDERR="$(cat "${WORK_DIR}/run.err")"
 # Positive control: the writer really received no START event.
 grep -qF "EOF reached without EXIT event" <<< "${RUN_STDERR}" \
   || fail "T11 control: under 'ulimit -n 12' the writer should see an empty stream; stderr: ${RUN_STDERR}"
-expect_no_trace_failure "T11 no START event (ulimit -n 12)" \
-  "${OUT_DIR_T11C}/args.ct" "args: one"
+# The recorder cannot move the event channel here (issue
+# `2026-11-16-bash-recorder-ignores-a-failed-move-of-its-event-channel`).
+# Bash does not exit when a redirection on `exec` fails, so the recorder
+# must check the move itself: the script must not run unrecorded, and
+# stderr must name the descriptor that could not be opened rather than
+# leave the missing-trace message as the only explanation. The launcher
+# must not then report the recorder's status as the script's.
+[[ "${RUN_RC}" == "1" ]] \
+  || fail "T11 failed FD move: launcher must exit 1, got ${RUN_RC}; stderr: ${RUN_STDERR}"
+[[ -z "${RUN_STDOUT}" ]] \
+  || fail "T11 failed FD move: the script must not run unrecorded; stdout: ${RUN_STDOUT}"
+grep -qE "recorder\.sh: cannot move the event stream from FD 3 to FD [0-9]+ \(open-files limit: 12\)" <<< "${RUN_STDERR}" \
+  || fail "T11 failed FD move: stderr must name the descriptor it could not open; stderr: ${RUN_STDERR}"
+grep -qF "recording failed" <<< "${RUN_STDERR}" \
+  || fail "T11 failed FD move: stderr must say the recording failed; stderr: ${RUN_STDERR}"
+grep -qF "${OUT_DIR_T11C}/args.ct" <<< "${RUN_STDERR}" \
+  || fail "T11 failed FD move: stderr must name the missing trace; stderr: ${RUN_STDERR}"
+grep -qF "before the script ran" <<< "${RUN_STDERR}" \
+  || fail "T11 failed FD move: stderr must say the script never ran; stderr: ${RUN_STDERR}"
+! grep -qF "the script exited with status" <<< "${RUN_STDERR}" \
+  || fail "T11 failed FD move: the recorder's status must not be reported as the script's; stderr: ${RUN_STDERR}"
+pass "T11 failed FD move (ulimit -n 12): script not run, stderr names the descriptor"
+
+# The launcher reads an empty event file as "the recorder stopped before the
+# script ran", so the recorder must not run the script when its START write
+# fails either (an event file on a full filesystem). The launcher always
+# hands it a fresh file from `mktemp`, so the recorder is run directly here,
+# with FD 3 on /dev/full, where every write fails with ENOSPC.
+# /dev/full is Linux-only; elsewhere this case is skipped by name.
+if [[ -c /dev/full ]]; then
+  RUN_RC=0
+  bash "${REPO_ROOT}/bash-recorder/recorder.sh" "${ARGS_FIXTURE}" one \
+    3>/dev/full >"${WORK_DIR}/run.out" 2>"${WORK_DIR}/run.err" || RUN_RC=$?
+  RUN_STDOUT="$(cat "${WORK_DIR}/run.out")"
+  RUN_STDERR="$(cat "${WORK_DIR}/run.err")"
+  [[ "${RUN_RC}" == "1" ]] \
+    || fail "T11 failed START write: recorder must exit 1, got ${RUN_RC}; stderr: ${RUN_STDERR}"
+  [[ -z "${RUN_STDOUT}" ]] \
+    || fail "T11 failed START write: the script must not run unrecorded; stdout: ${RUN_STDOUT}"
+  grep -qE "recorder\.sh: cannot write the START event to FD [0-9]+; the script was not run" <<< "${RUN_STDERR}" \
+    || fail "T11 failed START write: stderr must say the START write failed; stderr: ${RUN_STDERR}"
+  pass "T11 failed START write (FD 3 on /dev/full): script not run"
+elif [[ "$(uname -s)" == Linux ]]; then
+  fail "T11 failed START write: /dev/full is missing on Linux"
+else
+  echo "skipped: T11 failed START write — no /dev/full on $(uname -s)"
+fi
 
 # ---------------------------------------------------------------------------
 # T12. The recorded script sees its own path as `$0`, on the installed Bash

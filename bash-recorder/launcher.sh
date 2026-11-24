@@ -321,9 +321,19 @@ _ct_trace_base="${_ct_script##*/}"
 _ct_trace_stem="${_ct_trace_base%.*}"
 [[ -n "$_ct_trace_stem" ]] || _ct_trace_stem="$_ct_trace_base"
 _ct_trace_file="$_ct_output_dir/$_ct_trace_stem.ct"
+#
+# An empty event file means the recorder stopped during its own setup (FD 3
+# not open, no free descriptor, the move off FD 3 refused, the START write
+# failed), before it sourced the script, which it does only after a START
+# it has checked was written.
+# The status is then the recorder's, not the script's, and the recorder has
+# already said why on stderr; reporting it as the script's would point the
+# reader at a script that never ran.
 if [[ ! -f "$_ct_trace_file" ]]; then
     _ct_message="Error: recording failed: the trace writer finished without writing $_ct_trace_file"
-    if (( _ct_exit_code != 0 )); then
+    if [[ ! -s "$_ct_events_file" ]]; then
+        _ct_message+=" (the recorder stopped with status $_ct_exit_code before the script ran)"
+    elif (( _ct_exit_code != 0 )); then
         _ct_message+=" (the script exited with status $_ct_exit_code)"
     fi
     echo "$_ct_message" >&2

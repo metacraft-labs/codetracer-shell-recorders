@@ -92,7 +92,22 @@ while { : >&"$_ct_events_fd"; } 2>/dev/null; do
         exit 1
     fi
 done
-eval "exec $_ct_events_fd>&3 3>&-"
+# The move itself can still fail, and must be checked: a non-interactive Bash
+# outside POSIX mode does not exit when a redirection on `exec` fails, it
+# returns non-zero and carries on, so the script would run with no event
+# channel at all and the writer would get an empty stream. The probe above
+# cannot rule this out, because it reads a descriptor at or above the
+# open-files limit as free (`: >&N` fails there too), and `dup2` then refuses
+# it. Under `ulimit -n 12`, with 10 and 11 taken, that is FD 12. Spec
+# `CLI/recorders/shell.md`, "Rules": the recording fails rather than letting
+# the script run unrecorded. Bash's own diagnostic ("3: Bad file
+# descriptor") names the source, not the descriptor it could not open, so
+# it is replaced by one that does.
+# See: https://www.gnu.org/software/bash/manual/html_node/Bourne-Shell-Builtins.html (exec)
+if ! eval "exec $_ct_events_fd>&3 3>&-" 2>/dev/null; then
+    echo "recorder.sh: cannot move the event stream from FD 3 to FD $_ct_events_fd (open-files limit: $(ulimit -n)); the script was not run" >&2
+    exit 1
+fi
 
 # Quote a value for the wire protocol, without a subshell: sets `_ct_qv`.
 #
@@ -246,10 +261,19 @@ _ct_resolve_source_file() {
 }
 
 # Emit START event
+#
+# The write is checked for the same reason as the move above: a failed
+# `printf` (the event file's filesystem is full, say) does not stop Bash,
+# and the script would run with no START, so unrecorded. Stopping here also
+# keeps the launcher's reading of an empty event file true: the recorder
+# stopped before the script ran (launcher.sh, after the trace writer).
 _ct_inline_quote "$_ct_target_script"
 _ct_target_script_q=$_ct_qv
 _ct_inline_quote "$BASH_VERSION"
-printf 'START program=%s shell=bash shell_version=%s\n' "$_ct_target_script_q" "$_ct_qv" >&"$_ct_events_fd"
+if ! printf 'START program=%s shell=bash shell_version=%s\n' "$_ct_target_script_q" "$_ct_qv" >&"$_ct_events_fd"; then
+    echo "recorder.sh: cannot write the START event to FD $_ct_events_fd; the script was not run" >&2
+    exit 1
+fi
 
 # Register the main script path
 printf 'PATH file=%s\n' "$_ct_target_script_q" >&"$_ct_events_fd"
