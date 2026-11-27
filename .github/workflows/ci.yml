@@ -77,6 +77,13 @@ jobs:
       - name: Lint
         run: dev-exec just lint
 
+      # `test-dev-shell` enters this flake's dev shell itself (from a scratch
+      # git repository, then from this one), so it is not part of `just test`,
+      # which already runs inside the shell, and it must not be wrapped in
+      # `dev-exec`. Running it here reuses the closure the steps above built.
+      - name: Run dev-shell isolation test
+        run: nix develop . -c just test-dev-shell
+
   nix-build:
     name: Verify nix flake packages build (${{ join(matrix.runner, '-') }})
     strategy:

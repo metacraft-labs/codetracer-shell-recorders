@@ -188,6 +188,10 @@
                 # `ct print --json` output with jq.
                 jq
 
+                # tests/verify-ci-reaches-every-test-recipe.sh reads the
+                # workflows' `run:` steps with mikefarah's yq.
+                yq-go
+
                 # Build automation and dev tools
                 just
                 prek

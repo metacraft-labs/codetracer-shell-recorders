@@ -24,6 +24,22 @@ just cross-test
 
 This requires the sibling `codetracer` repo to be checked out alongside this one.
 
+To check that entering the dev shell from another git repository writes
+nothing there (no files, no git hooks, no `core.hooksPath`), execute, outside
+the dev shell:
+
+```
+nix develop -c just test-dev-shell
+```
+
+It enters the dev shell itself, so `just test` does not run it; CI runs it as
+its own step of the `test` job in `.github/workflows/ci.yml`.
+
+Every `test*`, `verify*`, `e2e*` and `check*` recipe must be run by a workflow
+(directly, or through the `just` calls and dependencies of a recipe a workflow
+runs), or carry a `# ci-test-audit: <reason>` line directly above it.
+`just verify-ci-reaches-every-test-recipe`, part of `just test`, enforces it.
+
 # Codebase structure
 
 * `crates/ct-shell-trace-writer/` — Rust binary that reads wire protocol events

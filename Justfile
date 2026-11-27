@@ -14,6 +14,7 @@ test: build-ct-print
     just verify-cli-convention
     just test-bash-cli
     just test-zsh-cli
+    just verify-ci-reaches-every-test-recipe
 
 # Build `ct-print` in the sibling codetracer-trace-format-nim checkout. The
 # CLI guards (`test-bash-cli`, `test-zsh-cli`) decode every recording with
@@ -35,6 +36,11 @@ verify-cli-convention:
 # that variable is unset, rather than skipping; see the script's header.
 test-bash-4-0 *ARGS:
     bash tests/test_bash_suite_under_bash_4_0.sh {{ ARGS }}
+
+# Every test recipe is run by a workflow or carries a `# ci-test-audit:`
+# reason directly above it. See the script's header for the rule.
+verify-ci-reaches-every-test-recipe:
+    bash tests/verify-ci-reaches-every-test-recipe.sh
 
 # End-to-end Bash launcher CLI tests (env vars, format rejection,
 # ct-print round-trip). Needs `just build-ct-print` first.
@@ -89,6 +95,7 @@ bump-version version:
     @echo "ct-shell-trace-writer → {{version}} (Cargo.toml + VERSION)"
 
 # Entering the dev shell from another git repository must write nothing there.
-# Runs `nix develop`, so it is not part of the in-shell test recipes.
+# Runs `nix develop`, so it is not part of the in-shell test recipes; CI runs
+# it as its own step of the `test` job.
 test-dev-shell:
     bash tests/test_dev_shell_writes_nothing_elsewhere.sh
