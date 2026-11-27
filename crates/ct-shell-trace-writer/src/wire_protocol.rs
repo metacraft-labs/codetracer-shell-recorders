@@ -3,8 +3,14 @@
 // The wire protocol is a line-oriented text format where each line represents
 // one event. Format: `TYPE key=value key=value ...`
 //
-// Values containing spaces must be quoted with double quotes.
-// Backslash escapes \" and \\ are supported inside quoted values.
+// An unquoted value ends at the first whitespace. A value containing
+// whitespace, a double quote or a backslash must be written double-quoted,
+// with `"` escaped as \" and `\` as \\ inside the quotes. This holds for
+// every value, including the paths (`START program=`, `PATH file=`,
+// `FUNC file=`, `STEP file=`) and function names (`FUNC name=`,
+// `CALL name=`) the recorders emit: a path or a name may contain any of
+// these characters. A newline cannot be carried, quoted or not: the
+// protocol is one event per line.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -346,6 +352,65 @@ mod tests {
                 line: 42,
             }
         );
+    }
+
+    /// Paths and function names are quoted like any other value
+    /// (codetracer-pm issue
+    /// `2026-11-15-shell-recorders-cannot-record-a-script-whose-path-contains-a-space`):
+    /// a space, a tab, a `"` and a `\` reach the event whole.
+    #[test]
+    fn test_parse_quoted_paths_and_names() {
+        let path = "/tmp/my scripts/we\"ird\\dir/tab\there.sh";
+        let quoted = "\"/tmp/my scripts/we\\\"ird\\\\dir/tab\there.sh\"";
+
+        assert_eq!(
+            parse_line(&format!(
+                "START program={quoted} shell=bash shell_version=5.2.0"
+            ))
+            .unwrap(),
+            WireEvent::Start {
+                program: path.to_string(),
+                shell: "bash".to_string(),
+                shell_version: Some("5.2.0".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_line(&format!("PATH file={quoted}")).unwrap(),
+            WireEvent::Path {
+                file: path.to_string()
+            }
+        );
+        assert_eq!(
+            parse_line(&format!("STEP file={quoted} line=3")).unwrap(),
+            WireEvent::Step {
+                file: path.to_string(),
+                line: 3,
+            }
+        );
+        assert_eq!(
+            parse_line(&format!(
+                r#"FUNC name="my \"odd\\ func" file={quoted} line=2"#
+            ))
+            .unwrap(),
+            WireEvent::Func {
+                name: r#"my "odd\ func"#.to_string(),
+                file: path.to_string(),
+                line: 2,
+            }
+        );
+        assert_eq!(
+            parse_line(r#"CALL name="my \"odd\\ func""#).unwrap(),
+            WireEvent::Call {
+                name: r#"my "odd\ func"#.to_string(),
+            }
+        );
+
+        // The failure the quoting prevents: unquoted, the path ends at the
+        // space and the rest of it is a malformed pair.
+        assert!(matches!(
+            parse_line("STEP file=/tmp/my scripts/deploy.sh line=3").unwrap_err(),
+            ParseError::MalformedKeyValue(_)
+        ));
     }
 
     #[test]

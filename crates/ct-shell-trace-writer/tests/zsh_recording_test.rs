@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use codetracer_trace_types::ValueRecord;
 use codetracer_trace_writer_nim::NimTraceReaderHandle;
 use tempfile::TempDir;
 
@@ -269,6 +270,208 @@ fn test_zsh_variable_capture() {
     );
 }
 
+/// Environment for the exported-variable tests: an inherited `HOME` the test
+/// controls, so that "HOME is not recorded" is a claim about a variable that
+/// really is in the script's environment, and one more inherited variable
+/// whose name no shell defines for itself.
+fn inherited_env(home: &TempDir) -> [(&str, &str); 2] {
+    [
+        ("HOME", home.path().to_str().unwrap()),
+        ("CT_INHERITED_MARKER", "inherited"),
+    ]
+}
+
+/// Assert no variable inherited from the environment of `inherited_env` was
+/// reported as a variable of the script.
+fn assert_no_inherited_vars(vars: &[(String, ValueRecord)], what: &str) {
+    for name in ["HOME", "CT_INHERITED_MARKER"] {
+        assert!(
+            common::var(vars, name).is_none(),
+            "{what}: the inherited {name} must not be recorded as a variable of the script; \
+             recorded: {:?}",
+            common::var_names(vars)
+        );
+    }
+}
+
+/// Record `script` through `shell`'s launcher, with `inherited_env` added to
+/// its environment, and return the variables of its last step.
+fn record_last_step_vars(
+    shell: &common::Shell,
+    script: &std::path::Path,
+) -> Vec<(String, ValueRecord)> {
+    build_trace_writer();
+    let home = TempDir::new().expect("failed to create temp dir");
+    let (out, output) = common::run_launcher_with_env(shell, script, &inherited_env(&home));
+    assert!(
+        output.status.success(),
+        "{} launcher failed on {}: {}",
+        shell.interpreter,
+        script.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::last_step_vars(out.path())
+}
+
+// Issue `2026-11-15-zsh-recorder-does-not-record-exported-variables`: zsh's
+// `typeset -p` prints an exported parameter with the keyword `export`, and
+// the recorder accepted only `typeset` lines, so an exported variable of the
+// script was never recorded. Spec `Recording-Backends/Shell-Recorder.md`,
+// "Variable Capture": exported (`-x`) and other attributes do not affect the
+// type mapping.
+#[test]
+fn test_zsh_exported_variable_capture() {
+    require_zsh!();
+    let vars = record_last_step_vars(&common::ZSH, &fixture_path("exported_variables.zsh"));
+
+    // `export DEPLOY_ENV=staging` is recorded, with its exact text.
+    common::assert_string(
+        common::var(&vars, "DEPLOY_ENV"),
+        "staging",
+        "DEPLOY_ENV at the last step",
+    );
+    // An inherited environment variable is not a variable of the script.
+    assert_no_inherited_vars(&vars, "zsh exported_variables");
+    // The non-exported variables are still recorded.
+    assert!(
+        common::var(&vars, "plain").is_some(),
+        "plain missing at the last step: {:?}",
+        common::var_names(&vars)
+    );
+    assert!(
+        common::var(&vars, "FIXED").is_some(),
+        "FIXED missing at the last step: {:?}",
+        common::var_names(&vars)
+    );
+}
+
+// The type of an exported parameter comes from its type flag, as for any
+// other parameter (spec `Recording-Backends/Shell-Recorder.md`, "Variable
+// Capture": exported (`-x`) attributes do not affect the type mapping). Each
+// exported parameter must carry the same trace type as a non-exported one of
+// the same zsh type: `export -i`, `export -F`, an exported array, and
+// `typeset -gx` inside a function (printed `export`, like a plain string).
+#[test]
+fn test_zsh_exported_variable_types() {
+    require_zsh!();
+    let vars = record_last_step_vars(&common::ZSH, &fixture_path("exported_typed.zsh"));
+    let get = |name: &str| {
+        common::var(&vars, name).unwrap_or_else(|| {
+            panic!(
+                "{name} not recorded at the last step: {:?}",
+                common::var_names(&vars)
+            )
+        })
+    };
+
+    common::assert_int(get("COUNT"), 3, "COUNT (export -i)");
+    match get("RATIO") {
+        ValueRecord::Float { f, .. } if *f == 1.5 => {}
+        other => panic!("RATIO (export -F): expected Float 1.5, got {other:?}"),
+    }
+    // Arrays are recorded as their `typeset -p` text (trace_bridge.rs
+    // `value_record_for_flag`), under the Array type.
+    common::assert_string(Some(get("LIST")), "( 1 2 )", "LIST (typeset -ax)");
+    common::assert_string(
+        Some(get("FROM_FN")),
+        "fn",
+        "FROM_FN (typeset -gx in a function)",
+    );
+
+    for (exported, plain) in [
+        ("COUNT", "plain_count"),
+        ("RATIO", "plain_ratio"),
+        ("LIST", "plain_list"),
+        ("FROM_FN", "plain_str"),
+    ] {
+        assert_eq!(
+            type_id_of(get(exported)),
+            type_id_of(get(plain)),
+            "{exported} must have the trace type of the non-exported {plain}: {:?} vs {:?}",
+            get(exported),
+            get(plain)
+        );
+    }
+    assert_no_inherited_vars(&vars, "zsh exported_typed");
+}
+
+// Issue `2026-11-15-zsh-recorder-drops-variables-whose-typeset-flag-carries-a-number`:
+// `typeset -p` prints an integer base or a field width inside the flag word
+// (`typeset -i16 h=255`, `typeset -Z5 z=42`, `export -Z4 gx=1`), and the
+// recorder accepted only letters there, so every such variable was dropped.
+// Spec `Recording-Backends/Shell-Recorder.md`, "Variable Capture": the type
+// comes from the type flag (`-i` → Int); width and base attributes do not
+// change it, so `-Z`/`-L`/`-R` parameters are Strings. Values are recorded
+// as `typeset -p` prints them: the decimal value for `-i16`, the assigned
+// text for `-Z5` (not the zero-filled `$z`).
+#[test]
+fn test_zsh_numeric_typeset_flags() {
+    require_zsh!();
+    let vars = record_last_step_vars(&common::ZSH, &fixture_path("numeric_flags.zsh"));
+    let get = |name: &str| {
+        common::var(&vars, name).unwrap_or_else(|| {
+            panic!(
+                "{name} not recorded at the last step: {:?}",
+                common::var_names(&vars)
+            )
+        })
+    };
+
+    common::assert_int(get("h"), 255, "h (typeset -i16)");
+    common::assert_int(get("xh"), 17, "xh (export -i16)");
+    common::assert_int(get("gb"), 5, "gb (typeset -gi2 in a function)");
+    for (name, value, what) in [
+        ("z", "42", "z (typeset -Z5)"),
+        ("l", "abcdef", "l (typeset -L3)"),
+        ("r", "ab", "r (typeset -R4)"),
+        ("rz", "7", "rz (typeset -Z3 -r)"),
+        ("lz", "9", "lz (typeset -L4 -Z4)"),
+        ("gx", "1", "gx (typeset -gxZ4 in a function)"),
+        ("plain_str", "s", "plain_str"),
+    ] {
+        common::assert_string(Some(get(name)), value, what);
+    }
+
+    for name in ["xh", "gb"] {
+        assert_eq!(
+            type_id_of(get(name)),
+            type_id_of(get("h")),
+            "{name} must have the trace type of h: {:?} vs {:?}",
+            get(name),
+            get("h")
+        );
+    }
+    for name in ["z", "l", "r", "rz", "lz", "gx"] {
+        assert_eq!(
+            type_id_of(get(name)),
+            type_id_of(get("plain_str")),
+            "{name} must have the trace type of plain_str: {:?} vs {:?}",
+            get(name),
+            get("plain_str")
+        );
+    }
+    // Inherited numeric-flag parameters (`typeset -i10 COLUMNS=0`, ...) are
+    // in the baseline now, and still not variables of the script.
+    for name in ["COLUMNS", "RANDOM", "SECONDS", "TRY_BLOCK_ERROR"] {
+        assert!(
+            common::var(&vars, name).is_none(),
+            "the inherited {name} must not be recorded; recorded: {:?}",
+            common::var_names(&vars)
+        );
+    }
+    assert_no_inherited_vars(&vars, "zsh numeric_flags");
+}
+
+/// The trace type of a scalar value record.
+fn type_id_of(value: &ValueRecord) -> u64 {
+    match value {
+        ValueRecord::Int { type_id, .. }
+        | ValueRecord::Float { type_id, .. }
+        | ValueRecord::String { type_id, .. } => type_id.0 as u64,
+        other => panic!("unexpected value record {other:?}"),
+    }
+}
+
 #[test]
 fn test_zsh_error_handling() {
     require_zsh!();
@@ -326,17 +529,32 @@ fn test_zsh_output_capture() {
 #[test]
 fn test_zsh_exit_code() {
     require_zsh!();
-    let (output_dir, _stdout, _stderr) = record_fixture("simple.zsh");
+    build_trace_writer();
+    // The script's exit code reaches the event stream and the trace however
+    // the script ends: off its last line, with `exit 0`, `exit 3`, or `exit`
+    // inside a function. See `common::check_exit_codes` for the claims.
+    common::check_exit_codes(&common::ZSH);
+}
 
-    // Verify .ct container exists — the exit code is encoded inside the binary
-    // container. Detailed event parsing is covered by integration_test.rs.
-    let ct_path = find_ct_file(&output_dir);
-    let ct_size = std::fs::metadata(&ct_path).unwrap().len();
-    assert!(
-        ct_size >= 1024,
-        ".ct file should be at least 1KB, got {} bytes",
-        ct_size
-    );
+// The launcher writes the trace and passes the status through when the
+// script ends non-zero. See `common::check_nonzero_exit_keeps_trace`.
+
+#[test]
+fn test_zsh_trace_written_when_script_calls_exit_nonzero() {
+    require_zsh!();
+    common::check_nonzero_exit_keeps_trace(&common::ZSH, "exit_three", 3, 4);
+}
+
+#[test]
+fn test_zsh_trace_written_when_last_command_fails() {
+    require_zsh!();
+    common::check_nonzero_exit_keeps_trace(&common::ZSH, "exit_status_last_command", 1, 5);
+}
+
+#[test]
+fn test_zsh_trace_written_when_errexit_stops_the_script() {
+    require_zsh!();
+    common::check_nonzero_exit_keeps_trace(&common::ZSH, "exit_status_errexit", 1, 7);
 }
 
 #[test]
@@ -880,5 +1098,356 @@ fn e2e_cross_shell_equivalence() {
         Some("zsh"),
         "Zsh trace should have language='zsh', got: {:?}",
         zsh_db_meta["language"]
+    );
+}
+
+// Issue `2026-11-15-zsh-recorder-does-not-record-exported-variables`, spec
+// `CLI/recorders/shell.md` "Rules": both shells produce interchangeable
+// traces. The same script records the same variables in both, an exported
+// one included, and neither reports an inherited environment variable.
+#[test]
+fn e2e_cross_shell_exported_variables() {
+    require_zsh!();
+    let bash_vars = record_last_step_vars(&common::BASH, &cross_shell_fixture_path("exported.sh"));
+    let zsh_vars = record_last_step_vars(&common::ZSH, &cross_shell_fixture_path("exported.zsh"));
+
+    assert_eq!(
+        common::var_names(&zsh_vars),
+        common::var_names(&bash_vars),
+        "zsh and bash must record the same variables at the last step"
+    );
+    common::assert_string(
+        common::var(&bash_vars, "DEPLOY_ENV"),
+        "staging",
+        "bash DEPLOY_ENV at the last step",
+    );
+    common::assert_string(
+        common::var(&zsh_vars, "DEPLOY_ENV"),
+        "staging",
+        "zsh DEPLOY_ENV at the last step",
+    );
+    assert_no_inherited_vars(&bash_vars, "bash exported.sh");
+    assert_no_inherited_vars(&zsh_vars, "zsh exported.zsh");
+}
+
+// ============================================================================
+// Function return recording
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-never-close-a-function-called-in-command-substitution`.
+// The claims are shared with the other shell; see "Function return
+// recording" in `common/mod.rs`.
+
+#[test]
+fn test_zsh_every_call_in_event_stream_has_a_return() {
+    require_zsh!();
+    // `cmdsubst_loop` calls a function in `$(...)`; the raw stream must close it.
+    common::assert_stream_balanced(&common::ZSH, "cmdsubst_loop");
+}
+
+#[test]
+fn test_zsh_function_in_command_substitution_is_closed() {
+    require_zsh!();
+    common::check_function_in_command_substitution_is_closed(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_function_used_as_condition_records_its_status() {
+    require_zsh!();
+    common::check_function_used_as_condition_records_its_status(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_directly_called_function_return_is_recorded() {
+    require_zsh!();
+    common::check_directly_called_function_return_is_recorded(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_explicit_return_values_are_recorded() {
+    require_zsh!();
+    common::check_explicit_return_values(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_outer_function_returns_inner_status() {
+    require_zsh!();
+    common::check_nested_returns(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_recursion_in_command_substitution_is_closed() {
+    require_zsh!();
+    common::check_recursion_in_command_substitution(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_exit_in_command_substitution_closes_subshell_frames() {
+    require_zsh!();
+    common::check_exit_in_command_substitution(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_main_shell_exit_in_function_writes_no_return() {
+    require_zsh!();
+    common::check_main_shell_exit_in_function_writes_no_return(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_sourced_file_frames_are_closed_once() {
+    require_zsh!();
+    common::check_sourced_file_returns(&common::ZSH, 8);
+}
+
+#[test]
+fn test_zsh_and_list_calls_are_closed() {
+    require_zsh!();
+    common::check_and_list_calls(&common::ZSH);
+}
+
+// ============================================================================
+// Traps set by the recorded script
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-lose-events-when-the-script-sets-its-own-err-or-debug-trap`.
+// The claims shared with the other shell are in "Traps set by the recorded
+// script" in `common/mod.rs`.
+
+#[test]
+fn test_zsh_script_zerr_trap_keeps_error_capture() {
+    require_zsh!();
+    common::check_script_err_trap_keeps_capturing(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_script_debug_trap_keeps_step_capture() {
+    require_zsh!();
+    common::check_script_debug_trap_keeps_capturing(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_script_debug_action_still_runs() {
+    require_zsh!();
+    common::check_script_debug_action_runs(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_script_trap_reset_and_ignore_keep_capture() {
+    require_zsh!();
+    common::check_script_trap_reset_and_ignore(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_script_trap_listing_shows_script_actions() {
+    require_zsh!();
+    common::check_script_trap_listing(&common::ZSH);
+}
+
+#[test]
+fn test_zsh_replaced_recorder_trap_is_reported() {
+    require_zsh!();
+    common::check_replaced_trap_is_reported(&common::ZSH);
+}
+
+/// Function-form traps (`TRAPZERR() { ... }`, `TRAPDEBUG() { ... }`) keep
+/// working, and `unfunction TRAPZERR` removes the script's trap only: all
+/// three failures (lines 8, 16 and 19) and the steps after `TRAPDEBUG` is
+/// defined are still recorded, and the script's handler runs for the first
+/// two only.
+#[test]
+fn test_zsh_script_function_form_traps_are_chained() {
+    require_zsh!();
+    let shell = &common::ZSH;
+    let run = common::assert_stream_balanced(shell, "trap_fn_forms");
+    assert_eq!(
+        common::error_step_lines(&run),
+        vec![8, 16, 19],
+        "stream:\n{}",
+        run.events.join("\n")
+    );
+    let out = common::record_like_native(shell, "trap_fn_forms");
+    assert_eq!(common::recorded_error_texts(out.path()).len(), 3);
+    let lines: Vec<u64> = common::step_lines_and_depths(out.path())
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    for line in [12, 13, 14, 15, 16, 17, 18, 19, 20] {
+        assert!(lines.contains(&line), "no step at line {line}: {lines:?}");
+    }
+}
+
+/// An `EXIT` trap set inside a function runs when that function returns,
+/// with `$?` its status, and does not replace the recorder's own per-function
+/// `EXIT` trap: every frame is closed with the function's status.
+#[test]
+fn test_zsh_script_function_exit_trap_is_chained() {
+    require_zsh!();
+    let shell = &common::ZSH;
+    common::assert_stream_balanced(shell, "trap_fn_exit");
+    let out = common::record_like_native(shell, "trap_fn_exit");
+    let calls = common::recorded_calls(out.path());
+    common::assert_calls(&calls, "f", 2, &[2]);
+    common::assert_calls(&calls, "g", 2, &[3]);
+}
+
+/// `setopt localtraps` in a function: the `ZERR` trap it sets there is the
+/// script's until the function returns, then the outer one is back, and
+/// both failures (lines 8 and 11) are recorded.
+///
+/// The `ERROR` lines are matched to the step before them rather than
+/// counted: zsh runs the ZERR trap once more in the caller of a function
+/// that returns non-zero when the function has an `EXIT` trap, and the
+/// recorder gives every function one, so the raw stream also has an
+/// `ERROR` for the call of `f` (which the script's own handler does not
+/// see; the standard-output comparison checks that).
+#[test]
+fn test_zsh_script_local_traps_are_restored() {
+    require_zsh!();
+    let shell = &common::ZSH;
+    let run = common::assert_stream_balanced(shell, "trap_local");
+    let mut lines = common::error_step_lines(&run);
+    lines.dedup();
+    assert_eq!(lines, vec![8, 11], "stream:\n{}", run.events.join("\n"));
+    common::record_like_native(shell, "trap_local");
+}
+
+#[test]
+fn test_zsh_script_exit_trap_is_chained() {
+    require_zsh!();
+    common::check_script_exit_trap(&common::ZSH);
+}
+
+/// `setopt localtraps` in a function when the script has no `DEBUG` or
+/// `ZERR` trap outside it: the function's traps are restored away when it
+/// returns (the script's handlers do not run for the commands after it),
+/// and both failures (lines 10 and 14) are recorded.
+#[test]
+fn test_zsh_script_local_traps_without_outer_trap_are_restored() {
+    require_zsh!();
+    let shell = &common::ZSH;
+    let run = common::assert_stream_balanced(shell, "trap_local_first");
+    let mut lines = common::error_step_lines(&run);
+    lines.dedup();
+    assert_eq!(lines, vec![10, 14], "stream:\n{}", run.events.join("\n"));
+    let native = common::native_stdout(shell, "trap_local_first");
+    assert!(
+        native.ends_with("h zerr\nend\n"),
+        "natively, no handler runs after `h` returns: {native:?}"
+    );
+    common::record_like_native(shell, "trap_local_first");
+}
+
+/// A script that takes descriptor 3 for itself (`exec 3>&1`) neither sees
+/// the event stream on its output nor cuts the recording short.
+#[test]
+fn test_zsh_script_redirecting_fd3_keeps_the_trace_channel() {
+    require_zsh!();
+    common::check_script_fd3_does_not_touch_the_trace_channel(&common::ZSH, "fd3_redirected");
+}
+
+/// A script that closes descriptor 3 (`exec 3>&-`) keeps being recorded.
+#[test]
+fn test_zsh_script_closing_fd3_keeps_the_trace_channel() {
+    require_zsh!();
+    common::check_script_fd3_does_not_touch_the_trace_channel(&common::ZSH, "fd3_closed");
+}
+
+// ============================================================================
+// Paths and function names that need quoting on the wire
+// ============================================================================
+//
+// Codetracer-pm issue
+// `2026-11-15-shell-recorders-cannot-record-a-script-whose-path-contains-a-space`.
+// The claims are shared with the other shell; see "Paths and function names
+// that need quoting on the wire" in `common/mod.rs`.
+
+/// Control: the same recording from a directory with no special character.
+#[test]
+fn test_zsh_records_script_in_plain_directory() {
+    require_zsh!();
+    common::check_records_script_in_dir(&common::ZSH, "plain_dir");
+}
+
+/// A path with a space must reach the writer quoted, so that the trace is
+/// written and carries the exact path.
+#[test]
+fn test_zsh_records_script_path_containing_a_space() {
+    require_zsh!();
+    common::check_records_script_in_dir(&common::ZSH, "my scripts");
+}
+
+/// A tab ends an unquoted value too.
+#[test]
+fn test_zsh_records_script_path_containing_a_tab() {
+    require_zsh!();
+    common::check_records_script_in_dir(&common::ZSH, "tab\tdir");
+}
+
+/// `"` and `\` are the characters the quoted form escapes.
+#[test]
+fn test_zsh_records_script_path_containing_a_quote_and_a_backslash() {
+    require_zsh!();
+    common::check_records_script_in_dir(&common::ZSH, "we\"ird\\dir");
+}
+
+#[test]
+fn test_zsh_records_sourced_file_whose_path_contains_a_space() {
+    require_zsh!();
+    common::check_records_sourced_file_with_space(&common::ZSH);
+}
+
+/// A file sourced by `./name` after a `cd` is recorded by its absolute path
+/// and copied (codetracer-pm issue
+/// `2026-11-15-shell-recorders-record-a-relatively-sourced-file-by-its-relative-path-and-may-not-copy-it`).
+#[test]
+fn test_zsh_records_file_sourced_by_a_relative_path_after_cd() {
+    require_zsh!();
+    common::check_records_relatively_sourced_file(&common::ZSH, common::RelativeSource::DotSlash);
+}
+
+/// The `.` and `..` components of a relative source path are folded.
+#[test]
+fn test_zsh_records_file_sourced_by_a_relative_path_with_dot_components() {
+    require_zsh!();
+    common::check_records_relatively_sourced_file(&common::ZSH, common::RelativeSource::DotDot);
+}
+
+/// A file found through a relative `PATH` entry is recorded by its absolute
+/// path.
+#[test]
+fn test_zsh_records_file_sourced_through_a_relative_path_entry() {
+    require_zsh!();
+    common::check_records_relatively_sourced_file(&common::ZSH, common::RelativeSource::PathSearch);
+}
+
+/// A `..` after a symlinked directory names the file the shell opened, not
+/// the one folding it lexically would name.
+#[test]
+fn test_zsh_records_file_sourced_by_a_relative_path_through_a_symlinked_dir() {
+    require_zsh!();
+    common::check_records_relatively_sourced_file(
+        &common::ZSH,
+        common::RelativeSource::DotDotThroughSymlink,
+    );
+}
+
+#[test]
+fn test_zsh_records_function_in_script_whose_path_contains_a_space() {
+    require_zsh!();
+    common::check_records_function_in_dir_with_space(&common::ZSH, "greet", "greet() {", "greet");
+}
+
+/// Zsh, unlike Bash, accepts any function name: one with a space, a `"`
+/// and a `\` must reach the writer whole in `FUNC` and `CALL`.
+#[test]
+fn test_zsh_records_function_whose_name_needs_quoting() {
+    require_zsh!();
+    common::check_records_function_in_dir_with_space(
+        &common::ZSH,
+        r#"my "odd\ func"#,
+        r#"function 'my "odd\ func' {"#,
+        r#"'my "odd\ func'"#,
     );
 }

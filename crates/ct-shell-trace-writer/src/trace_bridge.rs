@@ -74,6 +74,15 @@ pub struct TraceBridge {
     /// by a `CALL` event.  Drained on every `CALL` so each call frame's
     /// arg list is exactly the one the recorder emitted before it.
     pending_call_args: Vec<FullValueRecord>,
+    /// User function frames opened by `CALL` and not yet closed by `RETURN`.
+    ///
+    /// The writer-owned `<toplevel>` and `<script>` frames are not counted.
+    /// A script that calls `exit` inside a function ends with user frames
+    /// still open, because no `RETURN` reaches them; `EXIT` closes those
+    /// first so its exit code lands on `<script>` rather than on the
+    /// innermost user frame. A `RETURN` with no user frame open is dropped
+    /// so it cannot close `<script>` (see `handle_return`).
+    open_user_frames: usize,
 }
 
 impl TraceBridge {
@@ -94,6 +103,7 @@ impl TraceBridge {
             registered_functions: BTreeSet::new(),
             script_args: args.to_vec(),
             pending_call_args: Vec::new(),
+            open_user_frames: 0,
         }
     }
 
@@ -127,6 +137,7 @@ impl TraceBridge {
             }
             WireEvent::Call { name } => {
                 self.handle_call(&name);
+                self.open_user_frames += 1;
             }
             WireEvent::Arg {
                 name,
@@ -160,16 +171,10 @@ impl TraceBridge {
                 );
             }
             WireEvent::Return { status } => {
-                let type_id =
-                    TraceWriter::ensure_type_id(self.writer.as_mut(), TypeKind::Int, "Int");
-                let return_value = ValueRecord::Int { i: status, type_id };
-                TraceWriter::register_return(self.writer.as_mut(), return_value);
+                self.handle_return(status);
             }
             WireEvent::Exit { code } => {
-                let type_id =
-                    TraceWriter::ensure_type_id(self.writer.as_mut(), TypeKind::Int, "Int");
-                let return_value = ValueRecord::Int { i: code, type_id };
-                TraceWriter::register_return(self.writer.as_mut(), return_value);
+                self.handle_exit(code);
             }
         }
         Ok(())
@@ -244,6 +249,47 @@ impl TraceBridge {
         TraceWriter::register_call(self.writer.as_mut(), function_id, args);
     }
 
+    /// Close the innermost frame with the shell status `status` as an `Int`.
+    fn register_int_return(&mut self, status: i64) {
+        let type_id = TraceWriter::ensure_type_id(self.writer.as_mut(), TypeKind::Int, "Int");
+        TraceWriter::register_return(
+            self.writer.as_mut(),
+            ValueRecord::Int { i: status, type_id },
+        );
+    }
+
+    /// Handle a RETURN event: close the innermost user function frame.
+    ///
+    /// A `RETURN` with no user frame open has no `CALL` to match (the
+    /// recorder lost it), and closing a frame for it would close the
+    /// writer-owned `<script>` frame early, so that `EXIT` would then close
+    /// `<toplevel>` with the exit code. It is reported and dropped.
+    fn handle_return(&mut self, status: i64) {
+        if self.open_user_frames == 0 {
+            eprintln!(
+                "ct-shell-trace-writer: warning: RETURN status={status} with no open function call; ignored"
+            );
+            return;
+        }
+        self.open_user_frames -= 1;
+        self.register_int_return(status);
+    }
+
+    /// Handle the EXIT event: the shell ended with exit status `code`.
+    ///
+    /// `exit` inside a function ends the shell with that function's frame,
+    /// and every frame below it, still open. Each one terminated with the
+    /// exit status, so each is closed with it, innermost first, and then
+    /// `<script>` is closed with the exit code: the script's exit code is
+    /// the return value of its entry frame however the script ended.
+    fn handle_exit(&mut self, code: i64) {
+        while self.open_user_frames > 0 {
+            self.open_user_frames -= 1;
+            self.register_int_return(code);
+        }
+        self.register_int_return(code);
+    }
+
     /// Handle an ARG event: stage one positional parameter for the next
     /// `CALL`.  Type-flag handling mirrors `handle_var` so the same wire-
     /// protocol type vocabulary applies (`i`/`s`/`a`/`A`/`F`).
@@ -312,15 +358,35 @@ impl TraceBridge {
     /// `files/` (see `copy_source_files`) so the recorded bundle is
     /// self-contained.  This is done only after `close()` has flushed the
     /// container, so a failure copying sources cannot corrupt the trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no trace was written: the writer was never
+    /// started because the event stream carried no `START` event. A run that
+    /// ends that way has not "completed, trace written"
+    /// (`Recorder-CLI-Conventions.md` §6 "Exit Codes"), so it must not report
+    /// success; only the writer can tell, since a caller that tests for
+    /// `<script>.ct` cannot tell a fresh container from one a previous run
+    /// left behind. (A `START` that fails to create the container is reported
+    /// by `handle_event`, and the caller is expected to stop there.)
+    /// Also returns an error, prefixed `failed to finalize trace:`, when
+    /// finalizing the container or writing the bundle's sidecar and source
+    /// copies fails.
     pub fn finish(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.started {
-            TraceWriter::finish_writing_trace_events(self.writer.as_mut())?;
-            self.writer.write_meta_dat("codetracer-shell-recorders")?;
-            TraceWriter::close(self.writer.as_mut())?;
-
-            self.write_sidecar_files()?;
-            self.copy_source_files()?;
+        if !self.started {
+            return Err("no trace was written: the event stream carried no START event".into());
         }
+        fn finalize(e: impl std::fmt::Display) -> Box<dyn Error> {
+            format!("failed to finalize trace: {e}").into()
+        }
+        TraceWriter::finish_writing_trace_events(self.writer.as_mut()).map_err(finalize)?;
+        self.writer
+            .write_meta_dat("codetracer-shell-recorders")
+            .map_err(finalize)?;
+        TraceWriter::close(self.writer.as_mut()).map_err(finalize)?;
+
+        self.write_sidecar_files().map_err(finalize)?;
+        self.copy_source_files().map_err(finalize)?;
         Ok(())
     }
 

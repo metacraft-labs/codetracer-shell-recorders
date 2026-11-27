@@ -6,7 +6,9 @@ canonical CodeTracer CTFS `.ct` container.
 ## Architecture
 
 * `launcher.sh` — CLI entry point.  Resolves the target script, sets up
-  the FD 3 FIFO between the recorder and the trace writer, and forwards
+  the FD 3 event stream between the recorder and the trace writer (staged
+  through a temporary file; the recorder moves it to a descriptor of 10 or
+  above before the script runs, so the script keeps FD 3), and forwards
   argv as `--args ...` so the implicit `<toplevel>` call records the
   script's positional parameters.  Wrapped by `codetracer-bash-recorder`
   so the recorder is invoked by its canonical `codetracer-<lang>-recorder`
@@ -14,6 +16,26 @@ canonical CodeTracer CTFS `.ct` container.
 * `recorder.sh` — DEBUG/ERR/RETURN-trap-based instrumentation layer.
   Emits the line-oriented wire protocol consumed by
   `crates/ct-shell-trace-writer/`.
+
+The recorder sources the script into its own shell, so that its traps
+apply to it. The script still sees its own path as `$0`: the script's
+absolute path, equal to `${BASH_SOURCE[0]}` at its top level, so the usual
+`[[ "${BASH_SOURCE[0]}" == "$0" ]] && main "$@"` guard holds and
+`$(dirname "$0")` names the script's directory. One difference from a
+direct run remains: a script given by a relative path (`./x.sh`) sees `$0`
+as an absolute path. Bash 5.0 and later set `$0` through `BASH_ARGV0`; on
+Bash 4 the recorder re-enters itself once as a file sourced by
+`bash -c '...' <script-path>`, the only way to choose `$0` there. That
+`-c` shell shows in two more ways on Bash 4 only: `$-` contains `c`, and
+a file named by `BASH_ENV` is read once more before the script starts.
+
+## Requirements
+
+Bash 4.0 or newer, both for the launcher and for the recorded script (the
+`bash` found on `PATH` runs both). On an older Bash the launcher exits with
+an error that names the version it found. `tests/test_bash_recorder_cli.sh`
+runs the recorder under Bash 4.0, the oldest supported release, which the
+Linux dev shell provides as `CT_TEST_BASH_4_0`.
 
 ## Usage
 

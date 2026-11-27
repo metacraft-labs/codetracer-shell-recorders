@@ -419,5 +419,133 @@ RETURN_I="$(jq -r '
   || fail "T7: call_exit return_value should be 0 (success), got ${RETURN_I}"
 pass "T7 exact return: call_exit → Int(0)"
 
+# run_launcher <out-dir> [launcher-args...] -- runs the zsh launcher as
+# `--out-dir <out-dir> <launcher-args...>`. Sets RUN_RC, RUN_STDOUT and
+# RUN_STDERR; never aborts the test on a non-zero exit.
+run_launcher() {
+  local out_dir="$1"
+  shift
+  RUN_RC=0
+  zsh "${LAUNCHER}" --out-dir "${out_dir}" "$@" \
+    >"${WORK_DIR}/run.out" 2>"${WORK_DIR}/run.err" || RUN_RC=$?
+  RUN_STDOUT="$(cat "${WORK_DIR}/run.out")"
+  RUN_STDERR="$(cat "${WORK_DIR}/run.err")"
+}
+
+# ---------------------------------------------------------------------------
+# T10. A script argument that is one of the recorder's or the writer's own
+# flags (`-h`, `--help`, `-V`, `--version`) belongs to the script. See T10 in
+# tests/test_bash_recorder_cli.sh for the specification it checks.
+# ---------------------------------------------------------------------------
+
+ARGS_FIXTURE="${WORK_DIR}/args.zsh"
+cat > "${ARGS_FIXTURE}" <<'EOF'
+echo "args: $*"
+EOF
+
+for flag in -h --help -V --version; do
+  for form in plain dashdash; do
+    label="T10 script argument ${flag} (${form})"
+    out="${WORK_DIR}/t10-${flag#--}-${form}"
+    if [[ "${form}" == dashdash ]]; then
+      run_launcher "${out}" -- "${ARGS_FIXTURE}" "${flag}"
+    else
+      run_launcher "${out}" "${ARGS_FIXTURE}" "${flag}"
+    fi
+    [[ "${RUN_RC}" == "0" ]] \
+      || fail "${label}: launcher exited ${RUN_RC}; stdout: ${RUN_STDOUT}; stderr: ${RUN_STDERR}"
+    [[ "${RUN_STDOUT}" == "args: ${flag}" ]] \
+      || fail "${label}: stdout must be exactly the script's 'args: ${flag}'; got: ${RUN_STDOUT}"
+    shopt -s nullglob
+    cts=("${out}"/*.ct)
+    shopt -u nullglob
+    [[ "${#cts[@]}" == "1" && -f "${out}/args.ct" ]] \
+      || fail "${label}: expected exactly one *.ct (args.ct) in ${out}, found ${#cts[@]}: $(ls -A "${out}" 2>/dev/null)"
+    SCRIPT_ARGS="$(run_ct_print --full --strip-paths "${out}/args.ct" | jq -c '
+      [.events[] | select(.kind == "call_entry" and .function == "<script>")
+       | [.args[] | [.varname, .value.kind, .value.text]]]')"
+    [[ "${SCRIPT_ARGS}" == "[[[\"\$1\",\"String\",\"${flag}\"]]]" ]] \
+      || fail "${label}: the <script> call must carry \$1=String(\"${flag}\") and nothing else; got: ${SCRIPT_ARGS}"
+    pass "${label}: exit 0, one .ct, stdout is the script's, <script>(\$1=\"${flag}\")"
+  done
+done
+
+# ---------------------------------------------------------------------------
+# T11. A recording whose trace writer finishes without writing `<script>.ct`
+# fails: a message on stderr naming the missing trace, and exit 1, also when
+# the script itself failed. See T11 in tests/test_bash_recorder_cli.sh for
+# the specification. The trigger is the real writer meeting a directory
+# named `<script>.ct` in the output directory: it cannot create the
+# container and exits 1, and a stale `args.ct` in a read-only output
+# directory must not pass for this run's trace. (The bash test's second
+# trigger, an open-files limit, does not reach the writer here: zsh refuses
+# the descriptor itself and the launcher stops earlier.)
+# ---------------------------------------------------------------------------
+
+FAIL3_FIXTURE="${WORK_DIR}/args3.zsh"
+cat > "${FAIL3_FIXTURE}" <<'EOF'
+echo "args: $*"
+exit 3
+EOF
+
+# expect_no_trace_failure <label> <trace-path> <script-stdout> [status-phrase]
+expect_no_trace_failure() {
+  local label="$1" trace="$2" stdout="$3" status_phrase="${4:-}"
+  [[ "${RUN_RC}" == "1" ]] \
+    || fail "${label}: launcher must exit 1, got ${RUN_RC}; stdout: ${RUN_STDOUT}; stderr: ${RUN_STDERR}"
+  [[ "${RUN_STDOUT}" == "${stdout}" ]] \
+    || fail "${label}: the script must still run; stdout: ${RUN_STDOUT}"
+  grep -qF "recording failed" <<< "${RUN_STDERR}" \
+    || fail "${label}: stderr must say the recording failed; stderr: ${RUN_STDERR}"
+  grep -qF "${trace}" <<< "${RUN_STDERR}" \
+    || fail "${label}: stderr must name the missing trace ${trace}; stderr: ${RUN_STDERR}"
+  if [[ -n "${status_phrase}" ]]; then
+    grep -qF "${status_phrase}" <<< "${RUN_STDERR}" \
+      || fail "${label}: stderr must report '${status_phrase}'; stderr: ${RUN_STDERR}"
+  fi
+  pass "${label}: exit 1, stderr names ${trace##*/}"
+}
+
+OUT_DIR_T11="${WORK_DIR}/t11-ct-is-dir"
+mkdir -p "${OUT_DIR_T11}/args.ct"
+run_launcher "${OUT_DIR_T11}" "${ARGS_FIXTURE}" one
+expect_no_trace_failure "T11 args.ct is a directory" \
+  "${OUT_DIR_T11}/args.ct" "args: one"
+
+OUT_DIR_T11B="${WORK_DIR}/t11-ct-is-dir-status3"
+mkdir -p "${OUT_DIR_T11B}/args3.ct"
+run_launcher "${OUT_DIR_T11B}" "${FAIL3_FIXTURE}" one
+expect_no_trace_failure "T11 args3.ct is a directory, script exits 3" \
+  "${OUT_DIR_T11B}/args3.ct" "args: one" "status 3"
+
+# A `<script>.ct` left in the output directory by a previous run is not this
+# run's trace. The writer fails here because it cannot create the container
+# (the old `args.ct` and its directory are read-only), and the launcher must
+# take the writer's exit status as the verdict rather than find the old file
+# and report success (issue
+# `2026-11-16-shell-trace-writer-exits-0-when-it-cannot-create-the-trace-container`).
+# The old file must be left as it was. Permissions do not bind root, so the
+# case is skipped by name when the file stays writable.
+OUT_DIR_T11S="${WORK_DIR}/t11-stale-trace"
+mkdir -p "${OUT_DIR_T11S}"
+printf 'stale trace from a previous run' > "${OUT_DIR_T11S}/args.ct"
+chmod 444 "${OUT_DIR_T11S}/args.ct"
+chmod 555 "${OUT_DIR_T11S}"
+if [[ -w "${OUT_DIR_T11S}/args.ct" || -w "${OUT_DIR_T11S}" ]]; then
+  echo "skipped: T11 stale args.ct — read-only permissions do not bind this user"
+else
+  run_launcher "${OUT_DIR_T11S}" "${ARGS_FIXTURE}" one
+  grep -qF "failed to create streaming CTFS container" <<< "${RUN_STDERR}" \
+    || fail "T11 stale args.ct control: the writer must fail to create the container; stderr: ${RUN_STDERR}"
+  expect_no_trace_failure "T11 stale args.ct, writer fails" \
+    "${OUT_DIR_T11S}/args.ct" "args: one" "trace writer exited with status 1"
+  [[ "$(cat "${OUT_DIR_T11S}/args.ct")" == "stale trace from a previous run" ]] \
+    || fail "T11 stale args.ct: the old file must be left as it was"
+  [[ ! -e "${OUT_DIR_T11S}/trace_db_metadata.json" ]] \
+    || fail "T11 stale args.ct: a failed recording must not write the launcher's sidecars"
+fi
+chmod 755 "${OUT_DIR_T11S}"
+chmod 644 "${OUT_DIR_T11S}/args.ct"
+
 echo ""
 echo "test_zsh_recorder_cli: ${PASS_COUNT} assertions passed"

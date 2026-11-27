@@ -268,9 +268,23 @@ _ct_events_file=$(mktemp "${TMPDIR:-/tmp}/ct-events-XXXXXX")
 # Clean up on exit
 trap 'rm -f "$_ct_events_file"' EXIT
 
-# Run the recorder with FD 3 connected to the event file.
-"$_ct_zsh" "$_ct_script_dir/recorder.zsh" "$_ct_script" "${_ct_script_args[@]}" 3>"$_ct_events_file"
-_ct_exit_code=$?
+# Run the recorder with FD 3 connected to the event file. The recorder moves
+# the stream to a free descriptor of 10 or above and closes FD 3 before it
+# sources the script, so a script that uses FD 3 itself does not touch it.
+#
+# The recorder exits with the recorded script's status, and that status is
+# saved here to be returned by the launcher's last line, after the trace is
+# written: spec `Recorder-CLI-Conventions.md` §6 "Exit Codes" makes the
+# recorder's exit code a pass-through of the target's, and the trace must be
+# written however the script ends (`Recording-Backends/Shell-Recorder.md`,
+# "Invocation Flow" steps 10 and 11). The status is captured with `||`
+# rather than read from `$?` on the next line, because this launcher runs
+# under `set -eo pipefail`: a non-zero status from a plain command would end the
+# launcher right here, before the trace writer runs, and the `EXIT` trap
+# would delete the event file. A command on the left of `||` is exempt
+# from `errexit`.
+_ct_exit_code=0
+"$_ct_zsh" "$_ct_script_dir/recorder.zsh" "$_ct_script" "${_ct_script_args[@]}" 3>"$_ct_events_file" || _ct_exit_code=$?
 
 # Feed the recorded event stream to the trace writer, passing the program
 # name and its positional argv for metadata + top-level call-arg staging.
@@ -280,17 +294,61 @@ _ct_exit_code=$?
 #
 # The CTFS format is hard-pinned in the writer, which rejects `--format`;
 # no such flag is forwarded here.
+#
+# The writer exits 1 when it ends without writing a trace: the container
+# could not be created, no START event arrived, or finalizing failed
+# (`main` in crates/ct-shell-trace-writer/src/main.rs). Its status is captured
+# with `||` for the same `errexit` reason as the recorder's above, so that the
+# check below reports the failure instead of the launcher ending silently
+# here.
+_ct_writer_status=0
 if (( ${#_ct_script_args[@]} > 0 )); then
     "$_ct_trace_writer" \
         --out-dir "$_ct_output_dir" \
         --program "$_ct_script_native" \
         --args "${_ct_script_args[@]}" \
-        < "$_ct_events_file"
+        < "$_ct_events_file" || _ct_writer_status=$?
 else
     "$_ct_trace_writer" \
         --out-dir "$_ct_output_dir" \
         --program "$_ct_script_native" \
-        < "$_ct_events_file"
+        < "$_ct_events_file" || _ct_writer_status=$?
+fi
+
+# A recording that wrote no trace fails here, before the launcher writes its
+# own sidecars and makes the directory look like a bundle: exiting 0 then
+# would be the silent-incompleteness pattern spec `CLI/ct/record.md`
+# ("Corner Cases") forbids. The writer's status is the authority: a
+# `<script>.ct` that is present after a failed writer is one a previous run
+# left in the same directory, not this run's trace. The test for the file
+# remains as a second check, for a writer that exits 0 without one.
+#
+# The exit code is 1 whatever the script's status, as spec
+# `Recorder-CLI-Conventions.md` §6 "Exit Codes" asks of recorder errors; the
+# script's status is reported in the message instead of being lost.
+#
+# The writer names the container after the script: the basename of
+# `--program` (`_ct_script_native`) without its last extension, a leading
+# dot not counting as one
+# (Rust's `Path::file_stem`, applied in `trace_writer_begin_events`,
+# codetracer-trace-format `codetracer_trace_writer_ffi/src/writer.rs`).
+# https://doc.rust-lang.org/std/path/struct.Path.html#method.file_stem
+# `-f` rather than `-e`: a directory of that name is not a trace.
+_ct_trace_base="${_ct_script_native##*/}"
+_ct_trace_stem="${_ct_trace_base%.*}"
+[[ -n "$_ct_trace_stem" ]] || _ct_trace_stem="$_ct_trace_base"
+_ct_trace_file="$_ct_output_dir/$_ct_trace_stem.ct"
+if (( _ct_writer_status != 0 )) || [[ ! -f "$_ct_trace_file" ]]; then
+    if (( _ct_writer_status != 0 )); then
+        _ct_message="Error: recording failed: the trace writer exited with status $_ct_writer_status without writing $_ct_trace_file"
+    else
+        _ct_message="Error: recording failed: the trace writer finished without writing $_ct_trace_file"
+    fi
+    if (( _ct_exit_code != 0 )); then
+        _ct_message+=" (the script exited with status $_ct_exit_code)"
+    fi
+    echo "$_ct_message" >&2
+    exit 1
 fi
 
 # ============================================================================

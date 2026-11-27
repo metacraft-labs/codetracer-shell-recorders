@@ -1,7 +1,7 @@
 use std::fs;
 
 use codetracer_trace_types::ValueRecord;
-use codetracer_trace_writer_nim::NimTraceReaderHandle;
+use codetracer_trace_writer_nim::{decode_cbor_value_record, NimTraceReaderHandle};
 
 use ct_shell_trace_writer::trace_bridge::TraceBridge;
 use ct_shell_trace_writer::wire_protocol::parse_line;
@@ -258,6 +258,97 @@ EXIT code=0"#;
     );
 }
 
+/// Feed `input` through a `TraceBridge` for `program` and return every call
+/// in the resulting trace as (function name, decoded return value).
+fn record_calls(program: &str, input: &str) -> Vec<(String, ValueRecord)> {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let output_dir = tmp_dir.path();
+    let mut bridge = TraceBridge::new(output_dir, program, &[]);
+    for line_str in input.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let event =
+            parse_line(line_str).unwrap_or_else(|e| panic!("failed to parse '{line_str}': {e}"));
+        bridge
+            .handle_event(event)
+            .unwrap_or_else(|e| panic!("failed to handle event from '{line_str}': {e}"));
+    }
+    bridge.finish().expect("finish() should succeed");
+
+    let stem = std::path::Path::new(program).file_stem().unwrap();
+    let ct_path = output_dir.join(stem).with_extension("ct");
+    let reader = NimTraceReaderHandle::open(&ct_path.to_string_lossy())
+        .unwrap_or_else(|e| panic!("failed to open Nim CTFS reader for {ct_path:?}: {e}"));
+    (0..reader.call_count())
+        .map(|key| {
+            let json = reader.call_json(key).expect("read call JSON");
+            let call: serde_json::Value = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("invalid call JSON: {e}: {json}"));
+            let function_id = call["function_id"].as_u64().expect("function_id");
+            let name = reader.function(function_id).expect("function name");
+            // `decode_cbor_value_record` rather than `decode_value_record`:
+            // a frame finalisation closed without a value carries a byte
+            // that is not a CBOR item, and must surface as a wrong value in
+            // the assertion message rather than as a decode panic.
+            let bytes = bytes_from_json_array(&call["return_value"]);
+            (name, decode_cbor_value_record(&bytes))
+        })
+        .collect()
+}
+
+fn assert_returns_int(calls: &[(String, ValueRecord)], function: &str, expected: i64) {
+    let found: Vec<&ValueRecord> = calls
+        .iter()
+        .filter(|(name, _)| name == function)
+        .map(|(_, value)| value)
+        .collect();
+    assert_eq!(found.len(), 1, "expected one {function} call: {calls:?}");
+    match found[0] {
+        ValueRecord::Int { i, .. } if *i == expected => {}
+        other => panic!("{function} should return Int {expected}, got {other:?}; calls: {calls:?}"),
+    }
+}
+
+/// A script that calls `exit` inside nested functions ends with two user
+/// frames open: no `RETURN` reaches them. The `EXIT` event must close each
+/// open frame with the exit status, and then `<script>` with the exit code,
+/// instead of closing only the innermost frame and leaving `<script>` for
+/// finalisation to close without a value.
+#[test]
+fn test_exit_closes_frames_left_open_by_exit_inside_functions() {
+    let calls = record_calls(
+        "/tmp/nested_exit.sh",
+        r#"START program=/tmp/nested_exit.sh shell=bash shell_version=5.2.0
+PATH file=/tmp/nested_exit.sh
+FUNC name=outer file=/tmp/nested_exit.sh line=2
+FUNC name=inner file=/tmp/nested_exit.sh line=5
+STEP file=/tmp/nested_exit.sh line=8
+CALL name=outer
+STEP file=/tmp/nested_exit.sh line=3
+CALL name=inner
+STEP file=/tmp/nested_exit.sh line=6
+EXIT code=4"#,
+    );
+    assert_returns_int(&calls, "inner", 4);
+    assert_returns_int(&calls, "outer", 4);
+    assert_returns_int(&calls, "<script>", 4);
+}
+
+/// A `RETURN` with no user frame open (the recorder lost the matching
+/// `CALL`) must not close the writer-owned `<script>` frame, or `EXIT` would
+/// then close `<toplevel>` with the exit code and leave `<script>` without it.
+#[test]
+fn test_unmatched_return_does_not_close_the_script_frame() {
+    let calls = record_calls(
+        "/tmp/stray_return.sh",
+        r#"START program=/tmp/stray_return.sh shell=bash shell_version=5.2.0
+PATH file=/tmp/stray_return.sh
+STEP file=/tmp/stray_return.sh line=1
+RETURN status=7
+STEP file=/tmp/stray_return.sh line=2
+EXIT code=3"#,
+    );
+    assert_returns_int(&calls, "<script>", 3);
+}
+
 // ---------------------------------------------------------------------------
 // CLI convention compliance: CTFS is the only output format.
 //
@@ -361,4 +452,307 @@ fn test_cli_version_prints_canonical_line() {
         stdout.starts_with("ct-shell-trace-writer "),
         "--version line should start with the binary name; got: {stdout}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Script arguments that look like writer options.
+//
+// The launchers pass the recorded script's own arguments to the writer after
+// `--args`, which ends the writer's options: everything after it belongs to
+// the script (spec `CLI/recorders/shell.md`, "Options", `--`). A script
+// argument of `-h`, `--help`, `-V` or `--version` must therefore be recorded
+// as the script's `$1`, not answered with the writer's usage or version, and
+// the writer must still write the trace (`Recorder-CLI-Conventions.md` §6:
+// exit 0 means "recording completed, trace written").
+// ---------------------------------------------------------------------------
+
+/// The writer's own help and version flags, in both spellings.
+const HELP_AND_VERSION_FLAGS: [&str; 4] = ["-h", "--help", "-V", "--version"];
+
+/// Run the writer binary with `args`, feeding `stdin` to it, and return its
+/// captured output.
+fn run_writer(args: &[&str], stdin: &str) -> std::process::Output {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let bin = locate_trace_writer_binary();
+    let mut child = Command::new(&bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to execute {bin:?}: {e}"));
+    // A writer that exits without reading its input (the defect this guards
+    // against) closes the pipe early; a broken pipe here is that outcome,
+    // which the assertions on the output report, not a harness failure.
+    let _ = child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin.as_bytes());
+    child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("failed to wait for {bin:?}: {e}"))
+}
+
+#[test]
+fn test_cli_script_argument_that_is_a_help_or_version_flag_is_recorded() {
+    for flag in HELP_AND_VERSION_FLAGS {
+        let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let out_dir = tmp_dir.path().to_str().expect("utf-8 temp dir");
+        let events = "START program=/tmp/args.sh shell=bash shell_version=5.2.0\n\
+                      PATH file=/tmp/args.sh\n\
+                      STEP file=/tmp/args.sh line=1\n\
+                      EXIT code=0\n";
+        let output = run_writer(
+            &[
+                "--out-dir",
+                out_dir,
+                "--program",
+                "/tmp/args.sh",
+                "--args",
+                flag,
+            ],
+            events,
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "`--args {flag}`: the writer must exit 0; status {:?}, stderr={stderr}",
+            output.status
+        );
+        assert!(
+            stdout.is_empty(),
+            "`--args {flag}`: the writer must not print its version (or anything) \
+             to stdout; stdout={stdout}"
+        );
+        assert!(
+            !stderr.contains("Usage:"),
+            "`--args {flag}`: the writer must not print its usage; stderr={stderr}"
+        );
+
+        let ct_path = tmp_dir.path().join("args.ct");
+        assert!(
+            ct_path.is_file(),
+            "`--args {flag}`: args.ct must be written; files: {:?}; stderr={stderr}",
+            fs::read_dir(tmp_dir.path())
+                .map(|rd| rd
+                    .filter_map(|e| e.ok().map(|e| e.file_name()))
+                    .collect::<Vec<_>>())
+                .unwrap_or_default()
+        );
+
+        // The flag is the script's `$1`, carried by the `<script>` entry call
+        // (the second call, after the writer-owned argument-free root).
+        let reader = NimTraceReaderHandle::open(&ct_path.to_string_lossy())
+            .unwrap_or_else(|e| panic!("failed to open Nim CTFS reader for {ct_path:?}: {e}"));
+        let calls: Vec<serde_json::Value> = (0..reader.call_count())
+            .map(|key| {
+                let json = reader.call_json(key).expect("read call JSON");
+                serde_json::from_str(&json)
+                    .unwrap_or_else(|e| panic!("invalid call JSON: {e}: {json}"))
+            })
+            .collect();
+        assert_eq!(calls.len(), 2, "expected root and script: {calls:#?}");
+        let script_fn = calls[1]["function_id"].as_u64().expect("function_id");
+        assert_eq!(
+            reader.function(script_fn).expect("function name"),
+            "<script>"
+        );
+        assert_call_args(
+            &reader,
+            &calls[1..2],
+            &[("$1", ExpectedArgValue::String(flag))],
+        );
+    }
+}
+
+/// The short spellings of the writer's own options still work when given as
+/// options (before `--args`), alongside the long ones covered above.
+#[test]
+fn test_cli_short_help_and_version_options_still_work() {
+    let version = run_writer(&["-V"], "");
+    assert!(version.status.success(), "-V should exit zero");
+    let stdout = String::from_utf8_lossy(&version.stdout);
+    assert_eq!(
+        stdout,
+        format!("ct-shell-trace-writer {}\n", env!("CARGO_PKG_VERSION")),
+        "-V should print exactly the version line"
+    );
+
+    let help = run_writer(&["-h"], "");
+    assert!(help.status.success(), "-h should exit zero");
+    let stderr = String::from_utf8_lossy(&help.stderr);
+    assert!(
+        stderr.contains("Usage:"),
+        "-h should print usage; stderr={stderr}"
+    );
+}
+
+/// `--help` / `--version` given among the writer's options, before `--args`,
+/// is answered even when other options precede it and script arguments
+/// follow; no trace is written.
+#[test]
+fn test_cli_help_and_version_options_before_args_are_answered() {
+    for flag in HELP_AND_VERSION_FLAGS {
+        let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let out_dir = tmp_dir.path().join("out");
+        let out_dir_str = out_dir.to_str().expect("utf-8 temp dir");
+        let output = run_writer(
+            &[
+                "--out-dir",
+                out_dir_str,
+                "--program",
+                "/tmp/args.sh",
+                flag,
+                "--args",
+                "plain",
+            ],
+            "",
+        );
+        assert!(
+            output.status.success(),
+            "`{flag}` before --args should exit zero; status {:?}",
+            output.status
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if flag == "-V" || flag == "--version" {
+            assert!(
+                stdout.starts_with("ct-shell-trace-writer "),
+                "`{flag}` should print the version; stdout={stdout}"
+            );
+        } else {
+            assert!(
+                stderr.contains("Usage:"),
+                "`{flag}` should print usage; stderr={stderr}"
+            );
+        }
+        assert!(
+            !out_dir.exists(),
+            "`{flag}`: help/version must not create the output directory"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A run that writes no trace must not exit 0.
+//
+// `Recorder-CLI-Conventions.md` §6 "Exit Codes": 0 means "recording
+// completed, trace written", 1 "recording failed (recorder error)"; and
+// `CLI/ct/record.md` "Corner Cases" names a recorder that produced no trace
+// but exited 0 as the silent-incompleteness pattern. Only the writer knows
+// whether it wrote the trace (a caller that tests for `<script>.ct`
+// afterwards cannot tell a fresh container from one a previous run left), so
+// the writer's own exit status must say so. These run the real binary on
+// real filesystem conditions; nothing is mocked.
+// ---------------------------------------------------------------------------
+
+/// A well-formed event stream for `/tmp/args.sh`, from START to EXIT.
+const ARGS_SCRIPT_EVENTS: &str = "START program=/tmp/args.sh shell=bash shell_version=5.2.0\n\
+                                  PATH file=/tmp/args.sh\n\
+                                  STEP file=/tmp/args.sh line=1\n\
+                                  EXIT code=0\n";
+
+/// The container cannot be created because `<out-dir>/args.ct` is already a
+/// directory: the writer must fail, naming the container it could not create,
+/// rather than warn and exit 0.
+#[test]
+fn test_cli_exits_nonzero_when_the_trace_container_cannot_be_created() {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let ct_path = tmp_dir.path().join("args.ct");
+    fs::create_dir(&ct_path).expect("create the blocking args.ct directory");
+    let out_dir = tmp_dir.path().to_str().expect("utf-8 temp dir");
+
+    let output = run_writer(
+        &["--out-dir", out_dir, "--program", "/tmp/args.sh"],
+        ARGS_SCRIPT_EVENTS,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a writer that could not create {ct_path:?} must exit 1; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("ct-shell-trace-writer: error:")
+            && stderr.contains("failed to create streaming CTFS container")
+            && stderr.contains(&*ct_path.to_string_lossy()),
+        "stderr must report, as an error, the container that could not be created; \
+         stderr={stderr}"
+    );
+    assert!(
+        ct_path.is_dir(),
+        "the blocking directory must be left as it was"
+    );
+    assert!(
+        !tmp_dir.path().join("symbols.json").exists(),
+        "a failed recording must not write the symbols.json sidecar"
+    );
+}
+
+/// An empty event stream carries no START, so no trace is written: the writer
+/// must fail and say why.
+#[test]
+fn test_cli_exits_nonzero_on_an_empty_event_stream() {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let out_dir = tmp_dir.path().to_str().expect("utf-8 temp dir");
+
+    let output = run_writer(&["--out-dir", out_dir, "--program", "/tmp/args.sh"], "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a writer that received no START must exit 1; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("ct-shell-trace-writer: error:")
+            && stderr.contains("no trace was written")
+            && stderr.contains("START"),
+        "stderr must say no trace was written because no START arrived; stderr={stderr}"
+    );
+    assert!(
+        !tmp_dir.path().join("args.ct").exists(),
+        "no container may appear for a stream without START"
+    );
+}
+
+/// A `<script>.ct` left by a previous run is not this run's trace. With a
+/// stream that has events but no START, the writer writes nothing and must
+/// fail even though a regular `args.ct` is present, and must leave that old
+/// file untouched.
+#[test]
+fn test_cli_exits_nonzero_without_start_even_over_a_stale_trace() {
+    let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let ct_path = tmp_dir.path().join("args.ct");
+    fs::write(&ct_path, b"stale trace from a previous run").expect("write stale args.ct");
+    let out_dir = tmp_dir.path().to_str().expect("utf-8 temp dir");
+
+    let events_without_start = "PATH file=/tmp/args.sh\n\
+                                STEP file=/tmp/args.sh line=1\n\
+                                EXIT code=0\n";
+    for (label, events) in [("empty stream", ""), ("no START", events_without_start)] {
+        let output = run_writer(&["--out-dir", out_dir, "--program", "/tmp/args.sh"], events);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{label}: a stale args.ct must not make a run without START succeed; \
+             stderr={stderr}"
+        );
+        assert!(
+            stderr.contains("no trace was written"),
+            "{label}: stderr must say no trace was written; stderr={stderr}"
+        );
+        assert_eq!(
+            fs::read(&ct_path).expect("read args.ct"),
+            b"stale trace from a previous run",
+            "{label}: the old file must be left as it was"
+        );
+    }
 }

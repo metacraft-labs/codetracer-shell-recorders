@@ -19,6 +19,14 @@
 #     (the cairo / cardano / ... / js / python / ruby `--full` upgrade)
 #     so a recorder regression that silently drops or corrupts a value
 #     is caught loudly rather than passing a substring-presence check.
+#   * A script with no arguments records (and runs under `_DISABLED=1`) on
+#     the installed Bash and on Bash 4.0, the specification's floor, named
+#     by CT_TEST_BASH_4_0; a Bash 3.2 (CT_TEST_BASH_3_2) is refused by name.
+#     Both variables are exported by the Linux dev shell (flake.nix).
+#   * The recorded script sees its own absolute path as `$0`, so a
+#     `BASH_SOURCE[0] == $0` entry-point guard holds, on both Bashes.
+#   * The EXIT event carries the status the process exits with when the
+#     script's EXIT action changes it, on both Bashes.
 #
 # Usage: bash tests/test_bash_recorder_cli.sh
 #
@@ -478,6 +486,514 @@ RETURN_I="$(jq -r '
 [[ "${RETURN_I}" == "0" ]] \
   || fail "T7: call_exit return_value should be 0 (success), got ${RETURN_I}"
 pass "T7 exact return: call_exit → Int(0)"
+
+# ---------------------------------------------------------------------------
+# T8. A script recorded with no arguments, under the oldest supported Bash.
+#
+# The Shell Recorder specification (`Recording-Backends/Shell-Recorder.md`,
+# "Supported Shells") supports Bash 4.0 and newer. The launcher runs under
+# `set -u`, and before Bash 4.4 expanding an array with no elements under
+# `nounset` is an "unbound variable" error (Bash CHANGES, bash-4.4-rc2, "New
+# Features in Bash"); on 4.0 `"$@"` with no positional parameters is one too.
+# The dev shell's own Bash 5 cannot fail for that reason, so the floor
+# release is named by CT_TEST_BASH_4_0, which the Linux dev shell exports
+# (see `oldBashEnv` in flake.nix). CT_TEST_BASH_3_2 names a Bash below the
+# floor, which the launcher must refuse by name before it runs anything.
+#
+# Each Bash under test is selected through PATH: a directory holding only a
+# `bash` symlink is put first, so the entry point's `#!/usr/bin/env bash`,
+# the launcher's own shebang, and its `bash recorder.sh` all resolve to it.
+# ---------------------------------------------------------------------------
+
+NOARG_FIXTURE="${WORK_DIR}/noarg.sh"
+# Prints its argument count and each argument in brackets, so an empty
+# argument, or one with spaces, that the launcher drops or splits shows up.
+cat > "${NOARG_FIXTURE}" <<'EOF'
+_seen=""
+for _a in "$@"; do _seen="${_seen}[${_a}]"; done
+echo "noarg-marker argc=$# args=${_seen}"
+EOF
+
+[[ -x "${BIN}" ]] || fail "T8: entry point ${BIN} is not executable"
+
+# bash_path_dir <label> <bash-binary> -- prints a fresh directory that holds
+# only a `bash` symlink to <bash-binary>.
+bash_path_dir() {
+  local dir="${WORK_DIR}/path-$1"
+  mkdir -p "${dir}"
+  ln -sfn "$2" "${dir}/bash"
+  printf '%s\n' "${dir}"
+}
+
+# run_entry <path-prefix> <out-dir> [env-assignments...] -- [launcher-args...]
+# Runs the `codetracer-bash-recorder` entry point as
+# `--out-dir <out-dir> <launcher-args...>` (the script and its arguments,
+# optionally after `--`) with <path-prefix> (may be empty) prepended to
+# PATH. Sets RUN_RC, RUN_STDOUT and RUN_STDERR; never aborts the test on a
+# non-zero exit.
+run_entry() {
+  local prefix="$1" out_dir="$2"
+  shift 2
+  local -a env_vars=()
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    env_vars+=("$1")
+    shift
+  done
+  [[ $# -gt 0 ]] && shift
+  local run_path="${PATH}"
+  [[ -n "${prefix}" ]] && run_path="${prefix}:${PATH}"
+  RUN_RC=0
+  env ${env_vars[@]+"${env_vars[@]}"} PATH="${run_path}" \
+    "${BIN}" --out-dir "${out_dir}" "$@" \
+    >"${WORK_DIR}/run.out" 2>"${WORK_DIR}/run.err" || RUN_RC=$?
+  RUN_STDOUT="$(cat "${WORK_DIR}/run.out")"
+  RUN_STDERR="$(cat "${WORK_DIR}/run.err")"
+}
+
+# expect_recorded <label> <out-dir> <expected-script-line> <expected-args-json>
+expect_recorded() {
+  local label="$1" out_dir="$2" line="$3" args_json="$4"
+  local -a cts=()
+  [[ "${RUN_RC}" == "0" ]] \
+    || fail "${label}: launcher exited ${RUN_RC}; stderr: ${RUN_STDERR}"
+  if grep -qF "unbound variable" <<< "${RUN_STDERR}"; then
+    fail "${label}: stderr reports an unbound variable: ${RUN_STDERR}"
+  fi
+  grep -qxF "${line}" <<< "${RUN_STDOUT}" \
+    || fail "${label}: script output '${line}' missing; stdout: ${RUN_STDOUT}"
+  shopt -s nullglob
+  cts=("${out_dir}"/*.ct)
+  shopt -u nullglob
+  [[ "${#cts[@]}" == "1" ]] \
+    || fail "${label}: expected exactly one *.ct in ${out_dir}, found ${#cts[@]}: $(ls -A "${out_dir}" 2>/dev/null)"
+  jq -e --argjson want "${args_json}" '.args == $want' \
+    "${out_dir}/trace_db_metadata.json" >/dev/null \
+    || fail "${label}: trace_db_metadata.json args is not ${args_json} (or the file is not valid JSON): $(cat "${out_dir}/trace_db_metadata.json" 2>&1)"
+  pass "${label}: exit 0, one .ct, script ran, args ${args_json}"
+}
+
+# expect_ran_unrecorded <label> -- the _DISABLED short-circuit with no argument.
+expect_ran_unrecorded() {
+  local label="$1"
+  [[ "${RUN_RC}" == "0" ]] \
+    || fail "${label}: launcher exited ${RUN_RC}; stderr: ${RUN_STDERR}"
+  if grep -qF "unbound variable" <<< "${RUN_STDERR}"; then
+    fail "${label}: stderr reports an unbound variable: ${RUN_STDERR}"
+  fi
+  grep -qxF "noarg-marker argc=0 args=" <<< "${RUN_STDOUT}" \
+    || fail "${label}: the script did not run; stdout: ${RUN_STDOUT}; stderr: ${RUN_STDERR}"
+  pass "${label}: script ran, exit 0"
+}
+
+# check_no_arg_cases <label> <path-prefix> -- the no-argument recording
+# (with the script given plainly and after `--`, the two places the launcher
+# reads `"$@"`), the no-argument _DISABLED run, the one-argument control, and
+# an empty argument plus arguments with spaces, which the guarded array
+# expansions must pass through unchanged.
+check_no_arg_cases() {
+  local label="$1" prefix="$2"
+  local out="${WORK_DIR}/t8-${label}"
+  run_entry "${prefix}" "${out}-noarg" -- "${NOARG_FIXTURE}"
+  expect_recorded "T8 ${label} no argument" "${out}-noarg" \
+    "noarg-marker argc=0 args=" '[]'
+  run_entry "${prefix}" "${out}-dashdash" -- -- "${NOARG_FIXTURE}"
+  expect_recorded "T8 ${label} no argument after --" "${out}-dashdash" \
+    "noarg-marker argc=0 args=" '[]'
+  run_entry "${prefix}" "${out}-disabled" CODETRACER_BASH_RECORDER_DISABLED=1 \
+    -- "${NOARG_FIXTURE}"
+  expect_ran_unrecorded "T8 ${label} _DISABLED=1, no argument"
+  run_entry "${prefix}" "${out}-onearg" -- "${NOARG_FIXTURE}" one
+  expect_recorded "T8 ${label} one argument (control)" "${out}-onearg" \
+    "noarg-marker argc=1 args=[one]" '["one"]'
+  run_entry "${prefix}" "${out}-quoted" -- "${NOARG_FIXTURE}" "" "a b" "  c  "
+  expect_recorded "T8 ${label} empty and spaced arguments" "${out}-quoted" \
+    "noarg-marker argc=3 args=[][a b][  c  ]" '["","a b","  c  "]'
+}
+
+# The Bash the dev shell installs (5.x): the same cases must pass there too.
+check_no_arg_cases "installed-bash-$(bash -c 'echo "${BASH_VERSION}"')" ""
+
+if [[ -n "${CT_TEST_BASH_4_0:-}" ]]; then
+  [[ -x "${CT_TEST_BASH_4_0}" ]] \
+    || fail "T8: CT_TEST_BASH_4_0=${CT_TEST_BASH_4_0} is not executable"
+  BASH40_DIR="$(bash_path_dir bash40 "${CT_TEST_BASH_4_0}")"
+  # Positive control: through this PATH, `bash` really is 4.0. Without it a
+  # misconfigured fixture would silently test the installed Bash 5 instead.
+  BASH40_SEEN="$(PATH="${BASH40_DIR}:${PATH}" bash -c 'echo "${BASH_VERSION}"')"
+  [[ "${BASH40_SEEN}" == 4.0.* ]] \
+    || fail "T8: bash through ${BASH40_DIR} reports ${BASH40_SEEN}, expected 4.0.*"
+  # shellcheck disable=SC2016 # expanded by the Bash under test, not here
+  BASH40_ENV_SEEN="$(PATH="${BASH40_DIR}:${PATH}" env bash -c 'echo "${BASH_VERSION}"')"
+  [[ "${BASH40_ENV_SEEN}" == 4.0.* ]] \
+    || fail "T8: 'env bash' through ${BASH40_DIR} reports ${BASH40_ENV_SEEN}, expected 4.0.*"
+  pass "T8 control: PATH selects Bash ${BASH40_SEEN}"
+  check_no_arg_cases "bash-4.0" "${BASH40_DIR}"
+  # The launcher records the `bash --version` it ran with; it must be 4.0.
+  jq -e '.bash_version | startswith("4.0.")' \
+    "${WORK_DIR}/t8-bash-4.0-noarg/trace_db_metadata.json" >/dev/null \
+    || fail "T8: the Bash 4.0 recording names another Bash: $(cat "${WORK_DIR}/t8-bash-4.0-noarg/trace_db_metadata.json")"
+  pass "T8 bash-4.0: the recording's bash_version is 4.0"
+elif [[ "$(uname -s)" == Linux ]]; then
+  fail "T8: CT_TEST_BASH_4_0 is unset; run this test in the dev shell (nix develop), which exports it on Linux — it must not silently skip"
+else
+  echo "skipped: T8 under Bash 4.0 — CT_TEST_BASH_4_0 is unset (Linux dev shell only)"
+fi
+
+# T9. A Bash older than 4.0 is refused by name, before the script runs.
+if [[ -n "${CT_TEST_BASH_3_2:-}" ]]; then
+  [[ -x "${CT_TEST_BASH_3_2}" ]] \
+    || fail "T9: CT_TEST_BASH_3_2=${CT_TEST_BASH_3_2} is not executable"
+  BASH32_DIR="$(bash_path_dir bash32 "${CT_TEST_BASH_3_2}")"
+  BASH32_SEEN="$(PATH="${BASH32_DIR}:${PATH}" bash -c 'echo "${BASH_VERSION}"')"
+  [[ "${BASH32_SEEN}" == 3.2.* ]] \
+    || fail "T9: bash through ${BASH32_DIR} reports ${BASH32_SEEN}, expected 3.2.*"
+  OUT_DIR_T9="${WORK_DIR}/t9-bash32"
+  run_entry "${BASH32_DIR}" "${OUT_DIR_T9}" -- "${NOARG_FIXTURE}" one
+  [[ "${RUN_RC}" == "1" ]] \
+    || fail "T9: launcher under Bash ${BASH32_SEEN} must exit 1, got ${RUN_RC}; stdout: ${RUN_STDOUT}"
+  grep -qF "Bash ${BASH32_SEEN} (${BASH32_DIR}/bash)" <<< "${RUN_STDERR}" \
+    || fail "T9: error must name the Bash found (${BASH32_SEEN}, ${BASH32_DIR}/bash); stderr: ${RUN_STDERR}"
+  grep -qF "4.0 or newer" <<< "${RUN_STDERR}" \
+    || fail "T9: error must say Bash 4.0 or newer is required; stderr: ${RUN_STDERR}"
+  if grep -qF "noarg-marker" <<< "${RUN_STDOUT}"; then
+    fail "T9: the script must not run under an unsupported Bash; stdout: ${RUN_STDOUT}"
+  fi
+  [[ ! -e "${OUT_DIR_T9}" ]] \
+    || fail "T9: an unsupported Bash must not create ${OUT_DIR_T9}"
+  pass "T9 Bash ${BASH32_SEEN} refused (exit ${RUN_RC}), script not run"
+
+  # Started as `<bash-3.2> launcher.sh` with the installed Bash first on
+  # PATH, the error must name the interpreter running the launcher, not the
+  # `bash` on PATH.
+  OUT_DIR_T9_DIRECT="${WORK_DIR}/t9-bash32-direct"
+  RUN_RC=0
+  "${CT_TEST_BASH_3_2}" "${LAUNCHER}" --out-dir "${OUT_DIR_T9_DIRECT}" \
+    "${NOARG_FIXTURE}" >"${WORK_DIR}/run.out" 2>"${WORK_DIR}/run.err" || RUN_RC=$?
+  RUN_STDOUT="$(cat "${WORK_DIR}/run.out")"
+  RUN_STDERR="$(cat "${WORK_DIR}/run.err")"
+  [[ "${RUN_RC}" == "1" ]] \
+    || fail "T9: '${CT_TEST_BASH_3_2} launcher.sh' must exit 1, got ${RUN_RC}; stdout: ${RUN_STDOUT}"
+  grep -qF "Bash ${BASH32_SEEN} (${CT_TEST_BASH_3_2})" <<< "${RUN_STDERR}" \
+    || fail "T9: error must name the interpreter running the launcher (${CT_TEST_BASH_3_2}); stderr: ${RUN_STDERR}"
+  if grep -qF "noarg-marker" <<< "${RUN_STDOUT}"; then
+    fail "T9: the script must not run under an unsupported Bash; stdout: ${RUN_STDOUT}"
+  fi
+  [[ ! -e "${OUT_DIR_T9_DIRECT}" ]] \
+    || fail "T9: an unsupported Bash must not create ${OUT_DIR_T9_DIRECT}"
+  pass "T9 '<bash-3.2> launcher.sh' refused, naming ${CT_TEST_BASH_3_2}"
+elif [[ "$(uname -s)" == Linux ]]; then
+  fail "T9: CT_TEST_BASH_3_2 is unset; run this test in the dev shell (nix develop), which exports it on Linux — it must not silently skip"
+else
+  echo "skipped: T9 under Bash 3.2 — CT_TEST_BASH_3_2 is unset (Linux dev shell only)"
+fi
+
+# ---------------------------------------------------------------------------
+# T10. A script argument that is one of the recorder's or the writer's own
+# flags (`-h`, `--help`, `-V`, `--version`) belongs to the script.
+#
+# Spec `CLI/recorders/shell.md`, "Options": after the script, everything is
+# the script's arguments. The launcher hands them to `ct-shell-trace-writer`
+# after `--args`, so the writer must not answer them with its own usage or
+# version: the recording must exit 0 with exactly one trace, print only the
+# script's output, and record the flag as the `<script>` call's `$1`
+# (`Recorder-CLI-Conventions.md` §6: exit 0 means "trace written").
+# Each flag is given both plainly after the script and after `--`.
+# ---------------------------------------------------------------------------
+
+ARGS_FIXTURE="${WORK_DIR}/args.sh"
+cat > "${ARGS_FIXTURE}" <<'EOF'
+echo "args: $*"
+EOF
+
+for flag in -h --help -V --version; do
+  for form in plain dashdash; do
+    label="T10 script argument ${flag} (${form})"
+    out="${WORK_DIR}/t10-${flag#--}-${form}"
+    if [[ "${form}" == dashdash ]]; then
+      run_entry "" "${out}" -- -- "${ARGS_FIXTURE}" "${flag}"
+    else
+      run_entry "" "${out}" -- "${ARGS_FIXTURE}" "${flag}"
+    fi
+    [[ "${RUN_RC}" == "0" ]] \
+      || fail "${label}: launcher exited ${RUN_RC}; stdout: ${RUN_STDOUT}; stderr: ${RUN_STDERR}"
+    [[ "${RUN_STDOUT}" == "args: ${flag}" ]] \
+      || fail "${label}: stdout must be exactly the script's 'args: ${flag}'; got: ${RUN_STDOUT}"
+    shopt -s nullglob
+    cts=("${out}"/*.ct)
+    shopt -u nullglob
+    [[ "${#cts[@]}" == "1" && -f "${out}/args.ct" ]] \
+      || fail "${label}: expected exactly one *.ct (args.ct) in ${out}, found ${#cts[@]}: $(ls -A "${out}" 2>/dev/null)"
+    SCRIPT_ARGS="$(run_ct_print --full --strip-paths "${out}/args.ct" | jq -c '
+      [.events[] | select(.kind == "call_entry" and .function == "<script>")
+       | [.args[] | [.varname, .value.kind, .value.text]]]')"
+    [[ "${SCRIPT_ARGS}" == "[[[\"\$1\",\"String\",\"${flag}\"]]]" ]] \
+      || fail "${label}: the <script> call must carry \$1=String(\"${flag}\") and nothing else; got: ${SCRIPT_ARGS}"
+    pass "${label}: exit 0, one .ct, stdout is the script's, <script>(\$1=\"${flag}\")"
+  done
+done
+
+# ---------------------------------------------------------------------------
+# T11. A recording whose trace writer finishes without writing `<script>.ct`
+# fails: a message on stderr naming the missing trace, and exit 1.
+#
+# Spec `CLI/ct/record.md`, "Corner Cases": a recorder that produced no trace
+# but exited 0 is the silent-incompleteness pattern. `Recorder-CLI-
+# Conventions.md` §6 gives a recorder error exit 1 "regardless of the target
+# program's exit code", so a script that itself failed still makes the
+# launcher exit 1; the message carries the script's status instead.
+#
+# Real ways for the writer to end with no trace, none of them a stub; the
+# writer exits 1 for each, and the launcher must still say why:
+#   * `<out-dir>/args.ct` is already a directory, so the writer cannot create
+#     the container.
+#   * A read-only `args.ct` left by a previous run sits in a read-only output
+#     directory: the writer cannot create the container, and the old file
+#     must not pass for this run's trace.
+#   * The recorder cannot move the event channel to a descriptor of 10 or
+#     above (an open-files limit of 12), so no START event reaches the writer
+#     and `TraceBridge::finish` reports that no trace was written. Here the
+#     recorder must also stop before the script runs, and say which
+#     descriptor it could not open.
+#   * The recorder cannot write START (FD 3 on /dev/full): it must likewise
+#     stop before the script runs.
+# ---------------------------------------------------------------------------
+
+FAIL3_FIXTURE="${WORK_DIR}/args3.sh"
+cat > "${FAIL3_FIXTURE}" <<'EOF'
+echo "args: $*"
+exit 3
+EOF
+
+# expect_no_trace_failure <label> <trace-path> <script-stdout> [status-phrase]
+expect_no_trace_failure() {
+  local label="$1" trace="$2" stdout="$3" status_phrase="${4:-}"
+  [[ "${RUN_RC}" == "1" ]] \
+    || fail "${label}: launcher must exit 1, got ${RUN_RC}; stdout: ${RUN_STDOUT}; stderr: ${RUN_STDERR}"
+  [[ "${RUN_STDOUT}" == "${stdout}" ]] \
+    || fail "${label}: the script must still run; stdout: ${RUN_STDOUT}"
+  grep -qF "recording failed" <<< "${RUN_STDERR}" \
+    || fail "${label}: stderr must say the recording failed; stderr: ${RUN_STDERR}"
+  grep -qF "${trace}" <<< "${RUN_STDERR}" \
+    || fail "${label}: stderr must name the missing trace ${trace}; stderr: ${RUN_STDERR}"
+  if [[ -n "${status_phrase}" ]]; then
+    grep -qF "${status_phrase}" <<< "${RUN_STDERR}" \
+      || fail "${label}: stderr must report '${status_phrase}'; stderr: ${RUN_STDERR}"
+  fi
+  pass "${label}: exit 1, stderr names ${trace##*/}"
+}
+
+OUT_DIR_T11="${WORK_DIR}/t11-ct-is-dir"
+mkdir -p "${OUT_DIR_T11}/args.ct"
+run_entry "" "${OUT_DIR_T11}" -- "${ARGS_FIXTURE}" one
+expect_no_trace_failure "T11 args.ct is a directory" \
+  "${OUT_DIR_T11}/args.ct" "args: one"
+
+OUT_DIR_T11B="${WORK_DIR}/t11-ct-is-dir-status3"
+mkdir -p "${OUT_DIR_T11B}/args3.ct"
+run_entry "" "${OUT_DIR_T11B}" -- "${FAIL3_FIXTURE}" one
+expect_no_trace_failure "T11 args3.ct is a directory, script exits 3" \
+  "${OUT_DIR_T11B}/args3.ct" "args: one" "status 3"
+
+OUT_DIR_T11C="${WORK_DIR}/t11-no-start"
+RUN_RC=0
+( ulimit -n 12 && exec "${BIN}" --out-dir "${OUT_DIR_T11C}" "${ARGS_FIXTURE}" one ) \
+  >"${WORK_DIR}/run.out" 2>"${WORK_DIR}/run.err" || RUN_RC=$?
+RUN_STDOUT="$(cat "${WORK_DIR}/run.out")"
+RUN_STDERR="$(cat "${WORK_DIR}/run.err")"
+# Positive control: the writer really received no START event.
+grep -qF "EOF reached without EXIT event" <<< "${RUN_STDERR}" \
+  || fail "T11 control: under 'ulimit -n 12' the writer should see an empty stream; stderr: ${RUN_STDERR}"
+# The recorder cannot move the event channel here (issue
+# `2026-11-16-bash-recorder-ignores-a-failed-move-of-its-event-channel`).
+# Bash does not exit when a redirection on `exec` fails, so the recorder
+# must check the move itself: the script must not run unrecorded, and
+# stderr must name the descriptor that could not be opened rather than
+# leave the missing-trace message as the only explanation. The launcher
+# must not then report the recorder's status as the script's.
+[[ "${RUN_RC}" == "1" ]] \
+  || fail "T11 failed FD move: launcher must exit 1, got ${RUN_RC}; stderr: ${RUN_STDERR}"
+[[ -z "${RUN_STDOUT}" ]] \
+  || fail "T11 failed FD move: the script must not run unrecorded; stdout: ${RUN_STDOUT}"
+grep -qE "recorder\.sh: cannot move the event stream from FD 3 to FD [0-9]+ \(open-files limit: 12\)" <<< "${RUN_STDERR}" \
+  || fail "T11 failed FD move: stderr must name the descriptor it could not open; stderr: ${RUN_STDERR}"
+grep -qF "recording failed" <<< "${RUN_STDERR}" \
+  || fail "T11 failed FD move: stderr must say the recording failed; stderr: ${RUN_STDERR}"
+grep -qF "${OUT_DIR_T11C}/args.ct" <<< "${RUN_STDERR}" \
+  || fail "T11 failed FD move: stderr must name the missing trace; stderr: ${RUN_STDERR}"
+grep -qF "before the script ran" <<< "${RUN_STDERR}" \
+  || fail "T11 failed FD move: stderr must say the script never ran; stderr: ${RUN_STDERR}"
+! grep -qF "the script exited with status" <<< "${RUN_STDERR}" \
+  || fail "T11 failed FD move: the recorder's status must not be reported as the script's; stderr: ${RUN_STDERR}"
+pass "T11 failed FD move (ulimit -n 12): script not run, stderr names the descriptor"
+
+# A `<script>.ct` left in the output directory by a previous run is not this
+# run's trace. The writer fails here because it cannot create the container
+# (the old `args.ct` and its directory are read-only), and the launcher must
+# take the writer's exit status as the verdict rather than find the old file
+# and report success (issue
+# `2026-11-16-shell-trace-writer-exits-0-when-it-cannot-create-the-trace-container`).
+# The old file must be left as it was. Permissions do not bind root, so the
+# case is skipped by name when the file stays writable.
+OUT_DIR_T11S="${WORK_DIR}/t11-stale-trace"
+mkdir -p "${OUT_DIR_T11S}"
+printf 'stale trace from a previous run' > "${OUT_DIR_T11S}/args.ct"
+chmod 444 "${OUT_DIR_T11S}/args.ct"
+chmod 555 "${OUT_DIR_T11S}"
+if [[ -w "${OUT_DIR_T11S}/args.ct" || -w "${OUT_DIR_T11S}" ]]; then
+  echo "skipped: T11 stale args.ct — read-only permissions do not bind this user"
+else
+  run_entry "" "${OUT_DIR_T11S}" -- "${ARGS_FIXTURE}" one
+  grep -qF "failed to create streaming CTFS container" <<< "${RUN_STDERR}" \
+    || fail "T11 stale args.ct control: the writer must fail to create the container; stderr: ${RUN_STDERR}"
+  expect_no_trace_failure "T11 stale args.ct, writer fails" \
+    "${OUT_DIR_T11S}/args.ct" "args: one" "trace writer exited with status 1"
+  [[ "$(cat "${OUT_DIR_T11S}/args.ct")" == "stale trace from a previous run" ]] \
+    || fail "T11 stale args.ct: the old file must be left as it was"
+  [[ ! -e "${OUT_DIR_T11S}/trace_db_metadata.json" ]] \
+    || fail "T11 stale args.ct: a failed recording must not write the launcher's sidecars"
+fi
+chmod 755 "${OUT_DIR_T11S}"
+chmod 644 "${OUT_DIR_T11S}/args.ct"
+
+# The launcher reads an empty event file as "the recorder stopped before the
+# script ran", so the recorder must not run the script when its START write
+# fails either (an event file on a full filesystem). The launcher always
+# hands it a fresh file from `mktemp`, so the recorder is run directly here,
+# with FD 3 on /dev/full, where every write fails with ENOSPC.
+# /dev/full is Linux-only; elsewhere this case is skipped by name.
+if [[ -c /dev/full ]]; then
+  RUN_RC=0
+  bash "${REPO_ROOT}/bash-recorder/recorder.sh" "${ARGS_FIXTURE}" one \
+    3>/dev/full >"${WORK_DIR}/run.out" 2>"${WORK_DIR}/run.err" || RUN_RC=$?
+  RUN_STDOUT="$(cat "${WORK_DIR}/run.out")"
+  RUN_STDERR="$(cat "${WORK_DIR}/run.err")"
+  [[ "${RUN_RC}" == "1" ]] \
+    || fail "T11 failed START write: recorder must exit 1, got ${RUN_RC}; stderr: ${RUN_STDERR}"
+  [[ -z "${RUN_STDOUT}" ]] \
+    || fail "T11 failed START write: the script must not run unrecorded; stdout: ${RUN_STDOUT}"
+  grep -qE "recorder\.sh: cannot write the START event to FD [0-9]+; the script was not run" <<< "${RUN_STDERR}" \
+    || fail "T11 failed START write: stderr must say the START write failed; stderr: ${RUN_STDERR}"
+  pass "T11 failed START write (FD 3 on /dev/full): script not run"
+elif [[ "$(uname -s)" == Linux ]]; then
+  fail "T11 failed START write: /dev/full is missing on Linux"
+else
+  echo "skipped: T11 failed START write — no /dev/full on $(uname -s)"
+fi
+
+# ---------------------------------------------------------------------------
+# T12. The recorded script sees its own path as `$0`, on the installed Bash
+# and on Bash 4.0.
+#
+# The recorder sources the script, where `$0` would be `recorder.sh`; spec
+# `Recording-Backends/Shell-Recorder.md`, "Interactive Preservation", makes
+# `$0` the script's absolute path, equal to `${BASH_SOURCE[0]}` at its top
+# level. Bash 5.0 and later get it from `BASH_ARGV0`; Bash 4 has no such
+# variable, and the recorder re-enters itself under `bash -c` instead, which
+# only the Bash 4.0 leg exercises (CT_TEST_BASH_4_0, checked by T8 above).
+#   * `main_guard.sh` runs `main` only when `${BASH_SOURCE[0]} == $0`: its
+#     output must be the direct run's, and the trace must call `main`.
+#   * `print_dollar0.sh` prints `$0`: the absolute path, also when the
+#     script is given by a relative path (`bash ./x.sh` gives `./x.sh`, but
+#     `${BASH_SOURCE[0]}` is absolute under the recorder, and the guard
+#     compares the two).
+#   * The `-c` shell of the Bash 4 path must not show: no
+#     `BASH_EXECUTION_STRING`, which a script run directly does not have.
+# ---------------------------------------------------------------------------
+
+FIXTURES_BASH="${REPO_ROOT}/tests/fixtures/bash"
+EXECSTR_FIXTURE="${WORK_DIR}/execstr.sh"
+cat > "${EXECSTR_FIXTURE}" <<'EOF'
+echo "execstr=${BASH_EXECUTION_STRING-unset}"
+EOF
+
+# check_dollar_zero_cases <label> <path-prefix>
+check_dollar_zero_cases() {
+  local label="$1" prefix="$2" out="${WORK_DIR}/t12-$1" calls
+  run_entry "${prefix}" "${out}-guard" -- "${FIXTURES_BASH}/main_guard.sh" a b
+  [[ "${RUN_RC}" == "0" ]] \
+    || fail "T12 ${label} guard: launcher exited ${RUN_RC}; stderr: ${RUN_STDERR}"
+  [[ "${RUN_STDOUT}" == "main ran with 2 args" ]] \
+    || fail "T12 ${label} guard: the BASH_SOURCE[0] == \$0 guard must hold; stdout: '${RUN_STDOUT}'; stderr: ${RUN_STDERR}"
+  calls="$(run_ct_print --full --strip-paths "${out}-guard/main_guard.ct" | jq -c '
+    [.events[] | select(.kind == "call_entry") | .function]')"
+  [[ "${calls}" == '["<toplevel>","<script>","main"]' ]] \
+    || fail "T12 ${label} guard: the trace must call main from <script>; calls: ${calls}"
+  pass "T12 ${label}: guarded main runs and is recorded"
+
+  run_entry "${prefix}" "${out}-d0" -- "${FIXTURES_BASH}/print_dollar0.sh"
+  [[ "${RUN_RC}" == "0" && "${RUN_STDOUT}" == "dollar0=${FIXTURES_BASH}/print_dollar0.sh" ]] \
+    || fail "T12 ${label} \$0: expected dollar0=${FIXTURES_BASH}/print_dollar0.sh (exit 0), got '${RUN_STDOUT}' (exit ${RUN_RC}); stderr: ${RUN_STDERR}"
+  pass "T12 ${label}: \$0 is the script's path"
+
+  pushd "${FIXTURES_BASH}" >/dev/null
+  run_entry "${prefix}" "${out}-d0-rel" -- ./print_dollar0.sh
+  popd >/dev/null
+  [[ "${RUN_RC}" == "0" && "${RUN_STDOUT}" == "dollar0=${FIXTURES_BASH}/print_dollar0.sh" ]] \
+    || fail "T12 ${label} relative \$0: expected the absolute path, got '${RUN_STDOUT}' (exit ${RUN_RC}); stderr: ${RUN_STDERR}"
+  pass "T12 ${label}: \$0 of a script given by a relative path is absolute"
+
+  run_entry "${prefix}" "${out}-execstr" -- "${EXECSTR_FIXTURE}"
+  [[ "${RUN_RC}" == "0" && "${RUN_STDOUT}" == "execstr=unset" ]] \
+    || fail "T12 ${label}: BASH_EXECUTION_STRING must be unset, as in a direct run; got '${RUN_STDOUT}' (exit ${RUN_RC}); stderr: ${RUN_STDERR}"
+  pass "T12 ${label}: no BASH_EXECUTION_STRING"
+}
+
+check_dollar_zero_cases "installed-bash" ""
+if [[ -n "${BASH40_DIR:-}" ]]; then
+  check_dollar_zero_cases "bash-4.0" "${BASH40_DIR}"
+elif [[ "$(uname -s)" == Linux ]]; then
+  fail "T12: no Bash 4.0 (CT_TEST_BASH_4_0) to run under; run this test in the dev shell"
+else
+  echo "skipped: T12 under Bash 4.0 — CT_TEST_BASH_4_0 is unset (Linux dev shell only)"
+fi
+
+# ---------------------------------------------------------------------------
+# T13. The EXIT event carries the status the process exits with when the
+# script's EXIT action changes it, on the installed Bash and on Bash 4.0.
+#
+# codetracer-pm issue
+# `2026-11-16-bash-recorder-exit-event-keeps-the-old-code-when-the-scripts-exit-trap-calls-exit.md`;
+# spec `Recording-Backends/Shell-Recorder.md`, "Script Exit". What an
+# `exit` in a trap action exits with differs between Bash releases (Bash
+# before 5.1 forgets it runs the EXIT trap once another trap has run in it;
+# Bash 4.0 exits on `exit foo` where later releases go on), so each fixture is
+# compared with its own run without the recorder under the same Bash:
+# the recorder must exit with that status and end its event stream with
+# exactly one `EXIT code=<that status>`. The cargo tests check the rest of
+# the recording, on the installed Bash only.
+# ---------------------------------------------------------------------------
+
+# check_exit_action_fixtures <label> <bash>
+check_exit_action_fixtures() {
+  local label="$1" shell="$2" fixture name native_rc rec_rc events exits last
+  for fixture in "${FIXTURES_BASH}"/trap_exit_*.sh; do
+    name="$(basename "${fixture}" .sh)"
+    native_rc=0
+    # shellcheck disable=SC2016 # $1 is the inner shell's first argument
+    "${shell}" -c 'set -o functrace -o errtrace; shopt -s extdebug; source "$1"' \
+      bash "${fixture}" >/dev/null 2>&1 || native_rc=$?
+    events="${WORK_DIR}/t13-${label}-${name}.events"
+    rec_rc=0
+    "${shell}" "${REPO_ROOT}/bash-recorder/recorder.sh" "${fixture}" \
+      >/dev/null 2>&1 3>"${events}" || rec_rc=$?
+    [[ "${rec_rc}" == "${native_rc}" ]] \
+      || fail "T13 ${label} ${name}: the recorder exited ${rec_rc}, the script exits ${native_rc} without it"
+    exits="$(grep -c '^EXIT ' "${events}" || true)"
+    last="$(tail -n 1 "${events}")"
+    [[ "${exits}" == 1 && "${last}" == "EXIT code=${native_rc}" ]] \
+      || fail "T13 ${label} ${name}: expected one EXIT event, code=${native_rc}, last; got ${exits}, last event '${last}'"
+    pass "T13 ${label} ${name}: exit ${native_rc}, EXIT code=${native_rc}"
+  done
+}
+
+check_exit_action_fixtures "installed-bash" "$(command -v bash)"
+if [[ -n "${CT_TEST_BASH_4_0:-}" ]]; then
+  check_exit_action_fixtures "bash-4.0" "${CT_TEST_BASH_4_0}"
+elif [[ "$(uname -s)" == Linux ]]; then
+  fail "T13: no Bash 4.0 (CT_TEST_BASH_4_0) to run under; run this test in the dev shell"
+else
+  echo "skipped: T13 under Bash 4.0 — CT_TEST_BASH_4_0 is unset (Linux dev shell only)"
+fi
 
 echo ""
 echo "test_bash_recorder_cli: ${PASS_COUNT} assertions passed"
